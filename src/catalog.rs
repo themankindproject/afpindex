@@ -1,0 +1,607 @@
+use alloc::vec::Vec;
+use core::fmt;
+
+use crate::{Posting, Segment};
+
+/// Reference-counted segment handle: `Arc` where the target has atomics,
+/// `Rc` otherwise (a catalog is then not `Send`).
+#[cfg(target_has_atomic = "ptr")]
+type Shared<T> = alloc::sync::Arc<T>;
+#[cfg(not(target_has_atomic = "ptr"))]
+type Shared<T> = alloc::rc::Rc<T>;
+
+/// A searchable set of references: segments, plus which reference ids are
+/// live.
+///
+/// Reference ids are dense `u32`s. [`CatalogBuilder::add`] and
+/// [`Catalog::add`] assign them in order, and they never change or get
+/// reused; a catalog snapshot keeps the whole id space
+/// ([`Catalog::write_to`](crate::Catalog::write_to), `std`). A removed
+/// reference is tombstoned: searches skip it immediately, and its postings
+/// leave memory the next time the segment holding them is merged or
+/// compacted.
+///
+/// # Segments
+///
+/// A catalog keeps a list of immutable segments with geometrically
+/// decreasing sizes: each is less than half of the one before it.
+/// [`Catalog::add`] builds a one-reference segment and then merges from
+/// the tail while a segment is at least half of its predecessor, so a
+/// posting takes part in `O(log n)` merges over its life and the list
+/// stays about `log2(largest / smallest)` long. A search looks every query
+/// hash up in every segment, so call [`Catalog::compact_deltas`] (cheap)
+/// or [`Catalog::compact`] (one pass over everything) when the list grows.
+///
+/// Segments are shared, so `clone` costs `O(segments + ids)` and the clone
+/// keeps the postings alive: a server can clone, compact the clone, and
+/// swap it in without blocking searches on the original.
+///
+/// # Memory
+///
+/// The liveness table costs one byte per id, and a [`Scratch`](crate::Scratch)
+/// another four bytes and a bit per id, whether or not the id has postings.
+///
+/// A catalog is `Send + Sync` where the target has atomic pointers;
+/// searches take `&self`, so threads share one catalog and own a
+/// `Scratch` each.
+#[derive(Clone, Default)]
+pub struct Catalog {
+    /// Sizes non-increasing; `parts[0]` is the snapshot when one exists.
+    parts: Vec<Part>,
+    live: Vec<bool>,
+    live_count: usize,
+}
+
+/// A segment of a catalog and what the catalog knows of its references.
+#[derive(Clone)]
+struct Part {
+    segment: Shared<Segment>,
+    /// Every reference with a posting in the segment lies in
+    /// `ids.0..=ids.1`.
+    ids: (u32, u32),
+    /// `true` while the segment may hold postings of removed references.
+    /// A segment that cannot is merged without a look at its references.
+    stale: bool,
+}
+
+impl Part {
+    /// A part whose references all lie in `ids` and are all live.
+    fn new(segment: Segment, ids: (u32, u32)) -> Self {
+        Self {
+            segment: Shared::new(segment),
+            ids,
+            stale: false,
+        }
+    }
+}
+
+impl Catalog {
+    /// An empty catalog.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bulk-build a catalog with one sort over every posting.
+    #[must_use]
+    pub fn builder() -> CatalogBuilder {
+        CatalogBuilder::default()
+    }
+
+    /// Wrap a segment whose reference ids the caller assigned.
+    ///
+    /// Every id from `0` to the largest id in the segment is live, including
+    /// ids with no postings, and [`Catalog::add`] continues after the
+    /// largest. To persist a catalog that has seen removals, use the catalog
+    /// snapshot instead, which keeps the id space and the liveness table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the largest id plus one does not fit in `usize` (only
+    /// possible on 32-bit targets with the id `u32::MAX`).
+    #[must_use]
+    pub fn from_segment(segment: Segment) -> Self {
+        let max = segment.max_reference();
+        let n = max.map_or(0, |m| {
+            usize::try_from(m)
+                .ok()
+                .and_then(|m| m.checked_add(1))
+                .expect("reference id space exceeds the address space")
+        });
+        Self {
+            parts: max
+                .map(|max| Part::new(segment, (0, max)))
+                .into_iter()
+                .collect(),
+            live: alloc::vec![true; n],
+            live_count: n,
+        }
+    }
+
+    /// Assemble from validated parts (snapshot reader): each segment with
+    /// the smallest and largest reference it holds, if it holds any.
+    #[cfg(feature = "std")]
+    pub(crate) fn from_parts(
+        segments: Vec<(Segment, Option<(u32, u32)>)>,
+        live: Vec<bool>,
+    ) -> Self {
+        let live_count = live.iter().filter(|&&l| l).count();
+        let parts = segments
+            .into_iter()
+            .filter_map(|(segment, ids)| {
+                let ids = ids?;
+                // Stale if any id in its range was removed (or lies outside
+                // the id space, which the reader refuses anyway).
+                let stale = live
+                    .get(ids.0 as usize..=ids.1 as usize)
+                    .is_none_or(|range| range.contains(&false));
+                Some(Part {
+                    stale,
+                    ..Part::new(segment, ids)
+                })
+            })
+            .collect();
+        Self {
+            parts,
+            live,
+            live_count,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn live_table(&self) -> &[bool] {
+        &self.live
+    }
+
+    /// Add a reference from its `(hash, time)` rows and return its id.
+    ///
+    /// The rows become one sorted segment, which is then merged from the
+    /// tail (see the type docs). Exact duplicate rows are dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics once every id below `u32::MAX` has been assigned.
+    pub fn add(&mut self, rows: impl IntoIterator<Item = (u32, u32)>) -> u32 {
+        let id = self.next_id();
+        // One reference: a row is its hash and time, which sort as one
+        // 64-bit key.
+        let mut rows: Vec<u64> = rows
+            .into_iter()
+            .map(|(hash, time)| u64::from(hash) << 32 | u64::from(time))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        self.live.push(true);
+        self.live_count += 1;
+        if !rows.is_empty() {
+            self.parts
+                .push(Part::new(Segment::from_reference(id, &rows), (id, id)));
+            self.merge_tail();
+        }
+        id
+    }
+
+    /// Tombstone a reference. Returns `false` if the id is unknown or
+    /// already removed.
+    pub fn remove(&mut self, id: u32) -> bool {
+        match self.live.get_mut(id as usize) {
+            Some(live) if *live => {
+                *live = false;
+                self.live_count -= 1;
+                for part in &mut self.parts {
+                    part.stale |= (part.ids.0..=part.ids.1).contains(&id);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `true` if `id` was assigned and has not been removed.
+    #[must_use]
+    pub fn is_live(&self, id: u32) -> bool {
+        self.live.get(id as usize).copied().unwrap_or(false)
+    }
+
+    /// Number of live references.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.live_count
+    }
+
+    /// Number of ids assigned so far, live or not. The next
+    /// [`Catalog::add`] returns this value.
+    #[must_use]
+    pub fn reference_count(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Postings held across all segments, including those of removed
+    /// references not yet compacted away.
+    #[must_use]
+    pub fn posting_count(&self) -> usize {
+        self.segments().map(Segment::len).sum()
+    }
+
+    /// Number of segments.
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Segment `i`, largest first; `0` is the snapshot when one exists.
+    #[must_use]
+    pub fn segment(&self, i: usize) -> Option<&Segment> {
+        self.parts.get(i).map(|part| &*part.segment)
+    }
+
+    /// The segments, largest first.
+    #[must_use]
+    pub fn segments(&self) -> impl ExactSizeIterator<Item = &Segment> + '_ {
+        self.parts.iter().map(|part| &*part.segment)
+    }
+
+    /// Heap bytes held by the segments and the liveness table.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.segments().map(Segment::heap_bytes).sum::<usize>()
+            + self.parts.capacity() * size_of::<Part>()
+            + self.live.capacity()
+    }
+
+    /// Merge every segment but the largest into one, dropping the postings
+    /// of removed references from them. The deltas are merged in one pass,
+    /// which rewrites each of their postings once; the largest segment is
+    /// not rewritten, so the result may break the half-size rule until the
+    /// next [`Catalog::add`] merges them. A no-op when there is at most one
+    /// delta and it has nothing to drop.
+    pub fn compact_deltas(&mut self) {
+        let merged = self.merged_from(1);
+        self.parts.truncate(1);
+        self.parts.extend(merged);
+    }
+
+    /// Merge everything into one segment, dropping the postings of removed
+    /// references, in one pass that rewrites each posting once. While it
+    /// runs, the result is held next to the segments it replaces. A no-op
+    /// when there is one segment and it has nothing to drop.
+    pub fn compact(&mut self) {
+        let merged = self.merged_from(0);
+        self.parts.clear();
+        self.parts.extend(merged);
+    }
+
+    /// Segments `first..` as one part without the postings of removed
+    /// references, or `None` if no posting is left. A lone segment with
+    /// nothing to drop is shared rather than copied.
+    ///
+    /// One pass over all of them, so a posting is rewritten once however
+    /// many segments are merged. Only segments that may hold postings of
+    /// removed references are filtered; the others are copied run by run.
+    fn merged_from(&self, first: usize) -> Option<Part> {
+        let tail = self.parts.get(first..).unwrap_or_default();
+        match tail {
+            [] => return None,
+            [only] if !only.stale => return Some(only.clone()),
+            _ => {}
+        }
+        let keep = |reference: u32| self.live[reference as usize];
+        let sides: Vec<_> = tail
+            .iter()
+            .map(|part| (&*part.segment, part.stale.then_some(&keep)))
+            .collect();
+        let merged = Segment::merge_all(&sides);
+        if merged.is_empty() {
+            return None;
+        }
+        let ids = tail.iter().fold((u32::MAX, 0), |(lo, hi), part| {
+            (lo.min(part.ids.0), hi.max(part.ids.1))
+        });
+        Some(Part::new(merged, ids))
+    }
+
+    fn next_id(&self) -> u32 {
+        u32::try_from(self.live.len())
+            .ok()
+            .filter(|&id| id < u32::MAX)
+            .expect("reference ids exhausted")
+    }
+
+    /// Restore the size invariant from the tail: the last segment joins
+    /// the one before it while it is at least half of it, and the two
+    /// together may then be half of the next. The segments such a cascade
+    /// reaches are merged in one pass rather than two at a time.
+    fn merge_tail(&mut self) {
+        loop {
+            let Some(last) = self.parts.last() else {
+                return;
+            };
+            let mut first = self.parts.len() - 1;
+            // Sizes are below 2^40, so the sums and doublings fit.
+            let mut size = last.segment.len() as u64;
+            while first > 0 && size * 2 >= self.parts[first - 1].segment.len() as u64 {
+                first -= 1;
+                size += self.parts[first].segment.len() as u64;
+            }
+            if first + 1 == self.parts.len() {
+                return;
+            }
+            // The merge may come out smaller than the sum (removed
+            // references, duplicates), which only helps the invariant; the
+            // next turn of the loop confirms it.
+            let merged = self.merged_from(first);
+            self.parts.truncate(first);
+            self.parts.extend(merged);
+        }
+    }
+}
+
+impl fmt::Debug for Catalog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Catalog")
+            .field("references", &self.live.len())
+            .field("live", &self.live_count)
+            .field("postings", &self.posting_count())
+            .field("segments", &self.parts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Collects references and builds a [`Catalog`] with one sort.
+///
+/// Ids are assigned in call order starting at `0`, exactly as
+/// [`Catalog::add`] would, so a builder-built catalog and an add-built one
+/// agree on every id.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogBuilder {
+    rows: Vec<Posting>,
+    next: u32,
+}
+
+impl CatalogBuilder {
+    /// Add a reference from its `(hash, time)` rows and return its id.
+    ///
+    /// # Panics
+    ///
+    /// Panics once every id below `u32::MAX` has been assigned.
+    pub fn add(&mut self, rows: impl IntoIterator<Item = (u32, u32)>) -> u32 {
+        let id = self.next;
+        assert!(id < u32::MAX, "reference ids exhausted");
+        self.next = id + 1;
+        self.rows
+            .extend(rows.into_iter().map(|(hash, time)| Posting {
+                hash,
+                reference: id,
+                time,
+            }));
+        id
+    }
+
+    /// Postings collected so far.
+    #[must_use]
+    pub fn posting_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Sort everything once and build the catalog.
+    #[must_use]
+    pub fn build(self) -> Catalog {
+        let n = self.next as usize;
+        let mut cat = Catalog {
+            parts: Vec::new(),
+            live: alloc::vec![true; n],
+            live_count: n,
+        };
+        let segment = Segment::from_postings(self.rows);
+        // A posting implies a reference, so `next` is at least one here.
+        if !segment.is_empty() {
+            cat.parts.push(Part::new(segment, (0, self.next - 1)));
+        }
+        cat
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(seed: u32, n: u32) -> Vec<(u32, u32)> {
+        (0..n)
+            .map(|i| (seed.wrapping_mul(31).wrapping_add(i * 7), i))
+            .collect()
+    }
+
+    #[test]
+    fn ids_are_dense_and_never_reused() {
+        let mut cat = Catalog::new();
+        assert_eq!(cat.add(rows(1, 10)), 0);
+        assert_eq!(cat.add(rows(2, 10)), 1);
+        assert!(cat.remove(0));
+        assert!(!cat.remove(0));
+        assert!(!cat.remove(9));
+        assert_eq!(cat.add(rows(3, 10)), 2);
+        assert_eq!(cat.live_count(), 2);
+        assert_eq!(cat.reference_count(), 3);
+        assert!(!cat.is_live(0));
+        assert!(cat.is_live(1));
+        assert!(!cat.is_live(3));
+    }
+
+    #[test]
+    fn segment_sizes_stay_geometric() {
+        let mut cat = Catalog::new();
+        for i in 0..200 {
+            cat.add(rows(i, 100));
+            let sizes: Vec<usize> = cat.segments().map(Segment::len).collect();
+            assert!(sizes.windows(2).all(|w| w[1] * 2 < w[0]), "sizes {sizes:?}");
+        }
+        assert!(cat.segment_count() <= 9, "{} segments", cat.segment_count());
+        assert_eq!(cat.posting_count(), 200 * 100);
+    }
+
+    #[test]
+    fn compaction_drops_dead_postings_and_keeps_live_ones() {
+        let mut cat = Catalog::new();
+        for i in 0..20 {
+            cat.add(rows(i, 50));
+        }
+        for id in [0, 5, 19] {
+            assert!(cat.remove(id));
+        }
+        let before = cat.posting_count();
+        cat.compact_deltas();
+        assert!(cat.segment_count() >= 1);
+        cat.compact();
+        assert_eq!(cat.segment_count(), 1);
+        assert_eq!(cat.posting_count(), 17 * 50);
+        assert!(cat.posting_count() < before);
+        assert!(
+            cat.segment(0)
+                .unwrap()
+                .postings()
+                .all(|p| cat.is_live(p.reference))
+        );
+        // Compacting again is a no-op: the segment is the same allocation.
+        // A clone keeps the old segment alive, so a rewrite cannot land on
+        // the same address through allocator reuse.
+        let keep = cat.clone();
+        let before: *const Segment = cat.segment(0).unwrap();
+        cat.compact();
+        assert!(core::ptr::eq(before, cat.segment(0).unwrap()));
+        // A removal makes the next compaction rewrite it once, not forever.
+        assert!(cat.remove(7));
+        cat.compact();
+        assert!(!core::ptr::eq(before, cat.segment(0).unwrap()));
+        drop(keep);
+        let keep = cat.clone();
+        let after: *const Segment = cat.segment(0).unwrap();
+        cat.compact();
+        assert!(core::ptr::eq(after, cat.segment(0).unwrap()));
+        drop(keep);
+        // Removing everything leaves no segments.
+        for id in 0..20 {
+            cat.remove(id);
+        }
+        cat.compact();
+        assert_eq!(cat.segment_count(), 0);
+        assert_eq!(cat.live_count(), 0);
+    }
+
+    #[test]
+    fn compact_deltas_leaves_the_snapshot_alone() {
+        // A snapshot far larger than the deltas, so `add` never merges into it.
+        let mut b = Catalog::builder();
+        for i in 0..400 {
+            b.add(rows(i, 50));
+        }
+        let mut cat = b.build();
+        let keep = cat.clone();
+        let snapshot: *const Segment = cat.segment(0).unwrap();
+        for i in 400..420 {
+            cat.add(rows(i, 50));
+        }
+        cat.remove(401);
+        assert!(cat.segment_count() > 2);
+        cat.compact_deltas();
+        assert_eq!(cat.segment_count(), 2);
+        assert!(core::ptr::eq(snapshot, cat.segment(0).unwrap()));
+        assert_eq!(cat.segment(1).unwrap().len(), 19 * 50);
+        assert!(
+            cat.segment(1)
+                .unwrap()
+                .postings()
+                .all(|p| p.reference != 401)
+        );
+        drop(keep);
+    }
+
+    #[test]
+    fn clone_shares_segments() {
+        let mut cat = Catalog::new();
+        cat.add(rows(1, 10));
+        let copy = cat.clone();
+        assert!(core::ptr::eq(
+            cat.segment(0).unwrap(),
+            copy.segment(0).unwrap()
+        ));
+        cat.add(rows(2, 10));
+        assert_eq!(copy.segment_count(), 1);
+        assert_eq!(copy.reference_count(), 1);
+    }
+
+    #[test]
+    fn builder_and_incremental_agree_on_ids_and_postings() {
+        let mut b = Catalog::builder();
+        let mut inc = Catalog::new();
+        for i in 0..7 {
+            assert_eq!(b.add(rows(i, 30)), inc.add(rows(i, 30)));
+        }
+        assert_eq!(b.posting_count(), 7 * 30);
+        let built = b.build();
+        inc.compact();
+        assert_eq!(built.segment(0), inc.segment(0));
+    }
+
+    #[test]
+    fn from_segment_marks_every_id_live() {
+        let seg = Segment::from_postings(alloc::vec![Posting::new(1, 4, 0), Posting::new(2, 1, 0)]);
+        let mut cat = Catalog::from_segment(seg);
+        assert_eq!(cat.reference_count(), 5);
+        assert_eq!(cat.live_count(), 5);
+        assert!(cat.is_live(2));
+        assert_eq!(cat.add(rows(1, 3)), 5);
+        let empty = Catalog::from_segment(Segment::default());
+        assert_eq!(empty.reference_count(), 0);
+        assert_eq!(empty.segment_count(), 0);
+    }
+
+    #[test]
+    fn empty_references_take_an_id_but_no_segment() {
+        let mut cat = Catalog::new();
+        assert_eq!(cat.add(Vec::<(u32, u32)>::new()), 0);
+        assert_eq!(cat.segment_count(), 0);
+        assert_eq!(cat.live_count(), 1);
+        assert!(cat.heap_bytes() >= 1);
+        let dbg = alloc::format!("{cat:?}");
+        assert!(dbg.contains("references: 1"));
+    }
+
+    #[test]
+    fn compact_deltas_dedups_overlapping_segments() {
+        // The public API keeps a reference in one segment; a crafted
+        // snapshot need not. Overlapping deltas must compact to one copy
+        // of each posting rather than a run with duplicates.
+        let big = Segment::from_postings((0..100u32).map(|i| Posting::new(i, 0, i)).collect());
+        let d1 = Segment::from_postings(alloc::vec![
+            Posting::new(7, 1, 1),
+            Posting::new(7, 1, 2),
+            Posting::new(9, 2, 5),
+        ]);
+        let d2 = Segment::from_postings(alloc::vec![
+            Posting::new(7, 1, 2),
+            Posting::new(9, 2, 5),
+            Posting::new(9, 2, 6),
+        ]);
+        let mut cat = Catalog {
+            parts: [big, d1, d2]
+                .into_iter()
+                .map(|segment| Part::new(segment, (0, 2)))
+                .collect(),
+            live: alloc::vec![true; 3],
+            live_count: 3,
+        };
+        cat.compact_deltas();
+        assert_eq!(cat.segment_count(), 2);
+        let delta: Vec<Posting> = cat.segment(1).unwrap().postings().collect();
+        assert_eq!(
+            delta,
+            [
+                Posting::new(7, 1, 1),
+                Posting::new(7, 1, 2),
+                Posting::new(9, 2, 5),
+                Posting::new(9, 2, 6),
+            ]
+        );
+        assert_eq!(cat.posting_count(), 104);
+    }
+}

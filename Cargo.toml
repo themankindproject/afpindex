@@ -1,0 +1,68 @@
+[package]
+name         = "afindex"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "Exact in-memory inverted index for landmark audio fingerprints: sorted postings, a radix directory and a two-pass vote search"
+license      = "MIT"
+documentation = "https://docs.rs/afindex"
+keywords     = ["audio", "fingerprint", "inverted-index", "search", "no-std"]
+categories   = ["multimedia::audio", "data-structures", "no-std"]
+include      = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+
+[features]
+default = ["std"]
+# Snapshot files (`Catalog` / `Segment` `write_to` and `read_from`) and
+# `std::error::Error` for the snapshot error type.
+std = []
+# Memory-mapped snapshots: `Catalog::map_from` and `Segment::map_from`
+# leave the packed postings in the file's pages, shared between
+# processes. The mapping call is the crate's one `unsafe` block.
+mmap = ["std", "dep:memmap2"]
+
+[dependencies]
+# `sqrt` and `ceil` without `std`; also used under `std` so results are
+# bit-identical across the two builds.
+libm = { version = "0.2", default-features = false }
+memmap2 = { version = "0.9", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+
+[profile.bench]
+lto           = "fat"
+codegen-units = 1
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code  = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Index arithmetic between `u32` ids and `usize` positions is the whole
+# point of the layout; the casts are documented at the type boundaries.
+cast_possible_truncation = "allow"
+cast_possible_wrap       = "allow"
+cast_precision_loss      = "allow"
+cast_sign_loss           = "allow"
+cast_lossless            = "allow"
+module_name_repetitions  = "allow"
+must_use_candidate       = "allow"
+missing_errors_doc       = "allow"
+missing_panics_doc       = "allow"
+many_single_char_names   = "allow"
+
+[[example]]
+name = "replay"
+required-features = ["std"]
+
+[[example]]
+name = "lifecycle"
+required-features = ["std"]

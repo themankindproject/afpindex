@@ -1,0 +1,512 @@
+//! Snapshot round trips and corruption checks (`std` feature).
+#![cfg(feature = "std")]
+
+use afindex::{Catalog, Posting, Query, Scratch, SearchOptions, Segment, SnapshotError};
+
+const HEADER: usize = 32;
+
+fn sample() -> Segment {
+    let rows: Vec<Posting> = (0..5_000u32)
+        .map(|i| Posting::new(i.wrapping_mul(0x9E37_79B1) % 700, i % 37, (i * 13) % 3_000))
+        .collect();
+    Segment::from_postings(rows)
+}
+
+/// Byte offsets of the four arrays, the end of the times data, and the
+/// trailer in a segment snapshot. References and times are packed at the
+/// width of their largest value.
+fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize) {
+    let k = seg.key_count();
+    let p = seg.len();
+    let packed = |max: u32| (p * (32 - max.leading_zeros()) as usize).div_ceil(8);
+    let ref_bytes = packed(seg.max_reference().unwrap_or(0));
+    let time_bytes = packed(seg.postings().map(|r| r.time).max().unwrap_or(0));
+    let keys = HEADER;
+    let offsets = (keys + 4 * k).next_multiple_of(8);
+    let refs = offsets + 8 * (k + 1);
+    let times = (refs + ref_bytes).next_multiple_of(8);
+    let times_end = times + time_bytes;
+    let trailer = times_end.next_multiple_of(8);
+    (keys, offsets, refs, times, times_end, trailer)
+}
+
+fn query() -> Query {
+    Query::from_pairs(
+        (0..200u32).map(|i| (i.wrapping_mul(0x9E37_79B1) % 700, i)),
+        Some(64),
+    )
+}
+
+#[test]
+fn write_then_read_gives_the_same_segment_and_results() {
+    let seg = sample();
+    let mut bytes = Vec::new();
+    seg.write_to(&mut bytes).unwrap();
+    let (.., trailer) = layout(&seg);
+    assert_eq!(bytes.len(), trailer + 8);
+    let back = Segment::read_from(bytes.as_slice()).unwrap();
+    assert_eq!(back, seg);
+    let q = query();
+    let o = SearchOptions::default();
+    let mut s = Scratch::new();
+    let a = Catalog::from_segment(seg).search(&q, &o, &mut s).unwrap();
+    let b = Catalog::from_segment(back).search(&q, &o, &mut s).unwrap();
+    assert_eq!(a, b);
+    assert!(!a.is_empty());
+    let empty = Segment::default();
+    let mut bytes = Vec::new();
+    empty.write_to(&mut bytes).unwrap();
+    assert!(Segment::read_from(bytes.as_slice()).unwrap().is_empty());
+}
+
+#[test]
+fn corruption_is_reported_not_trusted() {
+    let seg = sample();
+    let mut good = Vec::new();
+    seg.write_to(&mut good).unwrap();
+    let (keys_at, offsets_at, refs_at, times_at, times_end, trailer_at) = layout(&seg);
+
+    let mut bad = good.clone();
+    bad[0] = b'X';
+    assert!(matches!(
+        Segment::read_from(bad.as_slice()),
+        Err(SnapshotError::BadMagic)
+    ));
+
+    let mut bad = good.clone();
+    bad[4] = 9;
+    assert!(matches!(
+        Segment::read_from(bad.as_slice()),
+        Err(SnapshotError::UnsupportedVersion(9))
+    ));
+
+    for cut in [HEADER - 1, offsets_at + 3, trailer_at, good.len() - 1] {
+        let err = Segment::read_from(&good[..cut]).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::Truncated),
+            "cut at {cut}: {err}"
+        );
+    }
+
+    // Claim more postings than a segment may hold, or more keys than there
+    // are hashes: refused from the header, before any allocation.
+    let mut bad = good.clone();
+    bad[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+    let err = Segment::read_from(bad.as_slice()).unwrap_err();
+    assert!(matches!(err, SnapshotError::Corrupt(_)), "{err}");
+    let mut bad = good.clone();
+    bad[16..24].copy_from_slice(&((1u64 << 32) + 1).to_le_bytes());
+    let err = Segment::read_from(bad.as_slice()).unwrap_err();
+    assert!(matches!(err, SnapshotError::Corrupt(_)), "{err}");
+
+    // Any flipped data byte fails the checksum (padding is not data).
+    for at in [
+        keys_at,
+        offsets_at + 8,
+        refs_at + 5,
+        times_at + 9,
+        times_end - 1,
+    ] {
+        let mut bad = good.clone();
+        bad[at] ^= 0x40;
+        let err = Segment::read_from(bad.as_slice()).unwrap_err();
+        assert!(matches!(err, SnapshotError::Checksum), "byte {at}: {err}");
+    }
+    let mut bad = good.clone();
+    bad[trailer_at] ^= 1;
+    assert!(matches!(
+        Segment::read_from(bad.as_slice()),
+        Err(SnapshotError::Checksum)
+    ));
+
+    // The header is covered too: a width change that keeps the packed
+    // length (two 1-bit references read as 2-bit) fails the checksum
+    // instead of decoding wrong values.
+    let tiny = Segment::from_postings(vec![Posting::new(7, 0, 0), Posting::new(9, 1, 0)]);
+    let mut bytes = Vec::new();
+    tiny.write_to(&mut bytes).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+    bytes[8] = 2;
+    assert!(matches!(
+        Segment::read_from(bytes.as_slice()),
+        Err(SnapshotError::Checksum)
+    ));
+
+    // Error values display and chain.
+    let err = Segment::read_from(&good[..10]).unwrap_err();
+    assert_eq!(err.to_string(), "snapshot ends early");
+    assert!(std::error::Error::source(&err).is_none());
+}
+
+#[test]
+fn catalog_snapshot_keeps_ids_liveness_and_segments() {
+    let mut cat = Catalog::builder();
+    for i in 0..30u32 {
+        cat.add(
+            (0..100u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000, j)),
+        );
+    }
+    let mut cat = cat.build();
+    for i in 30..45u32 {
+        cat.add(
+            (0..100u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000, j)),
+        );
+    }
+    // Remove some ids, including the last one, so the id space has holes
+    // and a trailing gap that a bare segment could not represent.
+    for id in [0u32, 7, 31, 44] {
+        assert!(cat.remove(id));
+    }
+    let q = Query::from_pairs(
+        (0..100u32).map(|j| {
+            (
+                33u32.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000,
+                j,
+            )
+        }),
+        Some(64),
+    );
+    let o = SearchOptions::default();
+    let mut s = Scratch::new();
+    let before = cat.search(&q, &o, &mut s).unwrap();
+    assert!(before.iter().any(|c| c.reference == 33 && c.delta == 0));
+
+    let mut bytes = Vec::new();
+    cat.write_to(&mut bytes).unwrap();
+    let back = Catalog::read_from(bytes.as_slice()).unwrap();
+    assert_eq!(back.reference_count(), 45);
+    assert_eq!(back.live_count(), 41);
+    for id in 0..46 {
+        assert_eq!(back.is_live(id), cat.is_live(id), "id {id}");
+    }
+    assert_eq!(back.segment_count(), cat.segment_count());
+    assert_eq!(back.posting_count(), cat.posting_count());
+    assert_eq!(back.search(&q, &o, &mut s).unwrap(), before);
+    // A loaded catalog knows which segments hold removed references:
+    // compacting it drops their postings like the original's.
+    let mut purged = back.clone();
+    purged.compact();
+    assert_eq!(purged.posting_count(), 41 * 100);
+    assert_eq!(purged.search(&q, &o, &mut s).unwrap(), before);
+    // The next id continues after the removed tail; nothing is reused.
+    let mut back = back;
+    assert_eq!(back.add([(1, 1)]), 45);
+    // A compacted catalog round-trips to one segment holding live postings only.
+    cat.compact();
+    let mut bytes = Vec::new();
+    cat.write_to(&mut bytes).unwrap();
+    let back = Catalog::read_from(bytes.as_slice()).unwrap();
+    assert_eq!(back.segment_count(), 1);
+    assert_eq!(back.posting_count(), 41 * 100);
+    assert_eq!(back.search(&q, &o, &mut s).unwrap(), before);
+    // An empty catalog round-trips too.
+    let mut bytes = Vec::new();
+    Catalog::new().write_to(&mut bytes).unwrap();
+    let back = Catalog::read_from(bytes.as_slice()).unwrap();
+    assert_eq!(back.reference_count(), 0);
+    assert_eq!(back.segment_count(), 0);
+}
+
+#[test]
+fn catalog_snapshot_corruption_is_reported() {
+    let mut cat = Catalog::new();
+    // Ten rows, then one: the small delta stays a segment of its own.
+    cat.add((0..10u32).map(|i| (i, i)));
+    cat.add([(1, 5)]);
+    cat.remove(0);
+    let mut good = Vec::new();
+    cat.write_to(&mut good).unwrap();
+
+    // The two kinds do not read as each other.
+    assert!(matches!(
+        Segment::read_from(good.as_slice()),
+        Err(SnapshotError::BadMagic)
+    ));
+    let mut seg_bytes = Vec::new();
+    cat.segment(0).unwrap().write_to(&mut seg_bytes).unwrap();
+    assert!(matches!(
+        Catalog::read_from(seg_bytes.as_slice()),
+        Err(SnapshotError::BadMagic)
+    ));
+
+    // Flip a liveness bit: the bitmap checksum catches it.
+    let mut bad = good.clone();
+    bad[HEADER] ^= 1;
+    assert!(matches!(
+        Catalog::read_from(bad.as_slice()),
+        Err(SnapshotError::Checksum)
+    ));
+
+    // Truncate inside a segment.
+    let err = Catalog::read_from(&good[..good.len() - 4]).unwrap_err();
+    assert!(matches!(err, SnapshotError::Truncated), "{err}");
+
+    // An implausible segment count is refused before reading any segment.
+    let mut bad = good.clone();
+    bad[24..32].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    assert!(matches!(
+        Catalog::read_from(bad.as_slice()),
+        Err(SnapshotError::Corrupt(_))
+    ));
+
+    // An id space wider than `u32` is refused before the bitmap is read.
+    let mut bad = good.clone();
+    bad[16..24].copy_from_slice(&(1u64 << 32).to_le_bytes());
+    assert!(matches!(
+        Catalog::read_from(bad.as_slice()),
+        Err(SnapshotError::Corrupt(_))
+    ));
+
+    // The header counts are checksummed: a smaller segment count would
+    // silently drop a segment, and an id space grown within the same
+    // bitmap byte would hand out an id that was never assigned.
+    assert_eq!(cat.segment_count(), 2, "a large and a small segment");
+    let mut bad = good.clone();
+    bad[24..32].copy_from_slice(&1u64.to_le_bytes());
+    assert!(matches!(
+        Catalog::read_from(bad.as_slice()),
+        Err(SnapshotError::Checksum)
+    ));
+    let mut bad = good.clone();
+    bad[16..24].copy_from_slice(&3u64.to_le_bytes());
+    assert!(matches!(
+        Catalog::read_from(bad.as_slice()),
+        Err(SnapshotError::Checksum)
+    ));
+}
+
+#[test]
+fn full_width_references_and_times_round_trip() {
+    // Both widths at 32 bits: the reader's run-length bound
+    // (`2^(ref_bits + time_bits)`) is clamped rather than overflowed, and
+    // the largest values survive the packing.
+    let seg = Segment::from_postings(vec![
+        Posting::new(1, u32::MAX, u32::MAX),
+        Posting::new(1, u32::MAX - 1, 0),
+        Posting::new(2, 0, u32::MAX),
+    ]);
+    let mut bytes = Vec::new();
+    seg.write_to(&mut bytes).unwrap();
+    let back = Segment::read_from(bytes.as_slice()).unwrap();
+    assert_eq!(back, seg);
+    assert_eq!(back.max_reference(), Some(u32::MAX));
+    assert_eq!(back.postings().map(|p| p.time).max(), Some(u32::MAX));
+}
+
+/// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
+/// snapshots (format version 2).
+const CATALOG_GOLDEN: (usize, u64) = (91_568, 7_667_176_456_971_685_523);
+const SEGMENT_GOLDEN: (usize, u64) = (30_056, 9_864_878_237_036_170_439);
+
+/// FNV-1a over `bytes`.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xCBF2_9CE4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
+    })
+}
+
+/// The format is a contract with the files already written: a fixed
+/// catalog and a fixed segment must keep producing the same bytes. A
+/// deliberate format change gets a new version number, a reader for this
+/// one, and then new constants here.
+#[test]
+fn snapshot_bytes_are_stable() {
+    let rows = |seed: u32| {
+        (0..300u32).map(move |j| {
+            (
+                seed.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 4_000,
+                j * 3 % 1_000,
+            )
+        })
+    };
+    let mut builder = Catalog::builder();
+    for seed in 0..40 {
+        builder.add(rows(seed));
+    }
+    let mut cat = builder.build();
+    for seed in 40..47 {
+        cat.add(rows(seed));
+    }
+    assert!(cat.remove(3) && cat.remove(41));
+    assert!(cat.segment_count() > 1, "a base and at least one delta");
+    let mut bytes = Vec::new();
+    cat.write_to(&mut bytes).unwrap();
+    assert_eq!((bytes.len(), fnv1a(&bytes)), CATALOG_GOLDEN);
+
+    let seg = Segment::from_postings(
+        (0..2_000u32)
+            .map(|i| Posting::new(i.wrapping_mul(0x9E37_79B1) >> 20, i % 300, i * 11 % 70_000))
+            .collect(),
+    );
+    let mut bytes = Vec::new();
+    seg.write_to(&mut bytes).unwrap();
+    assert_eq!((bytes.len(), fnv1a(&bytes)), SEGMENT_GOLDEN);
+}
+
+/// Memory-mapped snapshots (`mmap` feature).
+#[cfg(feature = "mmap")]
+mod mapped {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A fresh file name under the temp dir for this test.
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("afindex-{}-{name}", std::process::id()));
+        p
+    }
+
+    fn sample_catalog() -> (Catalog, Query) {
+        let mut cat = Catalog::builder();
+        for i in 0..30u32 {
+            cat.add(
+                (0..100u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000, j)),
+            );
+        }
+        let mut cat = cat.build();
+        for i in 30..45u32 {
+            cat.add(
+                (0..100u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000, j)),
+            );
+        }
+        for id in [0u32, 7, 31, 44] {
+            assert!(cat.remove(id));
+        }
+        let q = Query::from_pairs(
+            (0..100u32).map(|j| {
+                (
+                    33u32.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000,
+                    j,
+                )
+            }),
+            Some(64),
+        );
+        (cat, q)
+    }
+
+    #[test]
+    fn mapped_catalog_matches_the_read_one_and_keeps_working() {
+        let (cat, q) = sample_catalog();
+        let path = temp("catalog.afc");
+        cat.write_to(std::fs::File::create(&path).unwrap()).unwrap();
+        let o = SearchOptions::default();
+        let mut s = Scratch::new();
+        let want = cat.search(&q, &o, &mut s).unwrap();
+        assert!(want.iter().any(|c| c.reference == 33 && c.delta == 0));
+
+        let read = Catalog::read_from(std::fs::File::open(&path).unwrap()).unwrap();
+        let mapped = Catalog::map_from(&path).unwrap();
+        assert_eq!(mapped.reference_count(), read.reference_count());
+        assert_eq!(mapped.live_count(), read.live_count());
+        assert_eq!(mapped.posting_count(), read.posting_count());
+        assert_eq!(mapped.segment_count(), read.segment_count());
+        for id in 0..46 {
+            assert_eq!(mapped.is_live(id), cat.is_live(id), "id {id}");
+        }
+        assert_eq!(mapped.search(&q, &o, &mut s).unwrap(), want);
+        // The postings are not on the heap; the keys and directory are.
+        assert!(mapped.heap_bytes() < read.heap_bytes());
+        assert!(mapped.heap_bytes() > 0);
+
+        // A mapped catalog changes like any other: the new postings are
+        // owned, the mapped ones are read, and compaction copies them out.
+        let mut m = mapped.clone();
+        assert_eq!(m.add([(1, 1)]), 45);
+        assert!(m.remove(33));
+        assert!(
+            m.search(&q, &o, &mut s)
+                .unwrap()
+                .iter()
+                .all(|c| c.reference != 33)
+        );
+        m.compact();
+        assert_eq!(m.segment_count(), 1);
+        assert_eq!(m.posting_count(), 40 * 100 + 1);
+        let mut bytes = Vec::new();
+        m.write_to(&mut bytes).unwrap();
+        let back = Catalog::read_from(bytes.as_slice()).unwrap();
+        assert_eq!(back.posting_count(), m.posting_count());
+
+        // The original mapping is untouched by all of that.
+        assert_eq!(mapped.search(&q, &o, &mut s).unwrap(), want);
+        drop((m, mapped, back));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn mapped_segment_round_trips_and_checks_every_data_byte() {
+        let seg = sample();
+        let mut good = Vec::new();
+        seg.write_to(&mut good).unwrap();
+        let path = temp("segment.afx");
+        std::fs::write(&path, &good).unwrap();
+        let back = Segment::map_from(&path).unwrap();
+        assert_eq!(back, seg);
+        assert_eq!(back.max_reference(), seg.max_reference());
+        drop(back);
+        // Every data byte is checksummed in place, as on the read path.
+        let (keys_at, offsets_at, refs_at, times_at, times_end, trailer_at) = layout(&seg);
+        for at in [
+            keys_at,
+            offsets_at + 8,
+            refs_at + 5,
+            times_at + 9,
+            times_end - 1,
+            trailer_at,
+        ] {
+            let mut bad = good.clone();
+            bad[at] ^= 0x40;
+            std::fs::write(&path, &bad).unwrap();
+            let err = Segment::map_from(&path).unwrap_err();
+            assert!(matches!(err, SnapshotError::Checksum), "byte {at}: {err}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn mapped_corruption_is_reported() {
+        let (cat, _) = sample_catalog();
+        let mut good = Vec::new();
+        cat.write_to(&mut good).unwrap();
+        let path = temp("bad.afc");
+
+        // The liveness bitmap and the packed arrays are checksummed in place.
+        for at in [HEADER, good.len() / 2] {
+            let mut bad = good.clone();
+            bad[at] ^= 0x10;
+            std::fs::write(&path, &bad).unwrap();
+            let err = Catalog::map_from(&path).unwrap_err();
+            assert!(matches!(err, SnapshotError::Checksum), "byte {at}: {err}");
+        }
+        // Truncated anywhere: refused, never read past the file.
+        for cut in [HEADER - 1, good.len() / 3, good.len() - 4, good.len() - 1] {
+            std::fs::write(&path, &good[..cut]).unwrap();
+            let err = Catalog::map_from(&path).unwrap_err();
+            assert!(
+                matches!(err, SnapshotError::Truncated | SnapshotError::Corrupt(_)),
+                "cut {cut}: {err}"
+            );
+        }
+        std::fs::write(&path, b"AFCT").unwrap();
+        assert!(matches!(
+            Catalog::map_from(&path).unwrap_err(),
+            SnapshotError::Truncated
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            Catalog::map_from(&path).unwrap_err(),
+            SnapshotError::Io(_)
+        ));
+        // A segment file is not a catalog and the other way round.
+        let seg_path = temp("seg.afx");
+        cat.segment(0)
+            .unwrap()
+            .write_to(std::fs::File::create(&seg_path).unwrap())
+            .unwrap();
+        assert!(matches!(
+            Catalog::map_from(&seg_path).unwrap_err(),
+            SnapshotError::BadMagic
+        ));
+        std::fs::remove_file(&seg_path).unwrap();
+    }
+}
