@@ -412,7 +412,7 @@ fn for_each_run(
     let n = runs.len();
     let touch = |from: usize, to: usize| {
         let acc = runs[from.min(n)..to.min(n)].iter().fold(0u32, |acc, run| {
-            acc ^ segments[run.segment as usize].touch_refs(run.lo, run.hi)
+            acc ^ segments[run.segment as usize].touch_refs(run.lo, run.hi, Packed::SLACK)
         });
         core::hint::black_box(acc);
     };

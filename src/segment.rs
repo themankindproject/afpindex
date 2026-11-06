@@ -558,12 +558,13 @@ impl Segment {
         }
     }
 
-    /// Load the first and last reference of the run at `lo..hi` (the
-    /// caller discards the value the same way).
+    /// Load every cache line of the references of the run at `lo..hi`,
+    /// and those up to `reach` bytes past it (the caller discards the
+    /// value the same way; see [`Packed::touch`]).
     #[inline]
-    pub(crate) fn touch_refs(&self, lo: usize, hi: usize) -> u32 {
+    pub(crate) fn touch_refs(&self, lo: usize, hi: usize, reach: usize) -> u32 {
         debug_assert!(lo < hi, "a run is never empty");
-        self.refs.get(lo) ^ self.refs.get(hi - 1)
+        self.refs.touch(lo, hi, reach)
     }
 
     /// Load the time at entry `i` (the caller discards it the same way).
