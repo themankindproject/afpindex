@@ -2,7 +2,7 @@
 name         = "afindex"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 description  = "Exact in-memory inverted index for landmark audio fingerprints: sorted postings, a radix directory and a two-pass vote search"
 license      = "MIT"
 documentation = "https://docs.rs/afindex"
@@ -19,6 +19,11 @@ std = []
 # leave the packed postings in the file's pages, shared between
 # processes. The mapping call is the crate's one `unsafe` block.
 mmap = ["std", "dep:memmap2"]
+# Vector instructions for the passes that read many packed values. On
+# x86-64 a CPU with AVX2, detected when a pass starts, decodes eight
+# values at a time; everything else runs the same code as without the
+# feature. Entering the AVX2 code is the feature's one `unsafe` block.
+simd = ["std"]
 
 [dependencies]
 # `sqrt` and `ceil` without `std`; also used under `std` so results are
@@ -58,6 +63,10 @@ must_use_candidate       = "allow"
 missing_errors_doc       = "allow"
 missing_panics_doc       = "allow"
 many_single_char_names   = "allow"
+# A vector kernel can only be inlined into code compiled with its
+# instructions, so what lies between a pass and its kernel must be inlined
+# into the pass rather than left to the inliner (see `src/simd.rs`).
+inline_always            = "allow"
 
 [[example]]
 name = "replay"

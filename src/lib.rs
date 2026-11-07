@@ -25,11 +25,13 @@
 //!   that are merged geometrically; removals tombstone a reference and
 //!   compaction drops its postings. Reference ids never change, and a
 //!   catalog clone shares its segments.
-//! - **No unsafe code, no dependencies beyond `libm`,** and a `no_std + alloc`
-//!   core. The `std` feature adds checksummed snapshot files for segments
-//!   and whole catalogs; the `mmap` feature maps those files instead of
-//!   reading them, and its one mapping call is the crate's only `unsafe`
-//!   block.
+//! - **No unsafe code by default, no dependencies beyond `libm`,** and a
+//!   `no_std + alloc` core. The `std` feature adds checksummed snapshot
+//!   files for segments and whole catalogs. Two more features bring one
+//!   `unsafe` block each: `mmap` maps those files instead of reading them
+//!   (the mapping call), and `simd` decodes packed postings eight at a
+//!   time on x86-64 CPUs that report AVX2 when asked at run time (the
+//!   entry into the code compiled for AVX2).
 //!
 //! # Example
 //!
@@ -91,8 +93,9 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// The one `unsafe` block is the mapping call behind the `mmap` feature.
-#![cfg_attr(not(feature = "mmap"), forbid(unsafe_code))]
+// Two `unsafe` blocks, each behind a feature: the mapping call of `mmap`
+// and the entry into code compiled for AVX2 of `simd`.
+#![cfg_attr(not(any(feature = "mmap", feature = "simd")), forbid(unsafe_code))]
 
 extern crate alloc;
 
@@ -103,6 +106,7 @@ mod posting;
 mod query;
 mod search;
 mod segment;
+mod simd;
 #[cfg(feature = "std")]
 mod snapshot;
 mod sort;

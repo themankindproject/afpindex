@@ -34,7 +34,7 @@ jobs:
       - run: cargo run --release --example quickstart
       # A small catalog through every stage: build, additions, removals,
       # both compactions, the snapshot written, read and mapped, searches.
-      - run: cargo run --release --features mmap --example lifecycle -- 300 400 20000 60
+      - run: cargo run --release --features mmap,simd --example lifecycle -- 300 400 20000 60
 
   test-32bit:
     runs-on: ubuntu-latest
@@ -55,7 +55,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features
-      # The default features are what most users build: `std` without `mmap`.
+      # The default features are what most users build: `std` without `mmap`
+      # or `simd`.
       - run: cargo clippy --all-targets
       - run: cargo clippy --lib --no-default-features
       - run: cargo doc --no-deps --all-features
@@ -66,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.87
       - run: cargo check --all-targets --all-features
 
   no_std:

@@ -4,6 +4,8 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::ops::Range;
 
+use crate::simd::{Decoder, LANES, WINDOW};
+
 /// Unsigned integers of one width, `bits` each, packed back to back in
 /// little-endian bit order. Reading one is an unaligned 64-bit load, a
 /// shift and a mask; eight slack bytes at the end keep every such window
@@ -128,7 +130,7 @@ impl Packed {
 
     /// Pack `values` at `bits` through a builder with room for `capacity`.
     #[cfg(test)]
-    fn pack(values: &[u32], bits: u32, capacity: usize) -> Self {
+    pub(crate) fn pack(values: &[u32], bits: u32, capacity: usize) -> Self {
         let mut out = PackedBuilder::with_capacity(capacity, bits);
         out.extend(values.iter().copied());
         assert_eq!(out.len(), values.len());
@@ -187,12 +189,66 @@ impl Packed {
         }
     }
 
+    /// A cursor over the entries from `at` on in blocks of [`LANES`], if
+    /// `decoder` has a kernel for this width.
+    #[inline(always)]
+    pub(crate) fn blocks<D: Decoder>(
+        &self,
+        at: usize,
+        decoder: D,
+    ) -> Option<Blocks<'_, D::Kernel>> {
+        debug_assert!(at <= self.len, "{at} past {}", self.len);
+        let start = at as u64 * u64::from(self.bits);
+        let kernel = decoder.kernel(self.bits, (start & 7) as usize)?;
+        Some(Blocks {
+            bytes: self.bytes.as_slice(),
+            kernel,
+            byte: (start >> 3) as usize,
+            // A block of eight values is `bits` whole bytes.
+            step: self.bits as usize,
+        })
+    }
+
+    /// Call `f` with entries `lo..hi` in blocks of up to [`LANES`], as far
+    /// as `decoder` has a kernel for them, and return the entry it stopped
+    /// at: `hi`, or an earlier one the caller reads the rest from.
+    ///
+    /// `f` gets the index of the block's first entry, the block, and how
+    /// many of its lanes are entries of the range (all of them but in the
+    /// last block); the other lanes hold no particular value. Nothing is
+    /// decoded this way without a kernel, for a range shorter than
+    /// [`Packed::BLOCK_MIN`], or within a window of the array's end.
+    #[inline(always)]
+    pub(crate) fn for_each_block<D: Decoder>(
+        &self,
+        lo: usize,
+        hi: usize,
+        decoder: D,
+        mut f: impl FnMut(usize, &[u32; LANES], usize),
+    ) -> usize {
+        debug_assert!(lo <= hi && hi <= self.len, "{lo}..{hi} past {}", self.len);
+        if hi - lo < Self::BLOCK_MIN {
+            return lo;
+        }
+        let Some(mut blocks) = self.blocks(lo, decoder) else {
+            return lo;
+        };
+        let mut i = lo;
+        while i < hi {
+            let Some(block) = blocks.next() else { break };
+            let n = (hi - i).min(LANES);
+            f(i, &block, n);
+            i += n;
+        }
+        i
+    }
+
     /// Load a byte of every cache line that entries `lo..hi` lie in, and
     /// for a short range of those up to `reach` bytes past its last byte,
     /// and fold them together for a caller to discard: the lines a decode
     /// of the range will read are then on their way before it starts. A
-    /// decode reads up to [`Packed::SLACK`] bytes past the last entry.
-    /// Consecutive loads are at most a line
+    /// decoder reads a window past the last entry (8 bytes one value at a
+    /// time, [`WINDOW`] in blocks). Consecutive loads are at most a line
     /// apart, so no line is skipped whatever the alignment of the array.
     #[inline]
     pub(crate) fn touch(&self, lo: usize, hi: usize, reach: usize) -> u32 {
@@ -219,6 +275,36 @@ impl Packed {
             at += LINE;
         }
         u32::from(acc)
+    }
+
+    /// Entries a range must have before it is decoded in blocks: below
+    /// this, setting a kernel up costs more than the values it decodes.
+    pub(crate) const BLOCK_MIN: usize = 4;
+
+    /// Call `f` with entries `lo..hi` in order, decoded in blocks where
+    /// `decoder` has a kernel and as a stream ([`Packed::for_each`])
+    /// otherwise.
+    #[inline(always)]
+    pub(crate) fn for_each_in<D: Decoder>(
+        &self,
+        lo: usize,
+        hi: usize,
+        decoder: D,
+        mut f: impl FnMut(u32),
+    ) {
+        let rest = self.for_each_block(lo, hi, decoder, |_, block, n| {
+            if n == LANES {
+                // The common block, with a loop of fixed length.
+                for &v in block {
+                    f(v);
+                }
+            } else {
+                for &v in &block[..n] {
+                    f(v);
+                }
+            }
+        });
+        self.for_each(rest, hi, f);
     }
 
     pub(crate) const fn len(&self) -> usize {
@@ -274,6 +360,29 @@ impl Packed {
             }
         }
         lo
+    }
+}
+
+/// A cursor over a [`Packed`] array in blocks of [`LANES`] values
+/// (see [`Packed::blocks`]).
+pub(crate) struct Blocks<'a, K> {
+    bytes: &'a [u8],
+    kernel: K,
+    /// Byte the next block's first value starts in.
+    byte: usize,
+    /// Bytes per block.
+    step: usize,
+}
+
+impl<K: Fn(&[u8; WINDOW]) -> [u32; LANES]> Blocks<'_, K> {
+    /// The next [`LANES`] values, or `None` within a window of the end of
+    /// the bytes, where the caller reads what is left one value at a
+    /// time. Lanes past the array's length hold no particular value.
+    #[inline(always)]
+    pub(crate) fn next(&mut self) -> Option<[u32; LANES]> {
+        let window = self.bytes.get(self.byte..)?.first_chunk::<WINDOW>()?;
+        self.byte += self.step;
+        Some((self.kernel)(window))
     }
 }
 
@@ -558,6 +667,54 @@ mod tests {
         }
     }
 
+    /// Stretches long enough to be copied a word at a time, and longer
+    /// than one stack block of words, from every bit offset in the source
+    /// to every bit offset in the destination.
+    #[test]
+    fn long_stretches_copy_as_they_decode() {
+        let mut x = 0x0DDB_A110_5EED_1234u64;
+        for bits in [1u32, 3, 7, 8, 13, 15, 17, 24, 31, 32] {
+            let values: Vec<u32> = (0..5_000)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x & mask_of(bits)) as u32
+                })
+                .collect();
+            let whole = Packed::pack(&values, bits, values.len());
+            for lead in 0..9 {
+                for (lo, hi) in [
+                    (0, 5_000),
+                    (lead, 4_999),
+                    (3 * lead, 40),
+                    (17, 17 + 40 * lead),
+                ] {
+                    let hi = hi.max(lo);
+                    let mut b = PackedBuilder::with_capacity(0, bits);
+                    b.extend(values[..lead].iter().copied());
+                    b.extend_from(whole.view(), lo, hi);
+                    // A value after the stretch shows where it left the
+                    // pending bits.
+                    b.push(values[0]);
+                    let want: Vec<u32> = values[..lead]
+                        .iter()
+                        .chain(&values[lo..hi])
+                        .chain(&values[..1])
+                        .copied()
+                        .collect();
+                    let got = b.finish();
+                    assert_eq!(got.len(), want.len());
+                    assert_eq!(
+                        got.data(),
+                        Packed::pack(&want, bits, 0).data(),
+                        "{bits} bits, {lead} before, {lo}..{hi}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn for_each_matches_get_at_every_width() {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -600,7 +757,7 @@ mod tests {
             let values: Vec<u32> = (0..300).map(|i| i & mask_of(bits) as u32).collect();
             let p = Packed::pack(&values, bits, values.len());
             for (lo, hi) in [(0, 1), (0, 300), (299, 300), (17, 140), (64, 65), (1, 299)] {
-                for reach in [0, 7, Packed::SLACK, usize::MAX] {
+                for reach in [0, 7, WINDOW - 1, usize::MAX] {
                     p.touch(lo, hi, reach);
                 }
             }

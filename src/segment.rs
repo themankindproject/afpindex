@@ -517,7 +517,7 @@ impl Segment {
     /// first key of a batch, the slots of the batch after it are loaded.
     #[inline]
     fn touch_ahead(&self, k: usize) {
-        if k % AHEAD == 0 {
+        if k.is_multiple_of(AHEAD) {
             let n = self.keys.len();
             let from = (k + AHEAD).min(n);
             self.touch_directory(&self.keys[from..(from + AHEAD).min(n)]);
@@ -1275,7 +1275,7 @@ mod tests {
                 // what `keep` rejects there) leaves the right side with
                 // nothing to filter, so it may go without a `keep`.
                 let only_left = |r: u32| left.contains(&r) && !right.contains(&r);
-                let keep_left = |r: u32| !only_left(r) || (keep(r) && r % 2 == 0);
+                let keep_left = |r: u32| !only_left(r) || (keep(r) && r.is_multiple_of(2));
                 let one_sided = sorted(
                     &mut a_rows
                         .iter()
