@@ -33,10 +33,15 @@
 //! Flags and reserved fields are written as zero and ignored on read.
 
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread;
 use std::vec::Vec;
 
 use crate::packed::Packed;
 use crate::segment::MAX_POSTINGS;
+use crate::simd::{self, Decoder, LANES, Pass};
 use crate::{Catalog, Segment, SnapshotError};
 
 const SEGMENT_MAGIC: [u8; 4] = *b"AFIX";
@@ -390,15 +395,28 @@ fn read_segment_ids<R: Read>(r: &mut R) -> Result<(Segment, Ids), SnapshotError>
     if read_u64(r)? != ck.finish() {
         return Err(SnapshotError::Checksum);
     }
-
-    finish_segment(widths, n_post, keys, &offsets, refs, times)
+    // Checksummed as it was read.
+    finish_segment(widths, n_post, keys, &offsets, refs, times, |_, _| true)
 }
+
+/// Segments with at least this many postings have their runs checked on
+/// every core, and on the mapped path checksummed on a core of their own
+/// at the same time.
+#[cfg(not(test))]
+const PARALLEL_MIN: usize = 1 << 22;
+/// Small enough for the tests' segments to take the parallel path.
+#[cfg(test)]
+const PARALLEL_MIN: usize = 1 << 10;
 
 /// Check that the arrays describe a valid segment (keys ascending, offsets
 /// consistent, each run sorted by `(reference, time)` without duplicates)
-/// and assemble it. The walk also records each run's multiplicity for its
-/// directory slot and the range of the references, so nothing reads the
-/// postings a second time at load.
+/// and assemble it. The walk over the runs ([`CheckRuns`]) also records
+/// each run's multiplicity for its directory slot and the range of the
+/// references, so nothing reads the postings a second time at load.
+///
+/// `checksum` checks the packed arrays, unless the caller already has (it
+/// then returns `true`); a mismatch is reported before anything else,
+/// though the runs are checked while it runs.
 fn finish_segment(
     (ref_bits, time_bits): (u32, u32),
     n_post: usize,
@@ -406,7 +424,34 @@ fn finish_segment(
     offsets: &[u64],
     refs: Packed,
     times: Packed,
+    checksum: impl FnOnce(&Packed, &Packed) -> bool + Send,
 ) -> Result<(Segment, Ids), SnapshotError> {
+    let index = check_index(n_post, &keys, offsets);
+    let check = CheckRuns {
+        // Distinct `(reference, time)` pairs bound a run's length by the
+        // widths, which keeps the scan proportional to the bytes read.
+        longest: 1u64 << (ref_bits + time_bits).min(63),
+        offsets,
+        refs: &refs,
+        times: &times,
+    };
+    // The walk relies on the index, so it runs only once that holds.
+    let (summed, walk) = if index.is_ok() {
+        check_runs(check, || checksum(&refs, &times))
+    } else {
+        (checksum(&refs, &times), Ok((Vec::new(), None)))
+    };
+    if !summed {
+        return Err(SnapshotError::Checksum);
+    }
+    index?;
+    let (mults, ids) = walk?;
+    Ok((Segment::from_parts(keys, offsets, refs, times, &mults), ids))
+}
+
+/// Keys strictly ascending, and offsets strictly ascending from 0 to the
+/// posting count: what the walk over the runs relies on.
+fn check_index(n_post: usize, keys: &[u32], offsets: &[u64]) -> Result<(), SnapshotError> {
     if !keys.windows(2).all(|w| w[0] < w[1]) {
         return Err(SnapshotError::Corrupt("keys not strictly ascending"));
     }
@@ -416,47 +461,206 @@ fn finish_segment(
     if !offsets.windows(2).all(|w| w[0] < w[1]) {
         return Err(SnapshotError::Corrupt("offsets not strictly ascending"));
     }
-    // Distinct `(reference, time)` pairs bound a run's length by the
-    // widths, which keeps the scan below proportional to the bytes read.
-    let distinct = 1u64 << (ref_bits + time_bits).min(63);
-    // The same walk records each run's multiplicity for its directory slot.
-    let mut mults = Vec::with_capacity(keys.len());
-    let mut ids: Ids = None;
-    let (run_refs, run_times) = (refs.view(), times.view());
-    // A posting as one word that orders as `(reference, time)` does.
-    let posting = |i: usize| u64::from(run_refs.get(i)) << 32 | u64::from(run_times.get(i));
-    for w in offsets.windows(2) {
-        if w[1] - w[0] > distinct {
-            return Err(SnapshotError::Corrupt(
-                "a run is longer than its widths allow",
-            ));
+    Ok(())
+}
+
+/// Each run's multiplicity and the range of the references, or the error
+/// of the first run in key order that fails the check.
+type Walk = Result<(Vec<u8>, Ids), SnapshotError>;
+
+/// Run `check` over every run, and `side` meanwhile; return what `side`
+/// returned and the walk.
+///
+/// A large segment's runs are cut into pieces of about equal postings, a
+/// few per core so that a slow piece does not hold the rest up, and every
+/// thread takes the next piece until none are left; `side` is the first
+/// piece taken. The calling thread works too, so a thread that cannot be
+/// spawned costs nothing but parallelism. A small segment, or a single
+/// core, does it all in order on the calling thread.
+fn check_runs<T: Send>(check: CheckRuns<'_>, side: impl FnOnce() -> T + Send) -> (T, Walk) {
+    let offsets = check.offsets;
+    let n_keys = offsets.len() - 1;
+    let n_post = offsets[n_keys];
+    let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    if threads <= 1 || n_post < PARALLEL_MIN as u64 {
+        let out = side();
+        return (out, simd::run(check));
+    }
+    // Piece `i` is keys `bounds[i]..bounds[i + 1]`.
+    let pieces = threads * 4;
+    let mut bounds = vec![0];
+    for piece in 1..pieces {
+        let target = (u128::from(n_post) * piece as u128 / pieces as u128) as u64;
+        let k = offsets.partition_point(|&o| o < target).min(n_keys);
+        if k > bounds[bounds.len() - 1] {
+            bounds.push(k);
         }
-        let (lo, hi) = (w[0] as usize, w[1] as usize);
-        let (mut mult, mut streak) = (1u32, 1u32);
-        let first = posting(lo);
-        let mut prev = first;
-        for i in lo + 1..hi {
-            let cur = posting(i);
-            if cur <= prev {
+    }
+    if bounds[bounds.len() - 1] < n_keys {
+        bounds.push(n_keys);
+    }
+    let n = bounds.len() - 1;
+    let next = AtomicUsize::new(0);
+    let side = Mutex::new(Some(side));
+    let side_out = Mutex::new(None);
+    let walks: Vec<Mutex<Option<Walk>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let worker = || {
+        loop {
+            match next.fetch_add(1, Ordering::Relaxed) {
+                0 => {
+                    let side = side.lock().unwrap_or_else(PoisonError::into_inner).take();
+                    if let Some(side) = side {
+                        let out = side();
+                        *side_out.lock().unwrap_or_else(PoisonError::into_inner) = Some(out);
+                    }
+                }
+                i if i <= n => {
+                    let piece = CheckRuns {
+                        offsets: &offsets[bounds[i - 1]..=bounds[i]],
+                        ..check
+                    };
+                    let walk = simd::run(piece);
+                    *walks[i - 1].lock().unwrap_or_else(PoisonError::into_inner) = Some(walk);
+                }
+                _ => break,
+            }
+        }
+    };
+    thread::scope(|s| {
+        for _ in 1..threads {
+            // A failed spawn leaves its share to the others (the closure
+            // captures only references, so it is `Copy`).
+            let _ = thread::Builder::new().spawn_scoped(s, worker);
+        }
+        worker();
+    });
+    let out = side_out
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .expect("the first piece taken is `side`");
+    let mut mults = Vec::with_capacity(n_keys);
+    let mut ids: Ids = None;
+    for walk in walks {
+        let walk = walk
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .expect("every piece is taken");
+        match walk {
+            Ok((piece, piece_ids)) => {
+                mults.extend_from_slice(&piece);
+                ids = match (ids, piece_ids) {
+                    (Some((lo, hi)), Some((a, b))) => Some((lo.min(a), hi.max(b))),
+                    (a, b) => a.or(b),
+                };
+            }
+            Err(e) => return (out, Err(e)),
+        }
+    }
+    (out, Ok((mults, ids)))
+}
+
+/// The walk over every run of a segment being loaded: each run sorted by
+/// `(reference, time)` without duplicates and no longer than `longest`.
+/// Returns each run's multiplicity and the range of the references.
+#[derive(Clone, Copy)]
+struct CheckRuns<'a> {
+    longest: u64,
+    offsets: &'a [u64],
+    refs: &'a Packed,
+    times: &'a Packed,
+}
+
+const UNSORTED: SnapshotError = SnapshotError::Corrupt("a run is not sorted by (reference, time)");
+
+impl Pass for CheckRuns<'_> {
+    type Out = Result<(Vec<u8>, Ids), SnapshotError>;
+
+    /// A posting is compared with the one before it as one word that
+    /// orders as `(reference, time)` does. Where the decoder has a kernel,
+    /// eight references and eight times are decoded and compared at a
+    /// time, both arrays in the same loop; a block in which no reference
+    /// repeats, which is most of them, needs no look at its streaks.
+    #[inline(always)]
+    fn run<D: Decoder>(self, decoder: D) -> Self::Out {
+        let mut mults = Vec::with_capacity(self.offsets.len().saturating_sub(1));
+        let mut ids: Ids = None;
+        let (refs, times) = (self.refs.view(), self.times.view());
+        let posting = |i: usize| u64::from(refs.get(i)) << 32 | u64::from(times.get(i));
+        for w in self.offsets.windows(2) {
+            if w[1] - w[0] > self.longest {
                 return Err(SnapshotError::Corrupt(
-                    "a run is not sorted by (reference, time)",
+                    "a run is longer than its widths allow",
                 ));
             }
-            streak = if cur >> 32 == prev >> 32 {
-                streak.saturating_add(1)
-            } else {
-                1
-            };
-            mult = mult.max(streak);
-            prev = cur;
+            let (lo, hi) = (w[0] as usize, w[1] as usize);
+            let (mut mult, mut streak) = (1u32, 1u32);
+            let first = posting(lo);
+            let mut prev = first;
+            let mut i = lo + 1;
+            if hi - i >= LANES {
+                let blocks = self
+                    .refs
+                    .blocks(i, decoder)
+                    .zip(self.times.blocks(i, decoder));
+                if let Some((mut refs, mut times)) = blocks {
+                    while hi - i >= LANES {
+                        let (Some(r), Some(t)) = (refs.next(), times.next()) else {
+                            break;
+                        };
+                        // Each lane's predecessor: the block one lane
+                        // later, behind the posting before the block.
+                        let (mut before_r, mut before_t) =
+                            ([(prev >> 32) as u32; LANES], [prev as u32; LANES]);
+                        before_r[1..].copy_from_slice(&r[..LANES - 1]);
+                        before_t[1..].copy_from_slice(&t[..LANES - 1]);
+                        let (mut sorted, mut repeats) = (true, false);
+                        for lane in 0..LANES {
+                            let same = r[lane] == before_r[lane];
+                            sorted &=
+                                r[lane] > before_r[lane] || (same && t[lane] > before_t[lane]);
+                            repeats |= same;
+                        }
+                        if !sorted {
+                            return Err(UNSORTED);
+                        }
+                        if repeats {
+                            for lane in 0..LANES {
+                                streak = if r[lane] == before_r[lane] {
+                                    streak.saturating_add(1)
+                                } else {
+                                    1
+                                };
+                                mult = mult.max(streak);
+                            }
+                        } else {
+                            streak = 1;
+                        }
+                        prev = u64::from(r[LANES - 1]) << 32 | u64::from(t[LANES - 1]);
+                        i += LANES;
+                    }
+                }
+            }
+            for i in i..hi {
+                let cur = posting(i);
+                if cur <= prev {
+                    return Err(UNSORTED);
+                }
+                streak = if cur >> 32 == prev >> 32 {
+                    streak.saturating_add(1)
+                } else {
+                    1
+                };
+                mult = mult.max(streak);
+                prev = cur;
+            }
+            mults.push(u8::try_from(mult).unwrap_or(u8::MAX));
+            // Sorted, so the run's first reference is its smallest and its
+            // last one its largest.
+            let (first, last) = ((first >> 32) as u32, (prev >> 32) as u32);
+            ids = Some(ids.map_or((first, last), |(min, max)| (min.min(first), max.max(last))));
         }
-        mults.push(u8::try_from(mult).unwrap_or(u8::MAX));
-        // Sorted, so the run's first reference is its smallest and its
-        // last one its largest.
-        let (first, last) = ((first >> 32) as u32, (prev >> 32) as u32);
-        ids = Some(ids.map_or((first, last), |(min, max)| (min.min(first), max.max(last))));
+        Ok((mults, ids))
     }
-    Ok((Segment::from_parts(keys, offsets, refs, times, &mults), ids))
 }
 
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
@@ -570,8 +774,8 @@ mod mapped {
     use memmap2::Mmap;
 
     use super::{
-        Checksum, HEADER, Ids, SEGMENT_MAGIC, check_id_space, checksum_of, finish_segment,
-        read_catalog_head, read_header, read_pad, read_u32s, read_u64, read_u64s, segment_counts,
+        HEADER, Ids, SEGMENT_MAGIC, check_id_space, checksum_of, finish_segment, read_catalog_head,
+        read_header, read_pad, read_u32s, read_u64, read_u64s, segment_counts,
     };
     use crate::packed::Packed;
     use crate::{Catalog, Segment, SnapshotError};
@@ -592,13 +796,12 @@ mod mapped {
     }
 
     /// Wrap the packed array whose data starts at `start` (where `r` also
-    /// stands), checksum it, and move `r` past it.
+    /// stands) and move `r` past it.
     fn map_packed(
         map: &Arc<Mmap>,
         start: usize,
         n: usize,
         bits: u32,
-        ck: &mut Checksum,
         r: &mut &[u8],
     ) -> Result<Packed, SnapshotError> {
         if bits > u32::BITS {
@@ -606,9 +809,9 @@ mod mapped {
         }
         let packed =
             Packed::mapped(Arc::clone(map), start, n, bits).ok_or(SnapshotError::Truncated)?;
-        let data = packed.data();
-        ck.words(data);
-        *r = r.get(data.len()..).ok_or(SnapshotError::Truncated)?;
+        *r = r
+            .get(packed.data().len()..)
+            .ok_or(SnapshotError::Truncated)?;
         Ok(packed)
     }
 
@@ -629,15 +832,20 @@ mod mapped {
         rel = read_pad(&mut r, rel + n_keys as u64 * 4)?;
         let offsets = read_u64s(&mut r, n_keys + 1, &mut ck)?;
         rel += (n_keys as u64 + 1) * 8;
-        let refs = map_packed(map, pos + rel as usize, n_post, ref_bits, &mut ck, &mut r)?;
+        let refs = map_packed(map, pos + rel as usize, n_post, ref_bits, &mut r)?;
         rel = read_pad(&mut r, rel + refs.data().len() as u64)?;
-        let times = map_packed(map, pos + rel as usize, n_post, time_bits, &mut ck, &mut r)?;
+        let times = map_packed(map, pos + rel as usize, n_post, time_bits, &mut r)?;
         rel = read_pad(&mut r, rel + times.data().len() as u64)?;
-        if read_u64(&mut r)? != ck.finish() {
-            return Err(SnapshotError::Checksum);
-        }
+        let stored = read_u64(&mut r)?;
         rel += 8;
-        let (seg, ids) = finish_segment(widths, n_post, keys, &offsets, refs, times)?;
+        // The packed arrays are nearly all of the bytes: they are summed
+        // on a core of their own while the runs are checked.
+        let sum = move |refs: &Packed, times: &Packed| {
+            ck.words(refs.data());
+            ck.words(times.data());
+            ck.finish() == stored
+        };
+        let (seg, ids) = finish_segment(widths, n_post, keys, &offsets, refs, times, sum)?;
         Ok((seg, ids, pos + rel as usize))
     }
 
@@ -733,6 +941,126 @@ mod tests {
         assert!(matches!(roundtrip(&dup_run), Err(SnapshotError::Corrupt(m)) if m.contains("run")));
         let good = Segment::from_postings(vec![Posting::new(1, 0, 3), Posting::new(1, 1, 0)]);
         assert_eq!(roundtrip(&good).unwrap(), good);
+    }
+
+    /// Runs long enough to be checked eight postings at a time agree with
+    /// the check of one posting at a time: on their multiplicities, with
+    /// streaks that cross blocks, and on a posting out of order or repeated
+    /// at every position of a run.
+    #[test]
+    fn long_runs_are_checked_in_blocks() {
+        // Two runs. The second starts below where the first ends, which
+        // is valid: the order holds within a run only.
+        let streaks = [1u32, 3, 1, 1, 12, 2, 1, 9, 1, 1, 1, 4, 20, 1, 3];
+        let run: Vec<u32> = streaks
+            .iter()
+            .enumerate()
+            .flat_map(|(r, &n)| (0..n).map(move |_| 7 * r as u32))
+            .collect();
+        let n = run.len();
+        let refs: Vec<u32> = run.iter().chain(&run[5..]).copied().collect();
+        let times: Vec<u32> = (0..refs.len() as u32).map(|i| 3 * i).collect();
+        let offsets = [0, n as u64, refs.len() as u64];
+        let good = Segment::from_arrays(&[4, 9], &offsets, &refs, &times);
+        let back = roundtrip(&good).unwrap();
+        assert_eq!(back, good);
+        assert_eq!(back.range_mult(4), Some((0, n, 20)));
+        assert_eq!(back.range_mult(9), Some((n, refs.len(), 20)));
+        assert_eq!(good.range_mult(9), back.range_mult(9));
+        for at in (1..refs.len()).filter(|&at| at != n) {
+            // The posting at `at` moved before its predecessor, by its
+            // reference and then by its time alone.
+            let (mut r, mut t) = (refs.clone(), times.clone());
+            r[at - 1] = r[at] + 1;
+            let bad = Segment::from_arrays(&[4, 9], &offsets, &r, &times);
+            assert!(
+                matches!(roundtrip(&bad), Err(SnapshotError::Corrupt(m)) if m.contains("run")),
+                "reference out of order at {at}"
+            );
+            if refs[at] == refs[at - 1] {
+                t[at] = t[at - 1] - 1;
+                let bad = Segment::from_arrays(&[4, 9], &offsets, &refs, &t);
+                assert!(
+                    matches!(roundtrip(&bad), Err(SnapshotError::Corrupt(m)) if m.contains("run")),
+                    "time out of order at {at}"
+                );
+                // And repeated outright.
+                t[at] = t[at - 1];
+                let bad = Segment::from_arrays(&[4, 9], &offsets, &refs, &t);
+                assert!(
+                    matches!(roundtrip(&bad), Err(SnapshotError::Corrupt(m)) if m.contains("run")),
+                    "posting repeated at {at}"
+                );
+            }
+        }
+    }
+
+    /// A segment large enough to be checked on every core: the pieces'
+    /// multiplicities and reference ranges join up to those of a check in
+    /// order, and an unsorted run is found whichever piece it is in.
+    #[test]
+    fn large_segments_are_checked_in_parallel_pieces() {
+        let (n_keys, per_key) = (600u32, 20u32);
+        let mut refs = Vec::new();
+        let mut offsets = vec![0u64];
+        for k in 0..n_keys {
+            // Key `k` repeats one reference `k % 5 + 1` times, so the
+            // multiplicities differ from piece to piece.
+            let first = k % 7;
+            refs.extend((0..per_key).map(|i| first + i / (k % 5 + 1)));
+            offsets.push(refs.len() as u64);
+        }
+        let times: Vec<u32> = (0..refs.len() as u32).collect();
+        assert!(refs.len() >= 4 * PARALLEL_MIN);
+        let keys: Vec<u32> = (0..n_keys).map(|k| 3 * k).collect();
+        let good = Segment::from_arrays(&keys, &offsets, &refs, &times);
+        let back = roundtrip(&good).unwrap();
+        assert_eq!(back, good);
+        for &key in &keys {
+            assert_eq!(back.range_mult(key), good.range_mult(key), "key {key}");
+        }
+        for k in [0, 1, n_keys / 2, n_keys - 2, n_keys - 1] {
+            let mut bad = refs.clone();
+            let at = offsets[k as usize + 1] as usize - 1;
+            bad[at] = 0;
+            bad[at - 1] = 1;
+            let bad = Segment::from_arrays(&keys, &offsets, &bad, &times);
+            assert!(
+                matches!(roundtrip(&bad), Err(SnapshotError::Corrupt(m)) if m.contains("run")),
+                "unsorted run {k}"
+            );
+        }
+    }
+
+    /// The mapped path sums the packed arrays while the runs are checked:
+    /// a flipped data byte is a checksum error, not a structural one, and
+    /// an intact file maps to the segment it was written from.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn mapped_large_segments_are_summed_alongside_the_check() {
+        let refs: Vec<u32> = (0..8_000u32).map(|i| i % 50).collect();
+        let offsets: Vec<u64> = (0..=400u64).map(|k| k * 20).collect();
+        let times: Vec<u32> = (0..8_000u32).map(|i| i / 50).collect();
+        let keys: Vec<u32> = (0..400).collect();
+        let mut sorted = refs.clone();
+        for run in sorted.chunks_mut(20) {
+            run.sort_unstable();
+        }
+        let seg = Segment::from_arrays(&keys, &offsets, &sorted, &times);
+        let mut bytes = Vec::new();
+        seg.write_to(&mut bytes).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("afindex-parallel-{}.afx", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Segment::map_from(&path).unwrap(), seg);
+        // The last data byte before the checksum's padding: a reference or
+        // time bit, so the arrays still describe a valid segment.
+        let at = bytes.len() - 16;
+        bytes[at] ^= 0x10;
+        std::fs::write(&path, &bytes).unwrap();
+        let got = Segment::map_from(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(got, Err(SnapshotError::Checksum)), "{got:?}");
     }
 
     #[test]
