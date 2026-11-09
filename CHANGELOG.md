@@ -54,11 +54,43 @@ search results.
   0.46 s, `map_from` 0.44 s to 0.32 s.
 - `Query::from_pairs` groups with a stable radix sort and allocates its
   arrays once at their final size: 17.5 µs to 10.1 µs for 798 rows.
+- The minimum Rust version is 1.87 (was 1.85): the vector kernel uses
+  intrinsics that are safe to call from 1.87 on, and the default build
+  uses `is_multiple_of`, stable from 1.87.
+- The totals pass loads every cache line of the next batch of runs
+  before counting the current one, not just each run's first and last
+  entry, and for a run shorter than two lines also the line past it that
+  the decoder reads. On an AWS `m7i-flex.large` with the real catalog
+  (499 M postings, 136 per hash) and its 104 clips, against the code
+  before this release's search changes on the same host: summed
+  best-of-three latency 176.8 ms to 157.2 ms, p95 7.4 ms to 5.9 ms,
+  candidates identical; synthetic catalogs of 136 postings per hash
+  2,067 to 2,596 searches per second, of 17 per hash unchanged.
+- Snapshot loads check a large segment's runs on every core, and
+  `map_from` checksums the packed arrays on a core of their own at the
+  same time; the file format is unchanged. On the two-vCPU host above,
+  `map_from` of the real catalog 1.8 s to 1.6 s (1.2 s to 1.0 s with
+  `simd`); `read_from` is within 0.1 s, as its checksum runs while the
+  file is read.
+- The histogram pass no longer searches for the end of a survivor's
+  group in a run where no reference has two postings, and bounds the
+  search by the run's multiplicity elsewhere.
 - CI: read-only token, superseded runs are cancelled, clippy also runs on
   the default features, and the lifecycle example runs as a smoke test.
 
 ### Added
 
+- `simd` feature: on x86-64 CPUs that report AVX2 at run time, the
+  totals pass, the search for a survivor's group in a short run and the
+  check of every run at snapshot load decode packed values eight at a
+  time. The kernel is safe code; entering the code compiled for AVX2 is
+  the feature's one `unsafe` block. On the host and catalog above, on
+  top of the default build: summed latency 157.2 ms to 136.9 ms, p50
+  0.80 ms to 0.71 ms, p95 5.9 ms to 5.1 ms, two threads 629 to 737
+  searches per second, `read_from` 2.7 s to 2.1 s, `map_from` 1.6 s to
+  1.0 s, candidates identical; synthetic catalogs 12 % (17 postings per
+  hash) and 16 % (136) more searches per second. Off by default, and a
+  no-op on other targets and CPUs.
 - `examples/lifecycle.rs`: times the bulk build, additions, both
   compactions, the snapshot (written, read and mapped), query grouping and
   searches from a strict vote floor to none.

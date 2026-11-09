@@ -26,10 +26,12 @@ in milliseconds:
   merged geometrically; removals tombstone a reference, and compaction
   drops its postings. Reference ids never change, and a catalog clone
   shares its segments.
-- **No unsafe code, one dependency (`libm`), `no_std + alloc` core.** The
-  `std` feature adds checksummed snapshot files; the `mmap` feature maps
-  them instead of reading them, with one more dependency (`memmap2`) and
-  the crate's only `unsafe` block, the mapping call.
+- **No unsafe code by default, one dependency (`libm`), `no_std + alloc`
+  core.** The `std` feature adds checksummed snapshot files. Two more
+  features bring one `unsafe` block each: `mmap` maps those files instead
+  of reading them (the mapping call, and one more dependency, `memmap2`),
+  and `simd` decodes packed postings eight at a time on x86-64 CPUs with
+  AVX2 (the entry into the code compiled for it).
 
 ## Quick start
 
@@ -195,7 +197,8 @@ cargo run --release --example bench -- 20000 3000 3600000 200 4
 Those numbers are for the generic x86-64 target. Building with
 `RUSTFLAGS="-C target-cpu=native"` gained a further 5 % on this machine
 (a vectorised unsigned maximum in the survivor scan, BMI2 shifts in the
-packed loads); the crate sets no target features itself. The four-thread
+packed loads); the crate sets no target features itself, and the `simd`
+feature picks its code when a pass starts instead. The four-thread
 figure is the first five seconds from a cool package: past 75 °C this
 laptop throttles to about 20,000 searches per second, whatever the build.
 
@@ -203,9 +206,9 @@ A search here touches about 800 runs, each a few cache lines in a 0.5 GiB
 array, so it is bound by memory latency and parallelism rather than by
 arithmetic. The passes are arranged for that: a hash resolves in one
 directory read whose address depends only on the hash; each pass loads its
-next batch of lines (32 directory slots, 16 runs, 32 vote groups; half
-that costs 13 % of search time, double gains nothing more) before working
-on the current batch, with plain loads that overlap the way a
+next batch of lines (32 directory slots, every line of 16 runs, 32 vote
+groups; half that costs 13 % of search time, double gains nothing more)
+before working on the current batch, with plain loads that overlap the way a
 prefetch would; the totals pass decodes each run as a bit stream, answers
 the fanout test from a ring of the last 64 references instead of a second
 read, and uses plain adds whenever no counter can overflow; a run where
@@ -322,6 +325,76 @@ within one table only. The hypervisor exposes no hardware counters on this
 size, so cycle counts come from the laptop. The design notes estimated 50
 to 450 searches per second for a two-vCPU task.
 
+### Run lines, vector decoding and parallel loads
+
+Three changes since the tables above, measured on an AWS
+`m7i-flex.large` (two hardware threads of one Sapphire Rapids core),
+generic x86-64 build, with the real catalog and its 104 clips, each
+build in three alternating rounds on one host; candidates were
+identical in every run:
+
+| | before | default build | `simd` |
+|---|---|---|---|
+| search, one thread, best of three summed over the clips | 176.8 ms | 157.2 ms | 136.9 ms |
+| search, one thread, p50 / p95 | 0.79 / 7.4 ms | 0.80 / 5.9 ms | 0.71 / 5.1 ms |
+| searches per second, two threads | 620 | 629 | 737 |
+| `read_from` / `map_from` | 2.8 / 1.8 s | 2.7 / 1.6 s | 2.1 / 1.0 s |
+| synthetic, 136 postings per hash, searches per second | 2,067 | 2,596 | 3,008 |
+| synthetic, 17 postings per hash, searches per second | 7,634 | 7,521 | 8,432 |
+
+**Every line of a run.** A real run is 136 references of 17 bits, five
+cache lines, and the totals pass used to load only each run's first and
+last entry ahead of time; the middle lines were missed on demand. It now
+loads every line of the next 16 runs, and for a run shorter than two
+lines also the line past it, which the decoder reads into (8 bytes past
+the last value one at a time, up to 31 in blocks). That took a fifth off
+the p95 and a ninth off the summed latency; the catalogs of 17 postings
+per hash, whose runs fit a line or two, are unchanged.
+
+**Vector instructions (`simd`).** With the `simd` feature, on x86-64,
+the passes that read many packed values ask the CPU for AVX2 when they
+start and, if it has it, decode eight values at a time (one byte shuffle
+and one variable shift per block, for widths up to 25 bits): the totals
+pass, the search for a survivor's group in a short run, and the check of
+every run when a snapshot is loaded. Everything else, and every other
+CPU, runs the same code as without the feature.
+
+**Parallel loads.** A large segment's runs are checked on every core,
+and `map_from` checksums the packed arrays on a core of their own at the
+same time; the format is unchanged. Two hardware threads of one core
+gain little from it (the table's load column); more cores should gain
+more, which was not measured.
+
+**Huge pages.** Running the same builds with
+`GLIBC_TUNABLES=glibc.malloc.hugetlb=1` took a further 7–13 % off
+search and 14–19 % off `read_from` on this host, depending on the build.
+It also removed a gap that is not in the code: the build from before
+these changes and the default build without the run-line change
+measured 5–7 % apart on the real clips without it, and the same with
+it. Compare builds with it set, or expect that much noise.
+
+Measured here and left out:
+
+- Loading runs further ahead (32 or 64 runs instead of 16) was within
+  noise of 16.
+- Loading the line past a run whatever its length gained 8 % on runs of
+  17 postings but cost 2.5 % on runs of 136, where that line is mostly
+  the next run's; hence the two-line limit.
+- Counters: folding every reference into 4,096 counters (wrong answers,
+  timing only) took a third off the totals pass with `simd`, so the
+  counter array is that much of it. Staging each counting posting in a
+  buffer per 8,192 references and counting each full buffer into a
+  32 KiB slice of the counters, the way to keep them in L1 with right
+  answers, made searches 2.3 times slower: a run's references ascend, so
+  consecutive postings append to the same buffer and wait on one
+  another's length.
+- Reading up to 64 entries of a run in blocks to find a survivor, or
+  halving a longer run down to 32 entries first, cost a sixth to a half
+  more of that pass than halving alone, so only ranges of 24 entries or
+  fewer are read in blocks.
+- Storing the directory in the snapshot instead of rebuilding it would
+  save 0.05 s of a load; the run check and the checksum are the rest.
+
 ## Feeding it
 
 Any fingerprinter whose output is `(hash: u32, time: u32)` rows works.
@@ -342,6 +415,7 @@ references before indexing.
 |---|---|---|
 | `std` | yes | `Catalog` and `Segment` snapshot I/O, `std::error::Error` for `SnapshotError` |
 | `mmap` | no | `Catalog::map_from` and `Segment::map_from` (implies `std`; adds `memmap2`) |
+| `simd` | no | AVX2 decoding of packed postings on x86-64, chosen at run time (implies `std`; a no-op elsewhere) |
 
 ```toml
 [dependencies]
