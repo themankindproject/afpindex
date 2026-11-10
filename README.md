@@ -371,7 +371,8 @@ search and 14–19 % off `read_from` on this host, depending on the build.
 It also removed a gap that is not in the code: the build from before
 these changes and the default build without the run-line change
 measured 5–7 % apart on the real clips without it, and the same with
-it. Compare builds with it set, or expect that much noise.
+it. Compare builds with it set, or expect that much noise. For
+deployments, see [Running it](#running-it).
 
 Measured here and left out:
 
@@ -394,6 +395,16 @@ Measured here and left out:
   fewer are read in blocks.
 - Storing the directory in the snapshot instead of rebuilding it would
   save 0.05 s of a load; the run check and the checksum are the rest.
+- mimalloc as the programs' global allocator (crate 0.1.52, its v3 and
+  its v2) gains what huge pages gain and nothing more. v3 asks for them
+  itself and then matched glibc with the tunable: 8 % off the summed
+  latency of the real clips and 10–12 % more synthetic searches per
+  second than plain glibc, within about 1 % of the tunable. With its huge
+  pages turned off (`MIMALLOC_ALLOW_THP=0`) it matched plain glibc. It
+  also loaded the real catalog in 1.9 s against 1.5 s with the tunable
+  and peaked at 2.56 GB against 2.12 GB (1.88 against 1.19 GB in the
+  lifecycle run). A load grows each array by doubling: glibc's `realloc`
+  moves a large block by remapping its pages, mimalloc's copies it.
 
 ## Feeding it
 
@@ -408,6 +419,31 @@ per second).
 Hashes that appear in nearly every reference (silence, hum) cost the most
 and tell the least; drop them from queries before searching, or from
 references before indexing.
+
+## Running it
+
+On Linux with glibc, start the process with huge pages for the heap:
+
+```bash
+GLIBC_TUNABLES=glibc.malloc.hugetlb=1 ./your-service
+```
+
+(`Environment=GLIBC_TUNABLES=glibc.malloc.hugetlb=1` in a systemd unit,
+`ENV` in a Dockerfile.) On the real catalog this cut search latency by
+7–8 %, raised synthetic throughput by 10–11 %, and brought `read_from`
+down from 2.0 s to 1.5 s, at the same peak memory. These are figures
+from an AWS `m7i-flex.large`; see
+[Run lines, vector decoding and parallel loads](#run-lines-vector-decoding-and-parallel-loads).
+The tunable needs transparent huge pages set to `madvise` (Ubuntu's
+default) or `always` in `/sys/kernel/mm/transparent_hugepage/enabled`,
+and it does nothing on `never` or outside glibc. It belongs to the
+program, not to the crate: the crate allocates through the global
+allocator and sets none.
+
+Prefer the tunable to swapping the allocator. mimalloc gave the same
+search gain, all of it from the huge pages it requests itself. It also
+loaded more slowly and peaked 21–58 % higher in memory, because it
+copies an array that grows where glibc remaps its pages.
 
 ## Features and `no_std`
 
