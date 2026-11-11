@@ -59,9 +59,11 @@ jobs:
       # or `simd`.
       - run: cargo clippy --all-targets
       - run: cargo clippy --lib --no-default-features
+      # Without `--cfg docsrs`, which turns on the nightly-only `doc_cfg`
+      # feature; docs.rs sets it on its own nightly build.
       - run: cargo doc --no-deps --all-features
         env:
-          RUSTDOCFLAGS: -D warnings --cfg docsrs
+          RUSTDOCFLAGS: -D warnings
 
   msrv:
     runs-on: ubuntu-latest

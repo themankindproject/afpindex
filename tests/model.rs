@@ -510,7 +510,7 @@ fn results_are_deterministic_and_scratch_is_reusable_across_catalogs() {
         assert_eq!(b.search(&query, &o, &mut s2).unwrap(), first_b);
         assert_eq!(a.search(&query, &o, &mut s2).unwrap(), first_a);
     }
-    assert!(!first_a.is_empty());
+    assert_ne!(first_a.len(), 0);
 }
 
 #[test]
@@ -523,7 +523,7 @@ fn a_panicking_visitor_leaves_the_scratch_clean() {
     let o = SearchOptions::default();
     let mut scratch = Scratch::new();
     let expected = cat.search(&query, &o, &mut Scratch::new()).unwrap();
-    assert!(!expected.is_empty());
+    assert_ne!(expected.len(), 0);
     let mut seen = 0;
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         cat.search_with(&query, &o, &mut scratch, |_| {
@@ -553,12 +553,12 @@ fn empty_inputs_yield_no_candidates() {
     let o = SearchOptions::default();
     let empty = Catalog::new();
     let q = Query::from_pairs([(1, 2), (3, 4)], Some(64));
-    assert!(empty.search(&q, &o, &mut scratch).unwrap().is_empty());
+    assert_eq!(empty.search(&q, &o, &mut scratch).unwrap().len(), 0);
     let cat = Catalog::from_segment(Segment::from_postings(vec![Posting::new(1, 0, 0)]));
     let none = Query::from_pairs(Vec::<(u32, u32)>::new(), Some(64));
-    assert!(cat.search(&none, &o, &mut scratch).unwrap().is_empty());
+    assert_eq!(cat.search(&none, &o, &mut scratch).unwrap().len(), 0);
     let miss = Query::from_pairs([(2, 0)], Some(64));
-    assert!(cat.search(&miss, &o, &mut scratch).unwrap().is_empty());
+    assert_eq!(cat.search(&miss, &o, &mut scratch).unwrap().len(), 0);
     let hit = cat.search(&q, &o, &mut scratch).unwrap();
     assert_eq!(hit.len(), 1);
     assert_eq!(
@@ -702,7 +702,7 @@ fn a_query_with_no_kept_times_casts_no_votes() {
     let got = cat
         .search(&none, &SearchOptions::default(), &mut s)
         .unwrap();
-    assert!(got.is_empty());
+    assert_eq!(got.len(), 0);
     let all = Query::from_pairs(rows.iter().copied(), Some(64));
     let got = cat.search(&all, &SearchOptions::default(), &mut s).unwrap();
     assert_eq!(got.len(), 1);

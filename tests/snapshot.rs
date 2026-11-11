@@ -52,7 +52,7 @@ fn write_then_read_gives_the_same_segment_and_results() {
     let a = Catalog::from_segment(seg).search(&q, &o, &mut s).unwrap();
     let b = Catalog::from_segment(back).search(&q, &o, &mut s).unwrap();
     assert_eq!(a, b);
-    assert!(!a.is_empty());
+    assert_ne!(a.len(), 0);
     let empty = Segment::default();
     let mut bytes = Vec::new();
     empty.write_to(&mut bytes).unwrap();
