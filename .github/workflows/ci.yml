@@ -35,6 +35,8 @@ jobs:
       # A small catalog through every stage: build, additions, removals,
       # both compactions, the snapshot written, read and mapped, searches.
       - run: cargo run --release --features mmap,simd --example lifecycle -- 300 400 20000 60
+      # Audio fingerprinted by `audiofp`, indexed and searched here.
+      - run: cargo run --release --example audiofp
 
   test-32bit:
     runs-on: ubuntu-latest
@@ -70,7 +72,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.87
-      - run: cargo check --all-targets --all-features
+      # The library's minimum: the examples' dev-dependency `audiofp` needs
+      # 1.93, so the tests and examples are checked on stable only.
+      - run: cargo check --lib --all-features
+      - run: cargo check --lib --no-default-features
 
   no_std:
     runs-on: ubuntu-latest

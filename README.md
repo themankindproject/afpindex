@@ -415,6 +415,11 @@ makes a copy's Δ constant, such as STFT frames. The
 [`audiofp`](https://crates.io/crates/audiofp) crate's Wang fingerprinter
 produces exactly this shape (`WangHash { hash, t_anchor }` at 62.5 frames
 per second).
+`examples/audiofp.rs` joins the two: it fingerprints three tracks with
+`audiofp`, indexes them, and finds ten seconds of one of them, with
+another track playing underneath, at its offset (`cargo run --release
+--example audiofp`). The glue is one line,
+`fingerprint.hashes.iter().map(|h| (h.hash, h.t_anchor))`.
 
 Hashes that appear in nearly every reference (silence, hum) cost the most
 and tell the least; drop them from queries before searching, or from

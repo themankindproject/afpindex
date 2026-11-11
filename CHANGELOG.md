@@ -80,6 +80,10 @@ search results.
 
 ### Added
 
+- `examples/audiofp.rs`: audio fingerprinted by the `audiofp` crate's
+  Wang fingerprinter, indexed and searched, with the offset of a clip
+  checked. `audiofp` is a dev-dependency only, and it needs Rust 1.93;
+  the minimum version of the library stays 1.87.
 - `simd` feature: on x86-64 CPUs that report AVX2 at run time, the
   totals pass, the search for a survivor's group in a short run and the
   check of every run at snapshot load decode packed values eight at a
