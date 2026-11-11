@@ -99,7 +99,7 @@ search results.
 
 ## [0.1.0] - 2026-11-07
 
-First release: the engine of the *afindex* design notes as a library.
+First release: the engine of the *afpindex* design notes as a library.
 
 ### Added
 

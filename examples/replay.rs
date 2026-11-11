@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use afindex::{Candidate, Catalog, Posting, Query, Scratch, SearchOptions, Segment, vote_floor};
+use afpindex::{Candidate, Catalog, Posting, Query, Scratch, SearchOptions, Segment, vote_floor};
 
 type Clip = (String, usize, Query, SearchOptions);
 

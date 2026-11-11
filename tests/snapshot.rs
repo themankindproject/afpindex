@@ -1,7 +1,7 @@
 //! Snapshot round trips and corruption checks (`std` feature).
 #![cfg(feature = "std")]
 
-use afindex::{Catalog, Posting, Query, Scratch, SearchOptions, Segment, SnapshotError};
+use afpindex::{Catalog, Posting, Query, Scratch, SearchOptions, Segment, SnapshotError};
 
 const HEADER: usize = 32;
 
@@ -352,7 +352,7 @@ mod mapped {
     /// A fresh file name under the temp dir for this test.
     fn temp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("afindex-{}-{name}", std::process::id()));
+        p.push(format!("afpindex-{}-{name}", std::process::id()));
         p
     }
 

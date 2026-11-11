@@ -9,7 +9,7 @@
 //! `(reference, Δ = time − query_time)`. A true copy piles many votes into one
 //! bin; chance collisions scatter single votes across many offsets.
 //!
-//! `afindex` answers that search exactly and fast over hundreds of millions
+//! `afpindex` answers that search exactly and fast over hundreds of millions
 //! of postings:
 //!
 //! - **Postings sorted by hash** in flat arrays, references and times packed
@@ -36,8 +36,8 @@
 //! # Example
 //!
 //! ```
-//! # fn main() -> Result<(), afindex::SearchError> {
-//! use afindex::{Catalog, Query, Scratch, SearchOptions};
+//! # fn main() -> Result<(), afpindex::SearchError> {
+//! use afpindex::{Catalog, Query, Scratch, SearchOptions};
 //!
 //! // Two references with eight postings each. Reference 1 is reference 0
 //! // shifted 500 frames later.

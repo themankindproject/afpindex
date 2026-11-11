@@ -1,4 +1,4 @@
-# afindex
+# afpindex
 
 Exact in-memory inverted index for landmark audio fingerprints.
 
@@ -10,7 +10,7 @@ every posting with the same hash cast a **vote** for the bin
 `(reference, Δ = time − query_time)`. A true copy piles votes into one bin;
 chance collisions scatter single votes everywhere.
 
-`afindex` answers that search exactly, over hundreds of millions of postings,
+`afpindex` answers that search exactly, over hundreds of millions of postings,
 in milliseconds:
 
 - **Postings sorted by hash** in flat arrays, references and times packed
@@ -36,7 +36,7 @@ in milliseconds:
 ## Quick start
 
 ```rust
-use afindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
+use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
 
 // Build a catalog with one sort over every posting.
 let mut builder = Catalog::builder();
@@ -288,7 +288,7 @@ the additions, which is a deployment choice rather than the crate's.
 
 ### Real data
 
-`examples/replay.rs` runs the crate over the catalog of the *afindex*
+`examples/replay.rs` runs the crate over the catalog of the *afpindex*
 design notes (7 November 2026): 499.4 M postings from 120,329 production
 references, 3.66 M distinct hashes (136 postings per hash on average), and
 the 104 real clips the notes compared with the production ClickHouse
@@ -455,7 +455,7 @@ copies an array that grows where glibc remaps its pages.
 
 ```toml
 [dependencies]
-afindex = { version = "0.1", default-features = false }   # no_std + alloc
+afpindex = { version = "0.1", default-features = false }   # no_std + alloc
 ```
 
 The core needs only `alloc`, and `Arc`-shared segments need a target with

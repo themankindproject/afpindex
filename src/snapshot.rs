@@ -1050,7 +1050,7 @@ mod tests {
         let mut bytes = Vec::new();
         seg.write_to(&mut bytes).unwrap();
         let path =
-            std::env::temp_dir().join(format!("afindex-parallel-{}.afx", std::process::id()));
+            std::env::temp_dir().join(format!("afpindex-parallel-{}.afx", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Segment::map_from(&path).unwrap(), seg);
         // The last data byte before the checksum's padding: a reference or

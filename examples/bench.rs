@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use afindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
+use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
 
 struct Rng(u64);
 

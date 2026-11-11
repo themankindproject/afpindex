@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use afindex::{Candidate, Catalog, Posting, Query, Scratch, SearchError, SearchOptions, Segment};
+use afpindex::{Candidate, Catalog, Posting, Query, Scratch, SearchError, SearchOptions, Segment};
 
 /// What the model predicts for one candidate. The engine's `Candidate` is
 /// `#[non_exhaustive]`, so it is compared field by field.

@@ -1,11 +1,11 @@
 [package]
-name         = "afindex"
+name         = "afpindex"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.87"
 description  = "Exact in-memory inverted index for landmark audio fingerprints: sorted postings, a radix directory and a two-pass vote search"
 license      = "MIT"
-documentation = "https://docs.rs/afindex"
+documentation = "https://docs.rs/afpindex"
 keywords     = ["audio", "fingerprint", "inverted-index", "search", "no-std"]
 categories   = ["multimedia::audio", "data-structures", "no-std"]
 include      = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md"]
