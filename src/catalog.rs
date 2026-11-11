@@ -236,7 +236,6 @@ impl Catalog {
     }
 
     /// The segments, largest first.
-    #[must_use]
     pub fn segments(&self) -> impl ExactSizeIterator<Item = &Segment> + '_ {
         self.parts.iter().map(|part| &*part.segment)
     }

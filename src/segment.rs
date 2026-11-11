@@ -141,7 +141,6 @@ impl<'a> Run<'a> {
 
     /// The postings as `(reference, time)`, grouped by reference with
     /// times ascending.
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, u32)> + 'a {
         let (refs, times) = (self.segment.refs.view(), self.segment.times.view());
         (self.lo..self.hi).map(move |i| (refs.get(i), times.get(i)))

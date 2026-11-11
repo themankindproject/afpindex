@@ -91,7 +91,6 @@ impl Query {
     }
 
     /// Every hash with its kept times, hashes ascending.
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, &[u32])> + '_ {
         self.hashes
             .iter()
