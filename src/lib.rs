@@ -111,6 +111,13 @@ mod simd;
 mod snapshot;
 mod sort;
 
+// The guide's examples run as doctests, so they cannot drift from the API.
+// They map snapshots, hence `mmap`; the first one uses the `audiofp`
+// dev-dependency.
+#[cfg(all(doctest, feature = "mmap"))]
+#[doc = include_str!("../docs/USAGE.md")]
+mod usage_guide {}
+
 pub use catalog::{Catalog, CatalogBuilder};
 pub use error::SearchError;
 #[cfg(feature = "std")]

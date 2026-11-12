@@ -11,7 +11,7 @@ homepage     = "https://github.com/themankindproject/afpindex"
 readme       = "README.md"
 keywords     = ["audio", "fingerprint", "inverted-index", "search", "no-std"]
 categories   = ["multimedia::audio", "data-structures", "no-std"]
-include      = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+include      = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/docs/**", "/LICENSE", "/CHANGELOG.md"]
 
 [features]
 default = ["std"]

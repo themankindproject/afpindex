@@ -8,6 +8,16 @@
 
 Exact in-memory inverted index for landmark audio fingerprints: **hundreds of millions of postings**, **exact vote counts**, **sub-millisecond median searches**, **catalogs that change while they serve**, and **snapshots you can map instead of read**.
 
+> **Built for [`audiofp`](https://github.com/themankindproject/audiofp), usable by
+> any fingerprinter of the same shape.** afpindex was written as the search
+> index for audiofp's landmark fingerprints, but it does not depend on
+> audiofp and never touches audio: it indexes rows of `(hash: u32, time:
+> u32)`. Any fingerprinter that emits rows like these, with times in a
+> unit where a copy's offset stays constant (STFT frames, for example), can
+> use it as is: audiofp's Wang or Panako hashes, your own landmarks, or
+> another library's. See
+> [Feeding the index](docs/USAGE.md#2-feeding-the-index).
+
 ## Overview
 
 A landmark fingerprinter (Wang / Shazam-style, Panako, and friends) turns
@@ -148,7 +158,7 @@ the id it would have returned before.
 
 ## Documentation
 
-- [docs/USAGE.md](docs/USAGE.md) - what a search computes, catalogs that change, memory layout, snapshot format, limits, feeding the index and running it in production
+- [docs/USAGE.md](docs/USAGE.md) - the full guide: concepts, feeding the index, reference ids, building, queries, searching and every option, reading candidates, custom scoring, changing a catalog while it serves, threads, memory, snapshots, segments, errors, features, production and troubleshooting
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) - every measurement, how the passes are arranged, and what was tried and left out
 - [API reference](https://docs.rs/afpindex) on docs.rs
 - [CHANGELOG.md](CHANGELOG.md)
@@ -194,7 +204,7 @@ On the real catalog that cut search latency by 7–8 % and `read_from` from
 set to `madvise` (Ubuntu's default) or `always`. Prefer it to swapping the
 allocator: mimalloc gave the same search gain, loaded more slowly and
 peaked 21–58 % higher. Details in
-[docs/USAGE.md](docs/USAGE.md#running-in-production).
+[docs/USAGE.md](docs/USAGE.md#17-running-in-production).
 
 Drop hashes that appear in nearly every reference (silence, hum) before
 indexing or searching: they cost the most and tell the least.

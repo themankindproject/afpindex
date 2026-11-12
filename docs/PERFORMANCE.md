@@ -220,7 +220,7 @@ It also removed a gap that is not in the code: the build from before
 these changes and the default build without the run-line change
 measured 5–7 % apart on the real clips without it, and the same with
 it. Compare builds with it set, or expect that much noise. For
-deployments, see [Running in production](USAGE.md#running-in-production).
+deployments, see [Running in production](USAGE.md#17-running-in-production).
 
 Measured here and left out:
 
@@ -278,7 +278,7 @@ mimalloc's allocates a new block and copies. Mapped loads (`map_from`)
 were 0.9 s under every setup, since their large arrays never pass
 through the allocator; their searches gained 4–5 % from huge pages. The
 tunable is the recommendation in
-[Running in production](USAGE.md#running-in-production).
+[Running in production](USAGE.md#17-running-in-production).
 
 ## Reproducing
 
