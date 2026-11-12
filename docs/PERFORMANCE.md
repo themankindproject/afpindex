@@ -94,8 +94,8 @@ instructions per cycle, not by the counter array.
 synthetic catalog of the section above: the bulk build, 2,000 additions
 of 3,000 rows each (a tenth of them removed again), both compactions,
 the snapshot written to and read from memory and mapped from a file, and
-query grouping. On the AWS `m7i-flex.large`, next to the code before the
-changes the [changelog](../CHANGELOG.md) lists under *Unreleased*, both
+query grouping. On the AWS `m7i-flex.large`, next to an earlier version
+of the code without the build, merge and load work described below, both
 run on the same host:
 
 | | before | now |
