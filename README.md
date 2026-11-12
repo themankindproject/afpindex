@@ -156,6 +156,34 @@ let catalog = Catalog::map_from("catalog.afx")?;   // `mmap` feature
 A snapshot keeps the id space and the removals, so the next `add` returns
 the id it would have returned before.
 
+## Architecture
+
+How rows become candidates, from the whole catalog down to the bits. Each
+figure has more detail in [docs/USAGE.md](docs/USAGE.md).
+
+![afpindex at a glance: rows from a fingerprinter go into a catalog of immutable segments with a liveness table; a search turns shared hashes into votes and votes into candidates; snapshots are written, read and mapped; any number of threads search one catalog, each with its own scratch](docs/img/overview.svg)
+
+**Inside a segment.** Sorted keys, a directory that finds a hash's run in
+one read, and every posting's reference and time packed to the width of
+the largest value
+([memory](docs/USAGE.md#12-memory), [segments](docs/USAGE.md#14-working-with-segments-directly)).
+
+![Inside a segment: the sorted keys, the open-addressing directory and the bit layout of its 12-byte slot, a run of one hash in the packed reference and time arrays, and how 17-bit values sit across bytes](docs/img/segment.svg)
+
+**A search, pass by pass.** Lookup, a totals pass that counts votes per
+reference, survivors over the vote floor, and a histogram of offsets for
+those survivors only
+([searching](docs/USAGE.md#6-searching), [options](docs/USAGE.md#7-search-options)).
+
+![A search, pass by pass: query, run lookup, totals pass, survivors over the vote floor, histogram pass, and the best bin and noise that make a candidate](docs/img/search.svg)
+
+**Changing a catalog, and snapshots.** Additions, removals and compactions
+build new segments; a snapshot stores them as they are, and a load checks
+everything before a catalog exists
+([changing a catalog](docs/USAGE.md#10-changing-a-catalog), [snapshots](docs/USAGE.md#13-snapshots)).
+
+![Changing a catalog and snapshots: segments over a sequence of additions, a removal and compactions; the byte layout of the snapshot file; and the checks a load runs](docs/img/lifecycle.svg)
+
 ## Documentation
 
 - [docs/USAGE.md](docs/USAGE.md) - the full guide: concepts, feeding the index, reference ids, building, queries, searching and every option, reading candidates, custom scoring, changing a catalog while it serves, threads, memory, snapshots, segments, errors, features, production and troubleshooting

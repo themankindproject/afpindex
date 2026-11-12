@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 812" width="960" height="812" role="img" aria-labelledby="t d">
+<title id="t">Inside a segment</title>
+<desc id="d">A segment holds sorted distinct hash keys, an open-addressing directory from hash to run whose 12-byte slots hold the key, the run&#x27;s 40-bit start, its length and its largest per-reference multiplicity, and the references and times of every posting bit-packed to the width of the largest value. A run is grouped by reference with times ascending.</desc>
+<defs><marker id="a9a6700" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#9a6700"/></marker></defs>
+<rect x="0.5" y="0.5" width="959" height="811" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<text x="28" y="44" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="22" fill="#1f2328" font-weight="700">Inside a segment</text>
+<text x="28" y="68" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="13" fill="#59636e">Postings sorted by (hash, reference, time), never changed once built: sorted keys, a directory from hash to run, packed postings.</text>
+<rect x="28" y="88" width="904" height="352" rx="10" fill="#fbefff" stroke="#8250df" stroke-width="1.5"/>
+<text x="44" y="116" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="13" fill="#1f2328"><tspan font-weight="700" fill="#512a97">keys</tspan>   the sorted distinct hashes, u32, 4 bytes each</text>
+<rect x="44" y="128" width="92" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<text x="90" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#512a97" text-anchor="middle">0x0002a1f0</text>
+<rect x="136" y="128" width="92" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<text x="182" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#512a97" text-anchor="middle">0x0002b311</text>
+<rect x="228" y="128" width="92" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<text x="274" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#512a97" text-anchor="middle">0x0c5e9a17</text>
+<rect x="320" y="128" width="92" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="366" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#512a97" text-anchor="middle">0x3fa1c2e0</text>
+<rect x="412" y="128" width="92" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<text x="458" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#512a97" text-anchor="middle">0x91b07c44</text>
+<rect x="504" y="128" width="92" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<text x="550" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#512a97" text-anchor="middle">0xe40d1b2c</text>
+<rect x="596" y="128" width="92" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<text x="642" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#512a97" text-anchor="middle">…</text>
+<text x="706" y="138" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#59636e">Merges and iteration in key order</text>
+<text x="706" y="153" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#59636e">walk these; no offsets array is</text>
+<text x="706" y="168" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#59636e">kept in memory.</text>
+<text x="44" y="196" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="13" fill="#1f2328"><tspan font-weight="700" fill="#512a97">directory</tspan>   open addressing with linear probing, at most 3 keys per 5 slots; rebuilt from the keys, never stored</text>
+<rect x="44" y="208" width="46" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<rect x="90" y="208" width="46" height="26" rx="0" fill="#fbefff" stroke="#8250df" stroke-width="1"/>
+<text x="113" y="224.6" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#512a97" text-anchor="middle">e40d</text>
+<rect x="136" y="208" width="46" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<rect x="182" y="208" width="46" height="26" rx="0" fill="#fbefff" stroke="#8250df" stroke-width="1"/>
+<text x="205" y="224.6" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#512a97" text-anchor="middle">0002</text>
+<rect x="228" y="208" width="46" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<rect x="274" y="208" width="46" height="26" rx="0" fill="#fbefff" stroke="#8250df" stroke-width="1"/>
+<text x="297" y="224.6" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#512a97" text-anchor="middle">0c5e</text>
+<rect x="320" y="208" width="46" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="343" y="224.6" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#512a97" text-anchor="middle">3fa1</text>
+<rect x="366" y="208" width="46" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<rect x="412" y="208" width="46" height="26" rx="0" fill="#fbefff" stroke="#8250df" stroke-width="1"/>
+<text x="435" y="224.6" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#512a97" text-anchor="middle">91b0</text>
+<rect x="458" y="208" width="46" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<rect x="504" y="208" width="46" height="26" rx="0" fill="#fbefff" stroke="#8250df" stroke-width="1"/>
+<text x="527" y="224.6" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#512a97" text-anchor="middle">0002</text>
+<rect x="550" y="208" width="46" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<rect x="596" y="208" width="46" height="26" rx="0" fill="#ffffff" stroke="#8250df" stroke-width="1"/>
+<rect x="642" y="208" width="46" height="26" rx="0" fill="#fbefff" stroke="#8250df" stroke-width="1"/>
+<text x="665" y="224.6" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#512a97" text-anchor="middle">…</text>
+<text x="67" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">0</text>
+<text x="113" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1</text>
+<text x="159" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">2</text>
+<text x="205" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">3</text>
+<text x="251" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">4</text>
+<text x="297" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">5</text>
+<text x="343" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">6</text>
+<text x="389" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">7</text>
+<text x="435" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">8</text>
+<text x="481" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">9</text>
+<text x="527" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">10</text>
+<text x="573" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">11</text>
+<text x="619" y="248" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">12</text>
+<path d="M303,236 q17,14 34,0" stroke="#9a6700" stroke-width="1.8" fill="none" marker-end="url(#a9a6700)"/>
+<text x="320" y="264" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#4d2d00">0x3fa1c2e0: home slot 5 is taken, so the probe moves on to 6</text>
+<text x="706" y="214" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">home slot = (h × <tspan font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace">0x9E3779B1</tspan> mod 2³²)</text>
+<text x="706" y="229" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">× slots ≫ 32. A lookup is one read,</text>
+<text x="706" y="244" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">and a query's lookups overlap.</text>
+<text x="44" y="288" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328"><tspan font-weight="700" fill="#512a97">one slot, 12 bytes</tspan>   slot 6, holding the run of <tspan font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace">0x3fa1c2e0</tspan></text>
+<rect x="44" y="298" width="288" height="40" rx="0" fill="#fbefff" stroke="#8250df" stroke-width="1.2"/>
+<text x="188" y="314" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#512a97" text-anchor="middle">key</text>
+<text x="188" y="331" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#512a97" text-anchor="middle" font-weight="700">0x3fa1c2e0</text>
+<text x="46" y="352" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="9" fill="#59636e">32 bits</text>
+<rect x="332" y="298" width="288" height="40" rx="0" fill="#ddf4ff" stroke="#0969da" stroke-width="1.2"/>
+<text x="476" y="314" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#0a3069" text-anchor="middle">start, low 32 bits</text>
+<text x="476" y="331" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#0a3069" text-anchor="middle" font-weight="700">1,204</text>
+<text x="334" y="352" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="9" fill="#59636e">32 bits</text>
+<rect x="620" y="298" width="144" height="40" rx="0" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.2"/>
+<text x="692" y="314" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#116329" text-anchor="middle">len</text>
+<text x="692" y="331" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#116329" text-anchor="middle" font-weight="700">7</text>
+<text x="622" y="352" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="9" fill="#59636e">16 bits</text>
+<rect x="764" y="298" width="72" height="40" rx="0" fill="#fff1e5" stroke="#bc4c00" stroke-width="1.2"/>
+<text x="800" y="314" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#762c00" text-anchor="middle">mult</text>
+<text x="800" y="331" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#762c00" text-anchor="middle" font-weight="700">3</text>
+<text x="766" y="352" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="9" fill="#59636e">8 bits</text>
+<rect x="836" y="298" width="72" height="40" rx="0" fill="#ddf4ff" stroke="#0969da" stroke-width="1.2"/>
+<text x="872" y="314" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#0a3069" text-anchor="middle">start hi</text>
+<text x="872" y="331" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#0a3069" text-anchor="middle" font-weight="700">0</text>
+<text x="838" y="352" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="9" fill="#59636e">8 bits</text>
+<text x="44" y="372" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">The hash itself; a probe stops at</text>
+<text x="44" y="387" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">its own key or at an empty slot.</text>
+<text x="332" y="372" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">The run's first posting. With start hi it is</text>
+<text x="332" y="387" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">40 bits: a segment holds under 2⁴⁰ postings.</text>
+<text x="620" y="372" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">Postings in the run.</text>
+<text x="620" y="387" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">65,535 means longer:</text>
+<text x="620" y="402" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">the end is the next</text>
+<text x="620" y="417" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">key's start.</text>
+<text x="764" y="372" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">Most postings of one</text>
+<text x="764" y="387" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">reference (to 255). At</text>
+<text x="764" y="402" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">or under the fanout, the</text>
+<text x="764" y="417" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">search skips that test.</text>
+<rect x="28" y="456" width="904" height="340" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+<text x="44" y="484" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="13" fill="#1f2328"><tspan font-weight="700" fill="#0a3069">refs and times</tspan>   one value per posting, each array packed to the bits of its largest value</text>
+<text x="239" y="534" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1204</text>
+<text x="297" y="534" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1205</text>
+<text x="355" y="534" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1206</text>
+<text x="413" y="534" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1207</text>
+<text x="471" y="534" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1208</text>
+<text x="529" y="534" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1209</text>
+<text x="587" y="534" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">1210</text>
+<text x="44" y="558" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#0a3069" font-weight="700">refs</text>
+<text x="44" y="572" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="9" fill="#59636e">17 bits each</text>
+<rect x="152" y="542" width="58" height="26" rx="0" fill="#ffffff" stroke="#0969da" stroke-width="1"/>
+<text x="181" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">…</text>
+<rect x="210" y="542" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="239" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">7</text>
+<rect x="268" y="542" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="297" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">7</text>
+<rect x="326" y="542" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="355" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">7</text>
+<rect x="384" y="542" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="413" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">12</text>
+<rect x="442" y="542" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="471" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">40</text>
+<rect x="500" y="542" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="529" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">40</text>
+<rect x="558" y="542" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="587" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">103</text>
+<rect x="616" y="542" width="58" height="26" rx="0" fill="#ffffff" stroke="#0969da" stroke-width="1"/>
+<text x="645" y="559" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">…</text>
+<text x="44" y="590" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12" fill="#0a3069" font-weight="700">times</text>
+<text x="44" y="604" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="9" fill="#59636e">15 bits each</text>
+<rect x="152" y="574" width="58" height="26" rx="0" fill="#ffffff" stroke="#0969da" stroke-width="1"/>
+<text x="181" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">…</text>
+<rect x="210" y="574" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="239" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">18</text>
+<rect x="268" y="574" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="297" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">233</text>
+<rect x="326" y="574" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="355" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">901</text>
+<rect x="384" y="574" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="413" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">57</text>
+<rect x="442" y="574" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="471" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">12</text>
+<rect x="500" y="574" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="529" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">640</text>
+<rect x="558" y="574" width="58" height="26" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="587" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">77</text>
+<rect x="616" y="574" width="58" height="26" rx="0" fill="#ffffff" stroke="#0969da" stroke-width="1"/>
+<text x="645" y="591" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="11" fill="#0a3069" text-anchor="middle">…</text>
+<path d="M210,518 v-6 H616 v6" stroke="#9a6700" stroke-width="1.5" fill="none"/>
+<text x="413" y="506" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#4d2d00" text-anchor="middle"><tspan font-weight="700">run of 0x3fa1c2e0</tspan>: the slot's start 1,204 and len 7</text>
+<path d="M213,606 v6 H381 v-6" stroke="#0969da" stroke-width="1.2" fill="none"/>
+<path d="M445,606 v6 H555 v-6" stroke="#0969da" stroke-width="1.2" fill="none"/>
+<text x="297" y="628" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#0a3069" text-anchor="middle">reference 7: times ascending</text>
+<text x="500" y="628" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#0a3069" text-anchor="middle">reference 40</text>
+<text x="413" y="646" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#59636e" text-anchor="middle">references ascend through the run; mult = 3 (reference 7)</text>
+<rect x="704" y="502" width="212" height="146" rx="8" fill="#ffffff" stroke="#6e7781" stroke-width="1"/>
+<text x="716" y="522" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" font-weight="700">The real catalog</text>
+<text x="716" y="542" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">17 + 15 bits = 32 per posting</text>
+<text x="716" y="558" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">× 499.4 M postings = 1.86 GiB</text>
+<text x="716" y="574" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">+ 3.66 M hashes × 24 bytes</text>
+<text x="716" y="590" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">  (key + directory) = 0.08 GiB</text>
+<text x="716" y="606" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328"><tspan font-weight="700">= 1.94 GiB</tspan>, 41 % under u32</text>
+<text x="716" y="622" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">arrays, for 3–8 % more cycles</text>
+<text x="44" y="674" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328"><tspan font-weight="700" fill="#0a3069">How 17-bit references sit in bytes</tspan>   (little-endian, least significant bit first)</text>
+<rect x="44" y="684" width="187" height="24" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="137.5" y="701" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#1f2328" text-anchor="middle">value 1204</text>
+<rect x="231" y="684" width="187" height="24" rx="0" fill="#ddf4ff" stroke="#0969da" stroke-width="1"/>
+<text x="324.5" y="701" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#1f2328" text-anchor="middle">value 1205</text>
+<rect x="418" y="684" width="187" height="24" rx="0" fill="#fff8c5" stroke="#9a6700" stroke-width="1"/>
+<text x="511.5" y="701" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#1f2328" text-anchor="middle">value 1206</text>
+<rect x="605" y="684" width="143" height="24" rx="0" fill="#ddf4ff" stroke="#0969da" stroke-width="1"/>
+<text x="676.5" y="701" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#1f2328" text-anchor="middle">value 1207 …</text>
+<line x1="44" y1="680" x2="44" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="88" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 0</text>
+<line x1="132" y1="680" x2="132" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="176" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 1</text>
+<line x1="220" y1="680" x2="220" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="264" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 2</text>
+<line x1="308" y1="680" x2="308" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="352" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 3</text>
+<line x1="396" y1="680" x2="396" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="440" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 4</text>
+<line x1="484" y1="680" x2="484" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="528" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 5</text>
+<line x1="572" y1="680" x2="572" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="616" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 6</text>
+<line x1="660" y1="680" x2="660" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="704" y="724" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="9" fill="#59636e" text-anchor="middle">byte 7</text>
+<line x1="748" y1="680" x2="748" y2="712" stroke="#1f2328" stroke-width="1.2"/>
+<text x="44" y="746" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">Reading value i is one unaligned 8-byte load at byte ⌊17i / 8⌋, a shift right by 17i mod 8, and a 17-bit mask.</text>
+<text x="44" y="761" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">Eight slack bytes after the array keep every such load inside it.</text>
+<text x="44" y="776" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">With <tspan font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace">simd</tspan> on an AVX2 CPU, a block of eight values (17 bytes at this width) decodes at once: one byte</text>
+<text x="44" y="791" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">shuffle, one variable shift and one mask, for widths up to 25 bits.</text>
+</svg>
