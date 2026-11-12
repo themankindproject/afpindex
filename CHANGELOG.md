@@ -47,11 +47,17 @@ First release: the engine of the *afpindex* design notes as a library.
   references and times are stored packed, as in memory. A load reads each
   array straight into its final buffer, and checks the checksum and that
   the arrays describe a valid segment, a large segment's runs on every
-  core.
+  core. `read_from_trusted` skips the checksum and the order of the runs
+  for files the caller wrote and has checked: it still checks the
+  headers, sizes, keys, offsets and id space, and reads the references
+  once for what the search needs of each run. On the real catalog it
+  loads in 0.96 s instead of 1.65 s.
 - `mmap` feature: `Catalog::map_from` and `Segment::map_from` leave the
   packed postings in the file's pages, shared between processes, with the
-  same checks; the checksum runs on a core of its own alongside them. The
-  mapping call is the feature's one `unsafe` block.
+  same checks; the checksum runs on a core of its own alongside them.
+  `map_from_trusted` maps as `read_from_trusted` reads, in 0.39 s instead
+  of 0.94 s on the real catalog. The mapping call is the feature's one
+  `unsafe` block.
 - `simd` feature: on x86-64 CPUs that report AVX2 at run time, the totals
   pass, the search for a survivor's group in a short run and the check of
   every run at load decode packed values eight at a time. The kernel is

@@ -804,6 +804,36 @@ about 2 s and `map_from` about 1 s with the `simd` feature (2.7 s and
 1.6 s without it), and huge pages for the heap take `read_from` down to
 1.5 s.
 
+### Trusted loads
+
+`Catalog::read_from_trusted` and, with `mmap`, `Catalog::map_from_trusted`
+(and the same pair on `Segment`) skip the two checks that read every
+posting: the checksum of each segment, and the order of each run. The
+header, the sizes, the keys and offsets, the liveness table and its
+checksum, and the id space are still checked. The references are still
+read once, because the search needs to know the most postings one
+reference has in each run.
+
+```rust
+use std::path::Path;
+
+use afpindex::{Catalog, SnapshotError};
+
+/// Map a snapshot this service wrote and has loaded with every check before.
+pub fn restart(path: &Path) -> Result<Catalog, SnapshotError> {
+    Catalog::map_from_trusted(path)
+}
+```
+
+Use them for files you wrote and have checked once, when the time to load
+matters: a server restarting on the snapshot it saved, or a fleet that
+checks a new snapshot on one host before every host maps it. A file
+damaged since loads without an error, and searches and changes on it
+return wrong candidates or panic; nothing undefined happens. On the real
+catalog on two hardware threads with huge pages, `read_from_trusted` took
+0.96 s against 1.65 s for `read_from`, and `map_from_trusted` 0.39 s
+against 0.94 s.
+
 ### Mapping: `map_from`
 
 With the `mmap` feature, `Catalog::map_from(path)` and
@@ -1008,8 +1038,8 @@ source rows, or fall back to the previous file.
 
 | Feature | Default | Adds |
 |---|---|---|
-| `std` | yes | Snapshots (`write_to`, `read_from`), `std::error::Error` for `SnapshotError`, sorting the build's buckets and checking loads on every core |
-| `mmap` | no | `Catalog::map_from`, `Segment::map_from` (implies `std`; adds `memmap2`). The mapping call is the feature's one `unsafe` block |
+| `std` | yes | Snapshots (`write_to`, `read_from`, `read_from_trusted`), `std::error::Error` for `SnapshotError`, sorting the build's buckets, merging and checking loads on every core |
+| `mmap` | no | `Catalog::map_from`, `map_from_trusted` and the same on `Segment` (implies `std`; adds `memmap2`). The mapping call is the feature's one `unsafe` block |
 | `simd` | no | AVX2 decoding of packed postings (implies `std`) |
 
 **`simd`.** On x86-64, each pass that reads many packed values asks the
@@ -1083,7 +1113,9 @@ copies an array that grows where glibc remaps its pages.
 - **One `Scratch` per worker thread**, created once; as many search
   threads as hardware threads.
 - **Load with `map_from`** for fast restarts and shared pages across
-  processes; `read_from` for a catalog that changes heavily.
+  processes; `read_from` for a catalog that changes heavily. Once a
+  snapshot has passed a full load, `map_from_trusted` maps it again in
+  under half the time ([section 13](#trusted-loads)).
 - **Write snapshots atomically** (temporary file, sync, rename) and
   compact first.
 - **Keep the id table** (id to recording) next to the snapshot, written in

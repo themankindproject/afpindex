@@ -308,6 +308,31 @@ output, and the peak was 30 % higher; glibc keeps freed memory in its
 per-thread arenas rather than returning it to the system, so the
 pieces have to go as they are placed.
 
+## Trusted loads
+
+`read_from_trusted` and `map_from_trusted` skip the checksum and the
+order check of every run, and read the references alone for each run's
+multiplicity. On the AWS `m7i-flex.large`, huge pages on, `simd` build,
+each load in a fresh process with the file in the page cache, five
+alternating rounds on the real catalog and three on the synthetic one
+of 65 M postings:
+
+| | real, full | real, trusted | real, no pass | synthetic, full | synthetic, trusted |
+|---|---|---|---|---|---|
+| `read_from` | 1.65 s | 0.96 s | 0.71 s | 0.35 s | 0.24 s |
+| `map_from` | 0.94 s | 0.39 s | 0.13 s | 0.26 s | 0.17 s |
+
+Full loads measured the same as before the change, and searches after
+each of the four loads of the real catalog returned identical
+candidates. The "no pass" column is a variant that skips the pass over
+the references as well (wrong multiplicities, timing only): it is what a
+trusted load would cost if the snapshot stored each run's multiplicity,
+a change of format. That pass is a quarter of a second for 499 M
+references on two hardware threads. What remains of a trusted map is
+faulting in the file's pages, copying the keys and offsets, and the
+directory. The synthetic catalog's runs are 17 postings long, so its
+keys and directory are a larger share of its load and it gains less.
+
 ## Allocators and huge pages
 
 The `simd` build on the real catalog under five allocator setups, on one

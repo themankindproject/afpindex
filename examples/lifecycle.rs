@@ -159,7 +159,8 @@ fn grow_and_compact(catalog: &mut Catalog, shape: &Shape, adds: usize) {
     );
 }
 
-/// Write the snapshot to memory, read it back, and map it from a file.
+/// Write the snapshot to memory, read it back with every check and
+/// trusted, and map it from a file both ways.
 fn snapshot(catalog: &Catalog) {
     let (bytes, t) = timed(|| {
         let mut bytes = Vec::new();
@@ -174,6 +175,15 @@ fn snapshot(catalog: &Catalog) {
     );
     let (back, t) = timed(|| Catalog::read_from(bytes.as_slice()).expect("a valid snapshot"));
     println!("  read_from: {:.2} s ({:.2} GiB/s)", secs(t), gib / secs(t));
+    assert_eq!(back.posting_count(), catalog.posting_count());
+    drop(back);
+    let (back, t) =
+        timed(|| Catalog::read_from_trusted(bytes.as_slice()).expect("a valid snapshot"));
+    println!(
+        "  read_from_trusted: {:.2} s ({:.2} GiB/s)",
+        secs(t),
+        gib / secs(t)
+    );
     assert_eq!(back.posting_count(), catalog.posting_count());
     drop(back);
     map_snapshot(&bytes, catalog);
@@ -271,6 +281,10 @@ fn map_snapshot(bytes: &[u8], catalog: &Catalog) {
         secs(t),
         mapped.heap_bytes() as f64 / (1u64 << 30) as f64
     );
+    assert_eq!(mapped.posting_count(), catalog.posting_count());
+    drop(mapped);
+    let (mapped, t) = timed(|| Catalog::map_from_trusted(&path).expect("a valid snapshot"));
+    println!("  map_from_trusted: {:.2} s", secs(t));
     assert_eq!(mapped.posting_count(), catalog.posting_count());
     drop(mapped);
     std::fs::remove_file(&path).expect("removing the snapshot file");

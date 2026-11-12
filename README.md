@@ -68,7 +68,7 @@ afpindex = { version = "0.1", features = ["mmap", "simd"] }
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std` | Yes | `Catalog` and `Segment` snapshot I/O, `std::error::Error` for `SnapshotError` |
-| `mmap` | No | `Catalog::map_from` and `Segment::map_from` (implies `std`; adds `memmap2`) |
+| `mmap` | No | `Catalog::map_from` and `Segment::map_from`, and their `_trusted` forms (implies `std`; adds `memmap2`) |
 | `simd` | No | AVX2 decoding of packed postings on x86-64, chosen at run time (implies `std`; a no-op elsewhere) |
 
 Minimal build (`no_std + alloc`):
@@ -154,7 +154,10 @@ let catalog = Catalog::map_from("catalog.afx")?;   // `mmap` feature
 ```
 
 A snapshot keeps the id space and the removals, so the next `add` returns
-the id it would have returned before.
+the id it would have returned before. For a file you wrote and have
+loaded once, `read_from_trusted` and `map_from_trusted` skip the checksum
+and the order check of every run: on the real catalog, 0.39 s to map
+instead of 0.94 s.
 
 ## Architecture
 
@@ -273,7 +276,6 @@ indexing or searching: they cost the most and tell the least.
 - AVX2's counterpart on aarch64 (NEON), for Graviton hosts.
 - References stored as gaps within a run: about a fifth less memory
   (estimated).
-- An opt-in faster open for trusted snapshots.
 - Sliding-window queries for live audio (`audiofp::StreamingWang`).
 
 ## Contributing

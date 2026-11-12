@@ -12,9 +12,10 @@
 //! If `snapshot_dir/catalog.afc` exists it is loaded with
 //! `Catalog::read_from` instead of being built from the arrays, which is
 //! the production load path; `--save <file>` writes that file after a
-//! build from the arrays.
+//! build from the arrays. `--mmap` maps it instead, and `--trusted` loads
+//! or maps it without the checks that read every posting.
 //!
-//! usage: `replay <snapshot_dir> <fp_dir> <out_dir> [--save <file>] [--mmap]`
+//! usage: `replay <snapshot_dir> <fp_dir> <out_dir> [--save <file>] [--mmap] [--trusted]`
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -190,12 +191,16 @@ fn throughput(cat: &Catalog, clips: &[Clip], threads: usize) -> usize {
 }
 
 #[cfg(feature = "mmap")]
-fn map_catalog(path: &Path) -> Catalog {
-    Catalog::map_from(path).unwrap()
+fn map_catalog(path: &Path, trusted: bool) -> Catalog {
+    if trusted {
+        Catalog::map_from_trusted(path).unwrap()
+    } else {
+        Catalog::map_from(path).unwrap()
+    }
 }
 
 #[cfg(not(feature = "mmap"))]
-fn map_catalog(_: &Path) -> Catalog {
+fn map_catalog(_: &Path, _: bool) -> Catalog {
     panic!("--mmap needs a build with `--features mmap`")
 }
 
@@ -208,18 +213,24 @@ fn main() {
     );
     let save = (args.get(4).map(String::as_str) == Some("--save")).then(|| Path::new(&args[5]));
     let mmap = args.iter().any(|a| a == "--mmap");
+    let trusted = args.iter().any(|a| a == "--trusted");
     let afc = snap.join("catalog.afc");
     let cat = if afc.exists() && save.is_none() {
         let t = Instant::now();
         let cat = if mmap {
-            map_catalog(&afc)
+            map_catalog(&afc, trusted)
         } else {
             let file = BufReader::with_capacity(1 << 23, File::open(&afc).unwrap());
-            Catalog::read_from(file).unwrap()
+            if trusted {
+                Catalog::read_from_trusted(file).unwrap()
+            } else {
+                Catalog::read_from(file).unwrap()
+            }
         };
         eprintln!(
-            "catalog: {} {} in {:.1} s: {} postings, {} references, heap {:.2} GiB",
+            "catalog: {}{} {} in {:.2} s: {} postings, {} references, heap {:.2} GiB",
             if mmap { "mapped" } else { "loaded" },
+            if trusted { " trusted" } else { "" },
             afc.display(),
             t.elapsed().as_secs_f64(),
             cat.posting_count(),

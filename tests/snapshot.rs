@@ -207,6 +207,60 @@ fn catalog_snapshot_keeps_ids_liveness_and_segments() {
     assert_eq!(back.segment_count(), 0);
 }
 
+/// A trusted load gives the catalog a full one gives: ids, liveness,
+/// segments, search results, and which segments hold removed references.
+#[test]
+fn trusted_catalog_loads_match_full_ones() {
+    let mut cat = Catalog::builder();
+    for i in 0..30u32 {
+        cat.add(
+            (0..100u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000, j)),
+        );
+    }
+    let mut cat = cat.build();
+    for i in 30..45u32 {
+        cat.add(
+            (0..100u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000, j)),
+        );
+    }
+    for id in [0u32, 7, 31, 44] {
+        assert!(cat.remove(id));
+    }
+    let mut bytes = Vec::new();
+    cat.write_to(&mut bytes).unwrap();
+    let full = Catalog::read_from(bytes.as_slice()).unwrap();
+    let trusted = Catalog::read_from_trusted(bytes.as_slice()).unwrap();
+    assert_eq!(trusted.reference_count(), full.reference_count());
+    assert_eq!(trusted.live_count(), full.live_count());
+    assert_eq!(trusted.segment_count(), full.segment_count());
+    for i in 0..full.segment_count() {
+        assert_eq!(trusted.segment(i), full.segment(i), "segment {i}");
+    }
+    let (o, mut s) = (SearchOptions::default(), Scratch::new());
+    for i in 0..45u32 {
+        let q = Query::from_pairs(
+            (0..100u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 7) % 5_000, j)),
+            Some(64),
+        );
+        assert_eq!(
+            trusted.search(&q, &o, &mut s).unwrap(),
+            full.search(&q, &o, &mut s).unwrap(),
+            "query {i}"
+        );
+    }
+    let mut purged = trusted;
+    purged.compact();
+    assert_eq!(purged.posting_count(), 41 * 100);
+
+    // The liveness bitmap is still checked.
+    let mut bad = bytes;
+    bad[HEADER] ^= 1;
+    assert!(matches!(
+        Catalog::read_from_trusted(bad.as_slice()),
+        Err(SnapshotError::Checksum)
+    ));
+}
+
 #[test]
 fn catalog_snapshot_corruption_is_reported() {
     let mut cat = Catalog::new();
@@ -395,6 +449,11 @@ mod mapped {
         assert!(want.iter().any(|c| c.reference == 33 && c.delta == 0));
 
         let read = Catalog::read_from(std::fs::File::open(&path).unwrap()).unwrap();
+        let trusted = Catalog::map_from_trusted(&path).unwrap();
+        assert_eq!(trusted.search(&q, &o, &mut s).unwrap(), want);
+        for i in 0..read.segment_count() {
+            assert_eq!(trusted.segment(i), read.segment(i), "segment {i}");
+        }
         let mapped = Catalog::map_from(&path).unwrap();
         assert_eq!(mapped.reference_count(), read.reference_count());
         assert_eq!(mapped.live_count(), read.live_count());

@@ -34,6 +34,7 @@
 
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
@@ -289,12 +290,13 @@ fn write_packed<W: Write>(
     Ok(pos + bytes.len())
 }
 
-/// Read `n` values of `bits` packed, checksummed as [`write_packed`] does.
+/// Read `n` values of `bits` packed, checksummed as [`write_packed`] does
+/// if `ck` is given.
 fn read_packed<R: Read>(
     r: &mut R,
     n: usize,
     bits: u32,
-    ck: &mut Checksum,
+    mut ck: Option<&mut Checksum>,
 ) -> Result<Packed, SnapshotError> {
     if bits > u32::BITS {
         return Err(SnapshotError::Corrupt("a width exceeds 32 bits"));
@@ -307,7 +309,9 @@ fn read_packed<R: Read>(
         grow(&mut out, take, remaining.saturating_add(Packed::SLACK));
         let at = out.len();
         read_into(r, &mut out, take)?;
-        ck.words(&out[at..]);
+        if let Some(ck) = ck.as_deref_mut() {
+            ck.words(&out[at..]);
+        }
         remaining -= take;
     }
     Packed::from_bytes(out, n, bits).ok_or(SnapshotError::Corrupt("packed array length"))
@@ -370,33 +374,51 @@ fn check_id_space(ids: Ids, n_refs: usize) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn read_segment<R: Read>(r: &mut R) -> Result<Segment, SnapshotError> {
-    read_segment_ids(r).map(|(seg, _)| seg)
+/// How much of a snapshot a load checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Everything: the checksums and the order of every run too.
+    Full,
+    /// Everything but the checksums and the order of the runs, the checks
+    /// that read every posting; the multiplicities and the reference
+    /// ranges are taken from the references alone.
+    Trusted,
 }
 
 /// The smallest and the largest reference of a segment, if it has any.
 type Ids = Option<(u32, u32)>;
 
 /// Read a segment snapshot and report the range of its references.
-fn read_segment_ids<R: Read>(r: &mut R) -> Result<(Segment, Ids), SnapshotError> {
+fn read_segment<R: Read>(r: &mut R, check: Check) -> Result<(Segment, Ids), SnapshotError> {
     let (widths, n_keys, n_post) = read_header(r, SEGMENT_MAGIC)?;
     let (ref_bits, time_bits) = widths;
     let mut ck = checksum_of(widths, n_keys, n_post);
     let (n_keys, n_post) = segment_counts(n_keys, n_post)?;
     let mut pos = HEADER as u64;
+    // The keys and offsets are summed either way: next to the packed
+    // arrays they cost nothing.
     let keys = read_u32s(r, n_keys, &mut ck)?;
     pos = read_pad(r, pos + n_keys as u64 * 4)?;
     let offsets = read_u64s(r, n_keys + 1, &mut ck)?;
     pos += (n_keys as u64 + 1) * 8;
-    let refs = read_packed(r, n_post, ref_bits, &mut ck)?;
+    let full = check == Check::Full;
+    let refs = read_packed(r, n_post, ref_bits, full.then_some(&mut ck))?;
     pos = read_pad(r, pos + refs.data().len() as u64)?;
-    let times = read_packed(r, n_post, time_bits, &mut ck)?;
+    let times = read_packed(r, n_post, time_bits, full.then_some(&mut ck))?;
     read_pad(r, pos + times.data().len() as u64)?;
-    if read_u64(r)? != ck.finish() {
+    let stored = read_u64(r)?;
+    if full && stored != ck.finish() {
         return Err(SnapshotError::Checksum);
     }
-    // Checksummed as it was read.
-    finish_segment(widths, n_post, keys, &offsets, refs, times, |_, _| true)
+    // Checksummed as it was read, if at all.
+    finish_segment(
+        widths,
+        n_post,
+        (keys, &offsets),
+        (refs, times),
+        check,
+        |_, _| true,
+    )
 }
 
 /// Segments with at least this many postings have their runs checked on
@@ -416,30 +438,42 @@ const PARALLEL_MIN: usize = 1 << 10;
 ///
 /// `checksum` checks the packed arrays, unless the caller already has (it
 /// then returns `true`); a mismatch is reported before anything else,
-/// though the runs are checked while it runs.
+/// though the runs are checked while it runs. A trusted load checks the
+/// index alone and walks the references only ([`CountRuns`]).
 fn finish_segment(
     (ref_bits, time_bits): (u32, u32),
     n_post: usize,
-    keys: Vec<u32>,
-    offsets: &[u64],
-    refs: Packed,
-    times: Packed,
+    (keys, offsets): (Vec<u32>, &[u64]),
+    (refs, times): (Packed, Packed),
+    check: Check,
     checksum: impl FnOnce(&Packed, &Packed) -> bool + Send,
 ) -> Result<(Segment, Ids), SnapshotError> {
     let index = check_index(n_post, &keys, offsets);
-    let check = CheckRuns {
-        // Distinct `(reference, time)` pairs bound a run's length by the
-        // widths, which keeps the scan proportional to the bytes read.
-        longest: 1u64 << (ref_bits + time_bits).min(63),
-        offsets,
-        refs: &refs,
-        times: &times,
-    };
+    let side = || checksum(&refs, &times);
     // The walk relies on the index, so it runs only once that holds.
-    let (summed, walk) = if index.is_ok() {
-        check_runs(check, || checksum(&refs, &times))
-    } else {
-        (checksum(&refs, &times), Ok((Vec::new(), None)))
+    let (summed, walk) = match (check, index.is_ok()) {
+        (_, false) => (side(), Ok((Vec::new(), None))),
+        (Check::Full, true) => walk_runs(
+            offsets,
+            |keys| CheckRuns {
+                // Distinct `(reference, time)` pairs bound a run's length
+                // by the widths, which keeps the scan proportional to the
+                // bytes read.
+                longest: 1u64 << (ref_bits + time_bits).min(63),
+                offsets: &offsets[keys],
+                refs: &refs,
+                times: &times,
+            },
+            side,
+        ),
+        (Check::Trusted, true) => walk_runs(
+            offsets,
+            |keys| CountRuns {
+                offsets: &offsets[keys],
+                refs: &refs,
+            },
+            side,
+        ),
     };
     if !summed {
         return Err(SnapshotError::Checksum);
@@ -468,8 +502,9 @@ fn check_index(n_post: usize, keys: &[u32], offsets: &[u64]) -> Result<(), Snaps
 /// of the first run in key order that fails the check.
 type Walk = Result<(Vec<u8>, Ids), SnapshotError>;
 
-/// Run `check` over every run, and `side` meanwhile; return what `side`
-/// returned and the walk.
+/// Walk every run with the pass `piece` makes for a range of keys (the
+/// range of their offsets, each key's start and the end of the last), and
+/// run `side` meanwhile; return what `side` returned and the walk.
 ///
 /// A large segment's runs are cut into pieces of about equal postings, a
 /// few per core so that a slow piece does not hold the rest up, and every
@@ -477,14 +512,17 @@ type Walk = Result<(Vec<u8>, Ids), SnapshotError>;
 /// piece taken. The calling thread works too, so a thread that cannot be
 /// spawned costs nothing but parallelism. A small segment, or a single
 /// core, does it all in order on the calling thread.
-fn check_runs<T: Send>(check: CheckRuns<'_>, side: impl FnOnce() -> T + Send) -> (T, Walk) {
-    let offsets = check.offsets;
+fn walk_runs<T: Send, P: Pass<Out = Walk>>(
+    offsets: &[u64],
+    piece: impl Fn(RangeInclusive<usize>) -> P + Sync,
+    side: impl FnOnce() -> T + Send,
+) -> (T, Walk) {
     let n_keys = offsets.len() - 1;
     let n_post = offsets[n_keys];
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     if threads <= 1 || n_post < PARALLEL_MIN as u64 {
         let out = side();
-        return (out, simd::run(check));
+        return (out, simd::run(piece(0..=n_keys)));
     }
     // Piece `i` is keys `bounds[i]..bounds[i + 1]`.
     let pieces = threads * 4;
@@ -515,11 +553,7 @@ fn check_runs<T: Send>(check: CheckRuns<'_>, side: impl FnOnce() -> T + Send) ->
                     }
                 }
                 i if i <= n => {
-                    let piece = CheckRuns {
-                        offsets: &offsets[bounds[i - 1]..=bounds[i]],
-                        ..check
-                    };
-                    let walk = simd::run(piece);
+                    let walk = simd::run(piece(bounds[i - 1]..=bounds[i]));
                     *walks[i - 1].lock().unwrap_or_else(PoisonError::into_inner) = Some(walk);
                 }
                 _ => break,
@@ -663,6 +697,75 @@ impl Pass for CheckRuns<'_> {
     }
 }
 
+/// The walk of a trusted load: each run's multiplicity and the range of
+/// the references, read from the references alone and on the word of the
+/// file that every run is sorted, so its first reference is its smallest
+/// and its last one its largest. The times are not read.
+#[derive(Clone, Copy)]
+struct CountRuns<'a> {
+    offsets: &'a [u64],
+    refs: &'a Packed,
+}
+
+impl Pass for CountRuns<'_> {
+    type Out = Walk;
+
+    /// [`CheckRuns`] without the times and the comparisons: where the
+    /// decoder has a kernel, a block of eight references in which none
+    /// repeats its predecessor needs no look at its streaks.
+    #[inline(always)]
+    fn run<D: Decoder>(self, decoder: D) -> Self::Out {
+        let mut mults = Vec::with_capacity(self.offsets.len().saturating_sub(1));
+        let mut ids: Ids = None;
+        let refs = self.refs.view();
+        for w in self.offsets.windows(2) {
+            let (lo, hi) = (w[0] as usize, w[1] as usize);
+            let (mut mult, mut streak) = (1u32, 1u32);
+            let first = refs.get(lo);
+            let mut prev = first;
+            let mut i = lo + 1;
+            if hi - i >= LANES {
+                if let Some(mut blocks) = self.refs.blocks(i, decoder) {
+                    while hi - i >= LANES {
+                        let Some(r) = blocks.next() else {
+                            break;
+                        };
+                        let mut before = [prev; LANES];
+                        before[1..].copy_from_slice(&r[..LANES - 1]);
+                        if (0..LANES).any(|lane| r[lane] == before[lane]) {
+                            for lane in 0..LANES {
+                                streak = if r[lane] == before[lane] {
+                                    streak.saturating_add(1)
+                                } else {
+                                    1
+                                };
+                                mult = mult.max(streak);
+                            }
+                        } else {
+                            streak = 1;
+                        }
+                        prev = r[LANES - 1];
+                        i += LANES;
+                    }
+                }
+            }
+            for i in i..hi {
+                let cur = refs.get(i);
+                streak = if cur == prev {
+                    streak.saturating_add(1)
+                } else {
+                    1
+                };
+                mult = mult.max(streak);
+                prev = cur;
+            }
+            mults.push(u8::try_from(mult).unwrap_or(u8::MAX));
+            ids = Some(ids.map_or((first, prev), |(min, max)| (min.min(first), max.max(prev))));
+        }
+        Ok((mults, ids))
+    }
+}
+
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 impl Segment {
     /// Write the segment as a snapshot (format in the module docs).
@@ -685,7 +788,19 @@ impl Segment {
     /// [`SnapshotError`] on a read failure, a wrong magic or version, a
     /// checksum mismatch, or inconsistent arrays.
     pub fn read_from<R: Read>(mut r: R) -> Result<Segment, SnapshotError> {
-        read_segment(&mut r)
+        read_segment(&mut r, Check::Full).map(|(seg, _)| seg)
+    }
+
+    /// Read a snapshot as [`Segment::read_from`] does, without the checks
+    /// that read every posting, under the terms of
+    /// [`Catalog::read_from_trusted`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Segment::read_from`], except checksum mismatches and unsorted
+    /// runs, which go unnoticed.
+    pub fn read_from_trusted<R: Read>(mut r: R) -> Result<Segment, SnapshotError> {
+        read_segment(&mut r, Check::Trusted).map(|(seg, _)| seg)
     }
 }
 
@@ -732,15 +847,39 @@ impl Catalog {
     /// checksum mismatch, or a segment that references an id outside the
     /// id space.
     pub fn read_from<R: Read>(mut r: R) -> Result<Catalog, SnapshotError> {
-        let (live, n_segments, _) = read_catalog_head(&mut r)?;
-        let mut segments = Vec::with_capacity(n_segments);
-        for _ in 0..n_segments {
-            let (seg, ids) = read_segment_ids(&mut r)?;
-            check_id_space(ids, live.len())?;
-            segments.push((seg, ids));
-        }
-        Ok(Catalog::from_parts(segments, live))
+        read_catalog(&mut r, Check::Full)
     }
+
+    /// Read a snapshot as [`Catalog::read_from`] does, without the two
+    /// checks that read every posting: the segments' checksums, and the
+    /// order of each run. For a file this process or a pipeline it trusts
+    /// wrote and has checked once, when the time to load it matters, as
+    /// on a restart.
+    ///
+    /// The headers, the sizes, the keys, the offsets and the id space are
+    /// still checked, and the references are still read once, for what
+    /// the search needs to know of each run. A file damaged since it was
+    /// checked can load without an error; searches and changes on it then
+    /// return wrong candidates or panic, but do nothing undefined.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::read_from`], except checksum mismatches in the
+    /// segments and unsorted runs, which go unnoticed.
+    pub fn read_from_trusted<R: Read>(mut r: R) -> Result<Catalog, SnapshotError> {
+        read_catalog(&mut r, Check::Trusted)
+    }
+}
+
+fn read_catalog<R: Read>(r: &mut R, check: Check) -> Result<Catalog, SnapshotError> {
+    let (live, n_segments, _) = read_catalog_head(r)?;
+    let mut segments = Vec::with_capacity(n_segments);
+    for _ in 0..n_segments {
+        let (seg, ids) = read_segment(r, check)?;
+        check_id_space(ids, live.len())?;
+        segments.push((seg, ids));
+    }
+    Ok(Catalog::from_parts(segments, live))
 }
 
 /// The catalog header and liveness bitmap: the live table, the segment
@@ -774,8 +913,8 @@ mod mapped {
     use memmap2::Mmap;
 
     use super::{
-        HEADER, Ids, SEGMENT_MAGIC, check_id_space, checksum_of, finish_segment, read_catalog_head,
-        read_header, read_pad, read_u32s, read_u64, read_u64s, segment_counts,
+        Check, HEADER, Ids, SEGMENT_MAGIC, check_id_space, checksum_of, finish_segment,
+        read_catalog_head, read_header, read_pad, read_u32s, read_u64, read_u64s, segment_counts,
     };
     use crate::packed::Packed;
     use crate::{Catalog, Segment, SnapshotError};
@@ -821,6 +960,7 @@ mod mapped {
     fn read_segment_at(
         map: &Arc<Mmap>,
         pos: usize,
+        check: Check,
     ) -> Result<(Segment, Ids, usize), SnapshotError> {
         let mut r: &[u8] = map.get(pos..).ok_or(SnapshotError::Truncated)?;
         let (widths, n_keys, n_post) = read_header(&mut r, SEGMENT_MAGIC)?;
@@ -841,21 +981,24 @@ mod mapped {
         // The packed arrays are nearly all of the bytes: they are summed
         // on a core of their own while the runs are checked.
         let sum = move |refs: &Packed, times: &Packed| {
-            ck.words(refs.data());
-            ck.words(times.data());
-            ck.finish() == stored
+            check == Check::Trusted || {
+                ck.words(refs.data());
+                ck.words(times.data());
+                ck.finish() == stored
+            }
         };
-        let (seg, ids) = finish_segment(widths, n_post, keys, &offsets, refs, times, sum)?;
+        let (seg, ids) =
+            finish_segment(widths, n_post, (keys, &offsets), (refs, times), check, sum)?;
         Ok((seg, ids, pos + rel as usize))
     }
 
-    pub(super) fn catalog(path: &Path) -> Result<Catalog, SnapshotError> {
+    pub(super) fn catalog(path: &Path, check: Check) -> Result<Catalog, SnapshotError> {
         let map = map_file(path)?;
         let mut head: &[u8] = &map;
         let (live, n_segments, mut pos) = read_catalog_head(&mut head)?;
         let mut segments = Vec::with_capacity(n_segments);
         for _ in 0..n_segments {
-            let (seg, ids, next) = read_segment_at(&map, pos)?;
+            let (seg, ids, next) = read_segment_at(&map, pos, check)?;
             check_id_space(ids, live.len())?;
             segments.push((seg, ids));
             pos = next;
@@ -863,9 +1006,9 @@ mod mapped {
         Ok(Catalog::from_parts(segments, live))
     }
 
-    pub(super) fn segment(path: &Path) -> Result<Segment, SnapshotError> {
+    pub(super) fn segment(path: &Path, check: Check) -> Result<Segment, SnapshotError> {
         let map = map_file(path)?;
-        read_segment_at(&map, 0).map(|(seg, _, _)| seg)
+        read_segment_at(&map, 0, check).map(|(seg, _, _)| seg)
     }
 }
 
@@ -891,7 +1034,19 @@ impl Catalog {
     /// As [`Catalog::read_from`], plus any error opening or mapping the
     /// file.
     pub fn map_from(path: impl AsRef<std::path::Path>) -> Result<Catalog, SnapshotError> {
-        mapped::catalog(path.as_ref())
+        mapped::catalog(path.as_ref(), Check::Full)
+    }
+
+    /// Map a snapshot as [`Catalog::map_from`] does, without the checks
+    /// that read every posting, under the terms of
+    /// [`Catalog::read_from_trusted`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::map_from`], except checksum mismatches in the
+    /// segments and unsorted runs, which go unnoticed.
+    pub fn map_from_trusted(path: impl AsRef<std::path::Path>) -> Result<Catalog, SnapshotError> {
+        mapped::catalog(path.as_ref(), Check::Trusted)
     }
 }
 
@@ -906,7 +1061,19 @@ impl Segment {
     /// As [`Segment::read_from`], plus any error opening or mapping the
     /// file.
     pub fn map_from(path: impl AsRef<std::path::Path>) -> Result<Segment, SnapshotError> {
-        mapped::segment(path.as_ref())
+        mapped::segment(path.as_ref(), Check::Full)
+    }
+
+    /// Map a snapshot as [`Segment::map_from`] does, without the checks
+    /// that read every posting, under the terms of
+    /// [`Catalog::read_from_trusted`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Segment::map_from`], except checksum mismatches and unsorted
+    /// runs, which go unnoticed.
+    pub fn map_from_trusted(path: impl AsRef<std::path::Path>) -> Result<Segment, SnapshotError> {
+        mapped::segment(path.as_ref(), Check::Trusted)
     }
 }
 
@@ -1063,6 +1230,99 @@ mod tests {
         assert!(matches!(got, Err(SnapshotError::Checksum)), "{got:?}");
     }
 
+    /// A trusted load finds the multiplicities and reference ranges a
+    /// full one does: streaks that cross blocks of eight, a saturated
+    /// multiplicity, a segment walked in parallel pieces, and none at all.
+    #[test]
+    fn trusted_loads_agree_with_full_ones() {
+        let streaks = [1u32, 3, 1, 1, 12, 2, 1, 9, 1, 1, 1, 4, 20, 1, 3, 300, 1];
+        let run: Vec<u32> = streaks
+            .iter()
+            .enumerate()
+            .flat_map(|(r, &n)| (0..n).map(move |_| 7 * r as u32 + 2))
+            .collect();
+        let times: Vec<u32> = (0..run.len() as u32).collect();
+        let long = Segment::from_arrays(&[4], &[0, run.len() as u64], &run, &times);
+        let (mut refs, mut offsets) = (Vec::new(), vec![0u64]);
+        for k in 0..600u32 {
+            refs.extend((0..20).map(|i| k % 7 + i / (k % 5 + 1)));
+            offsets.push(refs.len() as u64);
+        }
+        assert!(refs.len() >= 4 * PARALLEL_MIN);
+        let times: Vec<u32> = (0..refs.len() as u32).collect();
+        let keys: Vec<u32> = (0..600).map(|k| 3 * k).collect();
+        let large = Segment::from_arrays(&keys, &offsets, &refs, &times);
+        let small = Segment::from_postings(vec![Posting::new(1, 9, 3), Posting::new(2, 4, 1)]);
+        for seg in [long, large, small, Segment::from_postings(Vec::new())] {
+            let mut bytes = Vec::new();
+            seg.write_to(&mut bytes).unwrap();
+            let (full, full_ids) = read_segment(&mut bytes.as_slice(), Check::Full).unwrap();
+            let (trusted, ids) = read_segment(&mut bytes.as_slice(), Check::Trusted).unwrap();
+            assert_eq!(trusted, full);
+            assert_eq!(ids, full_ids);
+            for &key in seg.keys() {
+                assert_eq!(trusted.range_mult(key), full.range_mult(key), "key {key}");
+            }
+        }
+    }
+
+    /// A trusted load skips the checksum and the order of the runs, and
+    /// nothing else.
+    #[test]
+    fn trusted_loads_skip_only_the_checks_that_read_every_posting() {
+        let trusted = |seg: &Segment| {
+            let mut bytes = Vec::new();
+            seg.write_to(&mut bytes).unwrap();
+            Segment::read_from_trusted(bytes.as_slice())
+        };
+        let unsorted = Segment::from_arrays(&[1], &[0, 2], &[1, 0], &[0, 0]);
+        assert!(roundtrip(&unsorted).is_err());
+        assert_eq!(trusted(&unsorted).unwrap(), unsorted);
+        let bad_keys = Segment::from_arrays(&[5, 3], &[0, 1, 2], &[0, 0], &[0, 1]);
+        assert!(matches!(trusted(&bad_keys), Err(SnapshotError::Corrupt(m)) if m.contains("keys")));
+        let bad_offsets = Segment::from_arrays(&[1, 2], &[0, 2, 2], &[0, 0], &[0, 1]);
+        assert!(
+            matches!(trusted(&bad_offsets), Err(SnapshotError::Corrupt(m)) if m.contains("offsets"))
+        );
+
+        let good = Segment::from_postings((0..50).map(|i| Posting::new(i % 7, i, i)).collect());
+        let mut bytes = Vec::new();
+        good.write_to(&mut bytes).unwrap();
+        // The last data byte before the padding: a time bit.
+        let mut flipped = bytes.clone();
+        let at = bytes.len() - 16;
+        flipped[at] ^= 0x10;
+        assert!(matches!(
+            Segment::read_from(flipped.as_slice()),
+            Err(SnapshotError::Checksum)
+        ));
+        let loaded = Segment::read_from_trusted(flipped.as_slice()).unwrap();
+        assert_eq!(loaded.len(), good.len());
+        assert_ne!(loaded, good);
+        assert!(matches!(
+            Segment::read_from_trusted(&bytes[..bytes.len() - 1]),
+            Err(SnapshotError::Truncated)
+        ));
+        let mut wrong = bytes.clone();
+        wrong[4] = 9;
+        assert!(matches!(
+            Segment::read_from_trusted(wrong.as_slice()),
+            Err(SnapshotError::UnsupportedVersion(9))
+        ));
+
+        #[cfg(feature = "mmap")]
+        {
+            let path =
+                std::env::temp_dir().join(format!("afpindex-trusted-{}.afx", std::process::id()));
+            std::fs::write(&path, &flipped).unwrap();
+            let full = Segment::map_from(&path);
+            let mapped = Segment::map_from_trusted(&path);
+            std::fs::remove_file(&path).unwrap();
+            assert!(matches!(full, Err(SnapshotError::Checksum)), "{full:?}");
+            assert_eq!(mapped.unwrap(), loaded);
+        }
+    }
+
     #[test]
     fn padding_keeps_every_section_aligned() {
         for n in 0..9u32 {
@@ -1085,6 +1345,10 @@ mod tests {
         cat.write_to(&mut bytes).unwrap();
         assert!(matches!(
             Catalog::read_from(bytes.as_slice()),
+            Err(SnapshotError::Corrupt(m)) if m.contains("id space")
+        ));
+        assert!(matches!(
+            Catalog::read_from_trusted(bytes.as_slice()),
             Err(SnapshotError::Corrupt(m)) if m.contains("id space")
         ));
     }
