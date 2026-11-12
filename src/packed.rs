@@ -92,6 +92,70 @@ impl Packed {
         })
     }
 
+    /// Wrap the data bytes of `len` values of `bits` followed by the
+    /// slack, which must be zero.
+    #[cfg(feature = "std")]
+    pub(crate) fn from_padded(bytes: Vec<u8>, len: usize, bits: u32) -> Self {
+        assert!(bits <= u32::BITS, "width of {bits} bits is above 32");
+        assert_eq!(
+            bytes.len(),
+            Self::data_len(len, bits) + Self::SLACK,
+            "data and slack"
+        );
+        Self {
+            bytes: Bytes::Owned(bytes),
+            bits,
+            mask: mask_of(bits),
+            len,
+        }
+    }
+
+    /// The `n` bits (at most 57) from bit `bit` of the data on, in the low
+    /// end of a word; bits past the data read as zero.
+    #[cfg(feature = "std")]
+    pub(crate) fn bits_at(&self, bit: u64, n: u32) -> u64 {
+        debug_assert!(n <= 57, "{n} bits");
+        let data = Self::data_len(self.len, self.bits) as u64;
+        if bit >= data * 8 {
+            return 0;
+        }
+        self.view().window(bit) & mask_of(n)
+    }
+
+    /// Fill `dst` with the data bits from bit `from` on: byte `i` of `dst`
+    /// gets bits `from + 8i` to `from + 8i + 7`, which must all be data.
+    ///
+    /// Where `from` is a whole byte this is a copy; otherwise each word
+    /// is put together from two loads.
+    #[cfg(feature = "std")]
+    pub(crate) fn copy_bits_into(&self, dst: &mut [u8], from: u64) {
+        debug_assert!(
+            from + 8 * dst.len() as u64 <= self.len as u64 * u64::from(self.bits),
+            "bits past the data"
+        );
+        let src = self.bytes.as_slice();
+        let (at, shift) = ((from >> 3) as usize, (from & 7) as u32);
+        if shift == 0 {
+            dst.copy_from_slice(&src[at..at + dst.len()]);
+            return;
+        }
+        let word = |i: usize| u64::from_le_bytes(src[i..i + 8].try_into().expect("8 bytes"));
+        let mut words = dst.chunks_exact_mut(8);
+        let mut i = at;
+        for out in &mut words {
+            // The 8 bytes from `i` hold all but the top `shift` bits of
+            // this word; the byte after them holds the rest. The slack
+            // keeps both loads in bounds.
+            let w = word(i) >> shift | u64::from(src[i + 8]) << (64 - shift);
+            out.copy_from_slice(&w.to_le_bytes());
+            i += 8;
+        }
+        for out in words.into_remainder() {
+            *out = (src[i] >> shift) | (src[i + 1] << (8 - shift));
+            i += 1;
+        }
+    }
+
     /// Wrap `len` values of `bits` whose data bytes (as written by
     /// [`Packed::data`]) start at `map[start]`; `None` if the width is
     /// wrong or the data plus the slack runs past the mapping.

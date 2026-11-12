@@ -49,7 +49,7 @@ Perfect for:
 - **Count Before Histogram** - A branch-free first pass totals each reference's votes; only references over a vote floor get a histogram, so chance matches never pay for a sort
 - **Packed Postings** - Sorted by hash in flat arrays, references and times packed to the width of the largest value: about 4 bytes per posting instead of 8, 1.94 GiB for 499 M postings
 - **One Read per Hash** - An open-addressing directory finds a hash's run in one read, and every pass loads its next batch of cache lines before working on the current one
-- **Catalogs That Change** - Additions go into small delta segments merged geometrically; removals tombstone a reference; ids never change; a clone shares its segments
+- **Catalogs That Change** - Additions go into small delta segments merged geometrically, on every core for large merges; removals tombstone a reference; ids never change; a clone shares its segments
 - **Checksummed Snapshots** - Versioned little-endian files about the size of the catalog, verified (checksum and structure) before use
 - **Memory-Mapped Loads** - With `mmap`, the packed postings stay in the file's pages, shared between processes
 - **AVX2 Decoding** - With `simd`, eight packed values per block on CPUs that report AVX2 at run time; every other CPU runs the same code as without the feature
@@ -269,7 +269,7 @@ indexing or searching: they cost the most and tell the least.
 - Count by reference range, so each segment's counters fit the fastest
   cache: the measured ceiling is a third off the totals pass.
 - Several cores on one heavy query, for the p95.
-- Parallel merge, and a parallel first level of the build sort.
+- A parallel first level of the build sort.
 - AVX2's counterpart on aarch64 (NEON), for Graviton hosts.
 - References stored as gaps within a run: about a fifth less memory
   (estimated).

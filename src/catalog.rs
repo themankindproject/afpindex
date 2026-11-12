@@ -284,7 +284,8 @@ impl Catalog {
             [only] if !only.stale => return Some(only.clone()),
             _ => {}
         }
-        let keep = |reference: u32| self.live[reference as usize];
+        let live = &self.live;
+        let keep = |reference: u32| live[reference as usize];
         let sides: Vec<_> = tail
             .iter()
             .map(|part| (&*part.segment, part.stale.then_some(&keep)))

@@ -5,6 +5,9 @@ use core::iter::FusedIterator;
 use crate::Posting;
 use crate::packed::{Packed, PackedBuilder, View};
 
+#[cfg(feature = "std")]
+mod parallel;
+
 /// One directory slot, 12 bytes: `key`'s run starts at `start` (40 bits),
 /// holds `len` postings (16 bits), and no reference has more than `mult`
 /// postings in it (8 bits, saturating).
@@ -55,6 +58,13 @@ impl Slot {
     #[inline]
     const fn start(self) -> u64 {
         self.start_lo as u64 | ((self.len_mult_hi & 0xFF) as u64) << 32
+    }
+
+    /// `start << 8 | mult`: a run as a merge walks it, ordered by where
+    /// it starts.
+    #[inline]
+    const fn order(&self) -> u64 {
+        self.start() << 8 | self.mult() as u64
     }
 }
 
@@ -205,10 +215,16 @@ fn build_table(keys: &[u32], offsets: &[u64], mults: &[u8]) -> Vec<Slot> {
         next[region + 1] += next[region];
     }
     let mut by_region = alloc::vec![Slot::EMPTY; next[regions]];
+    #[cfg(feature = "std")]
+    let region_starts = next.clone();
     for slot in (0..n).filter_map(slot_of_key) {
         let at = &mut next[region_of(slot.key)];
         by_region[*at] = slot;
         *at += 1;
+    }
+    #[cfg(feature = "std")]
+    if parallel::place_by_region(&mut table, &by_region, &region_starts) {
+        return table;
     }
     for slot in by_region {
         place(&mut table, slot);
@@ -396,6 +412,19 @@ impl Writer {
         mult
     }
 
+    /// The keys, the start of each key's run, the multiplicities and the
+    /// finished arrays, for a caller that joins several writers' output.
+    #[cfg(feature = "std")]
+    fn into_parts(self) -> (Vec<u32>, Vec<u64>, Vec<u8>, Packed, Packed) {
+        (
+            self.keys,
+            self.starts,
+            self.mults,
+            self.refs.finish(),
+            self.times.finish(),
+        )
+    }
+
     pub(crate) fn finish(mut self) -> Segment {
         let postings = self.refs.len() as u64;
         assert!(
@@ -539,9 +568,22 @@ impl Segment {
             self.table
                 .iter()
                 .filter(|slot| slot.len() != 0)
-                .map(|slot| slot.start() << 8 | u64::from(slot.mult())),
+                .map(Slot::order),
         );
         debug_assert_eq!(order.len(), self.keys.len(), "every key has a run");
+        self.source_of(keep, &self.keys, order, self.len())
+    }
+
+    /// A walk over `keys`, a stretch of this segment's keys whose runs
+    /// end at entry `end`, from their runs as [`Slot::order`] gives them in
+    /// any order.
+    fn source_of<'a, 'k, F>(
+        &'a self,
+        keep: Option<&'k F>,
+        keys: &'a [u32],
+        mut order: Vec<u64>,
+        end: usize,
+    ) -> Source<'a, 'k, F> {
         let start_bits = u64::BITS - (self.len() as u64).leading_zeros();
         crate::sort::radix_sort_by_key(&mut order, &mut Vec::new(), start_bits, |&run| run >> 8);
         Source {
@@ -550,9 +592,9 @@ impl Segment {
             keep,
             // Every key has a run; the shorter of the two bounds the walk
             // all the same.
-            keys: &self.keys[..self.keys.len().min(order.len())],
+            keys: &keys[..keys.len().min(order.len())],
             order,
-            end: self.len(),
+            end,
             next: 0,
         }
     }
@@ -848,19 +890,22 @@ impl Segment {
 
     /// Merge two segments, keeping only postings whose reference `keep`
     /// accepts. Linear in the two sizes; a posting present in both is kept
-    /// once.
+    /// once. With `std`, a large merge runs on every core, so `keep` is
+    /// called from several threads.
     ///
     /// # Panics
     ///
     /// Panics if the result would hold 2<sup>40</sup> postings or more.
     #[must_use]
-    pub fn merge(left: &Segment, right: &Segment, keep: impl Fn(u32) -> bool) -> Segment {
+    pub fn merge(left: &Segment, right: &Segment, keep: impl Fn(u32) -> bool + Sync) -> Segment {
         Self::merge_all(&[(left, Some(&keep)), (right, Some(&keep))])
     }
 
-    /// A copy without the postings of references `keep` rejects.
+    /// A copy without the postings of references `keep` rejects. With
+    /// `std`, a large segment is filtered on every core, so `keep` is
+    /// called from several threads.
     #[must_use]
-    pub fn filter(&self, keep: impl Fn(u32) -> bool) -> Segment {
+    pub fn filter(&self, keep: impl Fn(u32) -> bool + Sync) -> Segment {
         Self::merge_all(&[(self, Some(&keep))])
     }
 
@@ -871,38 +916,25 @@ impl Segment {
     /// rejects; its runs are then copied without a look at their
     /// references. Linear in the total size, times the number of segments
     /// for the distinct hashes.
-    pub(crate) fn merge_all<F: Fn(u32) -> bool>(sides: &[(&Segment, Option<&F>)]) -> Segment {
-        let widest = |bits: fn(&Segment) -> u32| sides.iter().map(|&(s, _)| bits(s)).max();
-        let mut out = Writer::with_capacity(
-            sides
-                .iter()
-                .fold(0usize, |n, (s, _)| n.saturating_add(s.len())),
-            widest(|s| s.refs.bits()).unwrap_or(0),
-            widest(|s| s.times.bits()).unwrap_or(0),
-        );
+    ///
+    /// With `std`, a large merge runs on every core: the hash space is cut
+    /// into pieces of about equal postings, each merged on its own, and the
+    /// pieces are joined in order. The result is the same posting for
+    /// posting.
+    pub(crate) fn merge_all<F: Fn(u32) -> bool + Sync>(
+        sides: &[(&Segment, Option<&F>)],
+    ) -> Segment {
+        #[cfg(feature = "std")]
+        if let Some(merged) = parallel::merge_all(sides) {
+            return merged;
+        }
+        let (ref_bits, time_bits) = widths(sides);
+        let mut out = Writer::with_capacity(postings(sides), ref_bits, time_bits);
         let mut sources: Vec<_> = sides
             .iter()
             .map(|&(segment, keep)| segment.source(keep))
             .collect();
-        // The runs of the smallest hash at the head of any source, each
-        // with the index of its source.
-        let mut same = Vec::with_capacity(sources.len());
-        loop {
-            let hash = sources
-                .iter()
-                .map(Source::head)
-                .fold(Source::<F>::DONE, u64::min);
-            if hash == Source::<F>::DONE {
-                break;
-            }
-            same.clear();
-            for (i, source) in sources.iter_mut().enumerate() {
-                if source.head() == hash {
-                    same.push((i, source.take()));
-                }
-            }
-            out.merge_runs(hash as u32, &sources, &mut same);
-        }
+        merge_sources(&mut out, &mut sources);
         // The walks are spent: the directory is built without them.
         drop(sources);
         out.finish()
@@ -928,6 +960,46 @@ impl Segment {
             );
         }
         out.finish()
+    }
+}
+
+/// Postings across `sides`, saturating.
+fn postings<F>(sides: &[(&Segment, Option<&F>)]) -> usize {
+    sides
+        .iter()
+        .fold(0usize, |n, (s, _)| n.saturating_add(s.len()))
+}
+
+/// The widest references and times across `sides`: the widths of their
+/// merge.
+fn widths<F>(sides: &[(&Segment, Option<&F>)]) -> (u32, u32) {
+    let widest = |bits: fn(&Segment) -> u32| sides.iter().map(|&(s, _)| bits(s)).max();
+    (
+        widest(|s| s.refs.bits()).unwrap_or(0),
+        widest(|s| s.times.bits()).unwrap_or(0),
+    )
+}
+
+/// Write the union of every run of `sources` to `out`, hashes ascending.
+fn merge_sources<F: Fn(u32) -> bool>(out: &mut Writer, sources: &mut [Source<'_, '_, F>]) {
+    // The runs of the smallest hash at the head of any source, each with
+    // the index of its source.
+    let mut same = Vec::with_capacity(sources.len());
+    loop {
+        let hash = sources
+            .iter()
+            .map(Source::head)
+            .fold(Source::<F>::DONE, u64::min);
+        if hash == Source::<F>::DONE {
+            break;
+        }
+        same.clear();
+        for (i, source) in sources.iter_mut().enumerate() {
+            if source.head() == hash {
+                same.push((i, source.take()));
+            }
+        }
+        out.merge_runs(hash as u32, sources, &mut same);
     }
 }
 

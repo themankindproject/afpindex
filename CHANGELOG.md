@@ -21,7 +21,11 @@ First release: the engine of the *afpindex* design notes as a library.
   `remove` by tombstone, `compact_deltas` and `compact`. A merge is one
   pass over every segment it joins, copies runs that need no change as
   packed bits, and looks at references only in segments that may hold a
-  removed one. Segments are shared (`Arc`), so a clone is cheap.
+  removed one. With `std`, a merge of a million postings or more runs on
+  every core: the hash space is cut into pieces of about equal postings,
+  merged on their own and copied into place in order, for the same
+  segment; a compaction ran 3 times faster on 8 vCPUs and 4 times on 16.
+  Segments are shared (`Arc`), so a clone is cheap.
 - `Query::from_pairs`: group a clip's `(hash, time)` rows by hash with a
   per-hash cap on the times kept.
 - `Catalog::search`: the two-pass exact search (branch-free totals pass
@@ -56,7 +60,8 @@ First release: the engine of the *afpindex* design notes as a library.
 - In-place radix sort on the hash when a segment is built from rows,
   whose swaps do not wait for one another and which skips the hash bits a
   bucket's rows agree on, so a build holds no buffer beyond the rows and
-  the segment's arrays; with `std`, the buckets are sorted on every core.
+  the segment's arrays; with `std`, the buckets are sorted on every core,
+  and so is a large directory filled, a stretch of regions per thread.
 - Searches arranged for memory-level parallelism without `unsafe`: the
   lookup, totals and histogram passes load their next batch of lines (32
   directory slots, every line of the next 16 runs, 32 vote groups) before

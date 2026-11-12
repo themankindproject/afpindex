@@ -267,6 +267,47 @@ Measured here and left out:
   no counters to confirm it. The kernel also needs Rust 1.89 for the
   AVX-512 intrinsics.
 
+## Parallel merge
+
+With `std`, a merge of a million postings or more runs on every core.
+The hash space is cut into pieces holding about equal numbers of
+postings, eight per thread. One pass deals every source's directory to
+the pieces, a stretch of slots per task. Each piece then merges its runs
+into arrays of its own, and the pieces are copied into the output in
+order as they finish, sharing the bytes where their packed bits meet; a
+large directory is filled a stretch of regions per thread. The segment
+is the same one a single thread builds.
+
+`examples/lifecycle.rs` with huge pages on, in alternating rounds of the
+code before and after on one host; build, write, read and map times did
+not change beyond noise:
+
+| host | catalog | `compact` | `compact_deltas` | worst `add` | peak memory |
+|---|---|---|---|---|---|
+| `m7i-flex.large`, 2 vCPUs | 60 M | 0.64 → 0.58 s | 0.27 → 0.23 s | 234 → 209 ms | +2 % |
+| `m7i.2xlarge`, 8 vCPUs | 60 M | 0.67 → 0.22 s | 0.27 → 0.09 s | 246 → 88 ms | +12 % |
+| `m7i.2xlarge`, 8 vCPUs | 180 M | 1.57 → 0.56 s | 0.35 → 0.12 s | 302 → 114 ms | +9 % |
+| `c7i.4xlarge`, 16 vCPUs | 60 M | 0.62 → 0.15 s | 0.25 → 0.06 s | 223 → 62 ms | +15 % |
+| `c7i.4xlarge`, 16 vCPUs | 180 M | 1.50 → 0.39 s | 0.33 → 0.09 s | 281 → 83 ms | +12 % |
+
+The 60 M catalog is the one of the section above, five rounds; the
+180 M one has three times the rows
+(`-- 60000 3000 10800000 2000`), three rounds. The average addition fell
+by about a fifth on 8 and 16 vCPUs, as the merges it waits on got shorter.
+Two hardware threads of one core gain a tenth, since they share the
+core's ports. On the real catalog, on that host, loads and searches
+measured the same, and the candidates were identical.
+
+**Memory.** Peak memory is that of the whole run: build, additions,
+compactions and loads. A merge holds its output at full size from the
+start. A piece's arrays are freed as soon as it is copied into place,
+so besides the output only the pieces merged and not yet placed are
+alive, about an eighth of the output with eight pieces per thread.
+Copying every piece in at the end instead held a second copy of the
+output, and the peak was 30 % higher; glibc keeps freed memory in its
+per-thread arenas rather than returning it to the system, so the
+pieces have to go as they are placed.
+
 ## Allocators and huge pages
 
 The `simd` build on the real catalog under five allocator setups, on one
