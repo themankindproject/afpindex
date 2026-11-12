@@ -243,6 +243,29 @@ Measured here and left out:
   fewer are read in blocks.
 - Storing the directory in the snapshot instead of rebuilding it would
   save 0.05 s of a load; the run check and the checksum are the rest.
+- AVX-512 decoding made every pass slower. The kernel decoded sixteen
+  values per block with one cross-lane byte permute (VBMI `vpermb`, its
+  64-byte window as the operand) and one variable shift, and it was
+  picked at run time ahead of AVX2. Measured against the AVX2 build of
+  the same code on an AWS `m7i-flex.large` (Xeon 8488C), five
+  alternating rounds with huge pages on:
+
+  | | AVX2 | AVX-512 |
+  |---|---|---|
+  | real clips, summed latency, catalog loaded | 139.4 ms | 142.3 ms (+2 %) |
+  | real clips, summed latency, catalog mapped | 145.9 ms | 150.0 ms (+3 %) |
+  | real catalog, `read_from` | 1.74 s | 1.85 s (+6 %) |
+  | real catalog, `map_from` | 1.03 s | 1.12 s (+9 %) |
+  | synthetic, runs of 17, searches per second | 8,815 | 8,675 (−2 %) |
+  | synthetic, runs of 136, searches per second | 3,121 | 2,788 (−11 %) |
+
+  Decoding is a small share of each pass, and runs of 17 postings fill
+  one block of sixteen. The loss was largest on runs of 136, where the
+  kernel runs most. That points to a cost the 512-bit instructions put
+  on the rest of the core rather than to the kernel. Most likely it is a
+  lower clock and a vector port given up while they run; this host has
+  no counters to confirm it. The kernel also needs Rust 1.89 for the
+  AVX-512 intrinsics.
 
 ## Allocators and huge pages
 
