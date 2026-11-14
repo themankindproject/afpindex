@@ -83,3 +83,7 @@ required-features = ["std"]
 [[example]]
 name = "lifecycle"
 required-features = ["std"]
+
+[[example]]
+name = "profile"
+required-features = ["mmap"]

@@ -1,0 +1,173 @@
+//! Instruction counts for a search or an addition, for `callgrind`.
+//!
+//! Builds a synthetic catalog into a snapshot, or maps one and searches or
+//! adds to it inside a function that `--toggle-collect` selects, so the
+//! profile holds the measured work and not the load or the result printing.
+//!
+//! ```bash
+//! export CARGO_PROFILE_RELEASE_DEBUG=1
+//! cargo build --release --features mmap,simd --example profile
+//! B=target/release/examples/profile
+//! $B build 120000 500 450000 /tmp/s1.afc    # real-like: 133 postings per hash
+//! $B build 20000 3000 3600000 /tmp/s2.afc   # the bench shape: 17 per hash
+//! valgrind --tool=callgrind --toggle-collect='profile::measured' \
+//!   --callgrind-out-file=/tmp/cg.out \
+//!   $B search 120000 500 450000 /tmp/s1.afc 750 0 0 2
+//! callgrind_annotate --auto=yes /tmp/cg.out
+//! ```
+//!
+//! Arguments after the path are query rows, floor (0 for a proportional
+//! one), additions before the first search, and rounds of 40 searches.
+//! `adds` mode profiles `n` single additions. Setting `COMPACT_DELTAS` or
+//! `COMPACT` in the environment compacts after the additions, so a search
+//! can be profiled against many segments.
+
+use std::time::Instant;
+
+use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
+
+struct Rng(u64);
+
+impl Rng {
+    fn seeded(seed: u64) -> Self {
+        let mut r = Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        for _ in 0..4 {
+            r.next();
+        }
+        r
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+const MAX_TIME: u64 = 32_000;
+
+fn rows_of(reference: u32, per_ref: usize, hashes: u64) -> Vec<(u32, u32)> {
+    let mut rng = Rng::seeded(u64::from(reference) + 1);
+    (0..per_ref)
+        .map(|_| (rng.below(hashes) as u32, rng.below(MAX_TIME) as u32))
+        .collect()
+}
+
+/// The searches `--toggle-collect` counts: the rounds, not the load.
+#[inline(never)]
+fn measured(
+    catalog: &Catalog,
+    queries: &[(Query, SearchOptions)],
+    scratch: &mut Scratch,
+    rounds: usize,
+) -> usize {
+    let mut n = 0;
+    for _ in 0..rounds {
+        for (q, o) in queries {
+            n += catalog.search(q, o, scratch).unwrap().len();
+        }
+    }
+    n
+}
+
+/// One addition per reference, the way a live catalog grows.
+#[inline(never)]
+fn measured_adds(catalog: &mut Catalog, rows: Vec<Vec<(u32, u32)>>) {
+    for r in rows {
+        catalog.add(r);
+    }
+}
+
+fn main() {
+    let a: Vec<String> = std::env::args().skip(1).collect();
+    let num = |i: usize| a[i].parse::<usize>().expect("integer");
+    let (refs, per_ref, hashes) = (num(1), num(2), num(3) as u64);
+    let path = &a[4];
+    match a[0].as_str() {
+        // build refs per_ref hashes path
+        "build" => {
+            let mut b = Catalog::builder();
+            for r in 0..refs as u32 {
+                b.add(rows_of(r, per_ref, hashes));
+            }
+            let c = b.build();
+            let file = std::fs::File::create(path).unwrap();
+            let mut out = std::io::BufWriter::with_capacity(1 << 23, file);
+            c.write_to(&mut out).unwrap();
+            println!("built {} postings", c.posting_count());
+        }
+        // search refs per_ref hashes path query_rows floor adds rounds
+        "search" => {
+            let (qrows, floor, adds, rounds) = (num(5), num(6), num(7), num(8));
+            let mut catalog = Catalog::map_from_trusted(path).unwrap();
+            for i in 0..adds {
+                catalog.add(rows_of((refs + i) as u32, per_ref, hashes));
+            }
+            if std::env::var("COMPACT_DELTAS").is_ok() {
+                catalog.compact_deltas();
+            }
+            if std::env::var("COMPACT").is_ok() {
+                catalog.compact();
+            }
+            let sizes: Vec<_> = catalog
+                .segments()
+                .map(|s| (s.len(), s.key_count()))
+                .collect();
+            println!("segment sizes: {sizes:?}");
+            let mut rng = Rng::seeded(0xBEEF);
+            let queries: Vec<(Query, SearchOptions)> = (0..40)
+                .map(|_| {
+                    let r = rng.below(refs as u64) as u32;
+                    let mut pairs: Vec<(u32, u32)> = rows_of(r, per_ref, hashes)
+                        .into_iter()
+                        .take(qrows * 2 / 3)
+                        .collect();
+                    let noise = qrows - pairs.len().min(qrows);
+                    pairs.extend(
+                        (0..noise).map(|_| (rng.below(hashes) as u32, rng.below(MAX_TIME) as u32)),
+                    );
+                    let q = Query::from_pairs(pairs, Some(64));
+                    let mut o = SearchOptions::default();
+                    o.min_total_votes = if floor == 0 {
+                        vote_floor(q.input_rows(), 16, 0.02)
+                    } else {
+                        floor as u32
+                    };
+                    (q, o)
+                })
+                .collect();
+            let mut scratch = Scratch::new();
+            let warm = measured(&catalog, &queries, &mut scratch, 1);
+            let t = Instant::now();
+            let n = measured(&catalog, &queries, &mut scratch, rounds);
+            let per = t.elapsed().as_secs_f64() * 1e6 / (rounds * queries.len()) as f64;
+            println!(
+                "segments {} postings {} | {warm} candidates/round | {per:.1} us/search",
+                catalog.segment_count(),
+                catalog.posting_count(),
+            );
+            std::hint::black_box(n);
+        }
+        // adds refs per_ref hashes path n
+        "adds" => {
+            let n = num(5);
+            let mut catalog = Catalog::map_from_trusted(path).unwrap();
+            let rows: Vec<_> = (0..n)
+                .map(|i| rows_of((refs + i) as u32, per_ref, hashes))
+                .collect();
+            let t = Instant::now();
+            measured_adds(&mut catalog, rows);
+            println!(
+                "{n} adds: {:.2} ms each, {} segments",
+                t.elapsed().as_secs_f64() * 1e3 / n as f64,
+                catalog.segment_count()
+            );
+        }
+        _ => panic!("mode: build, search or adds"),
+    }
+}
