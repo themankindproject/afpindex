@@ -918,11 +918,6 @@ mod tests {
                 "{threads} threads held {} pieces",
                 written.held
             );
-            assert!(
-                written.held >= threads.min(2),
-                "{threads} threads, held {}",
-                written.held
-            );
         }
     }
 

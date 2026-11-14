@@ -1252,6 +1252,9 @@ mod tests {
         let dir = scratch.dir.join("store");
         let mut store = small_store(&dir, &mut rng, 6, 40);
         store.save().expect("the save");
+        // The store maps its segments, and Windows refuses to write a
+        // mapped file.
+        drop(store);
         let manifest = dir.join(MANIFEST);
         let good = std::fs::read(&manifest).expect("the manifest");
         let segment = files(&dir)
