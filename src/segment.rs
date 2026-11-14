@@ -188,24 +188,42 @@ const REGION_SLOTS: usize = 1 << 13;
 /// of 20, at most about 50 MB per segment.
 const SPARSE_KEYS: usize = 1 << 20;
 
-/// Directory over sorted `keys` and their `offsets`: linear probing at a
-/// load of three keys per five slots, or one key per four below
-/// [`SPARSE_KEYS`] keys. A lookup that misses probes on to an empty slot,
-/// and that walk is most of what a lookup in a delta segment costs: at the
-/// denser load it is five slots, and at the sparser one under two. A hit
-/// costs one or two probes either way, and both stay inside one cache
-/// line.
-fn build_table(keys: &[u32], offsets: &[u64], mults: &[u8]) -> Vec<Slot> {
+/// Slots in a directory over `keys` keys at the dense load of a large
+/// segment: three keys per five slots.
+fn dense_slots(keys: usize) -> usize {
+    keys + keys / 3 * 2 + 1
+}
+
+/// Slots in a directory over `keys` keys at the sparse load of a small
+/// segment: four per key.
+fn sparse_slots(keys: usize) -> usize {
+    4 * keys + 1
+}
+
+/// Slots in a directory over `keys` keys: the sparse load below
+/// [`SPARSE_KEYS`], the dense one from there.
+///
+/// A lookup that misses probes on to an empty slot, and that walk is most
+/// of what a lookup in a delta segment costs: at the denser load it is
+/// five slots, and at the sparser one under two. A hit costs one or two
+/// probes either way, and both stay inside one cache line.
+fn slots_for(keys: usize) -> usize {
+    if keys < SPARSE_KEYS {
+        sparse_slots(keys)
+    } else {
+        dense_slots(keys)
+    }
+}
+
+/// Directory over sorted `keys` and their `offsets`, in a table of
+/// `slots`: [`slots_for`] at the load a segment's size picks.
+fn build_table_with(keys: &[u32], offsets: &[u64], mults: &[u8], slots: usize) -> Vec<Slot> {
     debug_assert_eq!(mults.len(), keys.len());
     if keys.is_empty() {
         return Vec::new();
     }
+    debug_assert!(slots > keys.len(), "a key needs a free slot");
     let n = keys.len();
-    let slots = if n < SPARSE_KEYS {
-        4 * n + 1
-    } else {
-        n + n / 3 * 2 + 1
-    };
     let mut table = alloc::vec![Slot::EMPTY; slots];
     // A key without postings (only arrays a reader has yet to reject) gets
     // no slot, which reads as "absent".
@@ -248,6 +266,13 @@ fn build_table(keys: &[u32], offsets: &[u64], mults: &[u8]) -> Vec<Slot> {
         place(&mut table, slot);
     }
     table
+}
+
+/// Directory over sorted `keys` and their `offsets`, in the table size
+/// [`slots_for`] gives them.
+fn build_table(keys: &[u32], offsets: &[u64], mults: &[u8]) -> Vec<Slot> {
+    let slots = slots_for(keys.len());
+    build_table_with(keys, offsets, mults, slots)
 }
 
 /// Put `slot` in the first free slot from its key's home.
@@ -785,6 +810,19 @@ impl Segment {
         self.table[i] = Slot::new(hash, start, u64::from(LONG), mult);
     }
 
+    /// Rebuild the directory in a table of `slots`, the size a test picks
+    /// instead of the one [`slots_for`] gives the key count (tests).
+    #[cfg(test)]
+    fn retable(&mut self, slots: usize) {
+        let offsets: Vec<u64> = self.offsets().collect();
+        let mults: Vec<u8> = self
+            .keys
+            .iter()
+            .map(|&k| self.range_mult(k).expect("every key has a run").2)
+            .collect();
+        self.table = build_table_with(&self.keys, &offsets, &mults, slots);
+    }
+
     #[inline]
     pub(crate) fn refs(&self) -> &Packed {
         &self.refs
@@ -1231,9 +1269,34 @@ mod tests {
     }
 
     #[test]
+    fn directory_load_switches_at_the_sparse_threshold() {
+        // Four slots per key below `SPARSE_KEYS`, and fewer than two from
+        // there: a lookup that misses walks to an empty slot, so the load
+        // is what decides how far it walks.
+        for keys in [0usize, 1, 7, 1_000, SPARSE_KEYS - 1] {
+            let slots = slots_for(keys);
+            assert_eq!(slots, 4 * keys + 1, "{keys} keys");
+            // Three empty slots per key, which ends a miss in under two
+            // probes.
+            assert_eq!(slots - keys, 3 * keys + 1, "{keys} keys");
+        }
+        for keys in [SPARSE_KEYS, SPARSE_KEYS + 1, 3 * SPARSE_KEYS + 2] {
+            let slots = slots_for(keys);
+            assert_eq!(slots, keys + keys / 3 * 2 + 1, "{keys} keys");
+            assert!(
+                slots < 2 * keys,
+                "{keys} keys: fewer than two slots per key"
+            );
+            assert!(slots > keys, "{keys} keys: a key needs a free slot");
+        }
+    }
+
+    #[test]
     fn directory_spreads_keys_that_vary_in_few_bits() {
         // Keys below 2^16, keys with a constant top byte, and multiples of
-        // 2^16: each set must resolve, miss cleanly, and probe briefly.
+        // 2^16: each set must resolve, miss cleanly, and probe briefly at
+        // the sparse load a segment this small gets, and at the dense one
+        // every large segment uses.
         let sets: [Vec<u32>; 3] = [
             (0..4_000u32).map(|i| i * 7 % 65_536).collect(),
             (0..3_000u32).map(|i| 0xAB00_0000 | (i * 1_031)).collect(),
@@ -1245,22 +1308,30 @@ mod tests {
                 .enumerate()
                 .map(|(i, &h)| p(h, 0, i as u32))
                 .collect();
-            let s = Segment::from_postings(rows.clone());
-            let mut probes = 0;
-            for r in &rows {
-                assert!(s.run(r.hash).is_some());
-                assert_eq!(s.range(r.hash).unwrap().1, s.end_by_search(r.hash));
-                probes += s.probes(r.hash);
-            }
-            assert!(
-                probes <= rows.len() * 2,
-                "{} probes for {} keys",
-                probes,
-                rows.len()
-            );
-            assert!(s.table.len() > s.key_count());
-            for probe in [1u32, 65_537, 1 << 20, 0xAB00_0000 | 1, u32::MAX] {
-                assert_eq!(s.run(probe).is_some(), rows.iter().any(|r| r.hash == probe));
+            let mut s = Segment::from_postings(rows.clone());
+            let n = s.key_count();
+            assert_eq!(s.table.len(), slots_for(n));
+            // The sparse load this size gets, then the dense one of a
+            // large segment.
+            for slots in [sparse_slots(n), dense_slots(n)] {
+                s.retable(slots);
+                assert_eq!(s.table.len(), slots);
+                let mut probes = 0;
+                for r in &rows {
+                    assert!(s.run(r.hash).is_some());
+                    assert_eq!(s.range(r.hash).unwrap().1, s.end_by_search(r.hash));
+                    probes += s.probes(r.hash);
+                }
+                assert!(
+                    probes <= rows.len() * 2,
+                    "{} probes for {} keys in {slots} slots",
+                    probes,
+                    rows.len()
+                );
+                assert!(s.table.len() > s.key_count());
+                for probe in [1u32, 65_537, 1 << 20, 0xAB00_0000 | 1, u32::MAX] {
+                    assert_eq!(s.run(probe).is_some(), rows.iter().any(|r| r.hash == probe));
+                }
             }
         }
         assert!(Segment::default().run(0).is_none());
@@ -1475,6 +1546,51 @@ mod tests {
         }
         assert_eq!(walked.next(), None);
         assert!(alloc::format!("{walked:?}").contains("remaining: 0"));
+    }
+
+    /// A real segment of `SPARSE_KEYS` keys, the smallest that takes the
+    /// dense load: every key resolves to its run, hashes it does not hold
+    /// miss, and the directory has the dense size rather than the sparse
+    /// one a smaller segment gets.
+    #[test]
+    fn a_segment_at_the_sparse_threshold_uses_the_dense_directory() {
+        // A bijection of `0..SPARSE_KEYS` over the hash space, one posting
+        // of reference 0 per key, its ordinal as the time.
+        let mut keys: Vec<(u32, u32)> = (0..SPARSE_KEYS as u32)
+            .map(|i| (i.wrapping_mul(0x9E37_79B1), i))
+            .collect();
+        let rows: Vec<Posting> = keys.iter().map(|&(hash, t)| p(hash, 0, t)).collect();
+        let s = Segment::from_postings(rows);
+        assert_eq!(s.key_count(), SPARSE_KEYS);
+        assert_eq!(s.len(), SPARSE_KEYS);
+        // Three keys per five slots, not the four per key a smaller segment
+        // gets: the dense directory is the one every large segment has.
+        assert_eq!(s.table.len(), dense_slots(SPARSE_KEYS));
+        assert!(s.table.len() < sparse_slots(SPARSE_KEYS));
+        // Every key resolves to its run, one posting with its time.
+        keys.sort_unstable();
+        for (rank, &(hash, t)) in keys.iter().enumerate() {
+            let (lo, hi, mult) = s.range_mult(hash).expect("a key the segment holds");
+            assert_eq!((lo, hi, mult), (rank, rank + 1, 1), "hash {hash}");
+            assert_eq!(s.times().get(rank), t, "time of hash {hash}");
+        }
+        // Hashes the keys miss. They cover the image of a bijection, so a
+        // sorted copy answers the lookups as the directory must.
+        for j in 0..4_096u32 {
+            let probe = j.wrapping_mul(0x85EB_CA6B) | 1;
+            assert_eq!(
+                s.run(probe).is_some(),
+                keys.binary_search_by_key(&probe, |&(hash, _)| hash).is_ok(),
+                "hash {probe}"
+            );
+        }
+        for probe in [u32::MAX, 0x8000_0001] {
+            assert_eq!(
+                s.run(probe).is_some(),
+                keys.binary_search_by_key(&probe, |&(hash, _)| hash).is_ok(),
+                "hash {probe}"
+            );
+        }
     }
 
     #[test]

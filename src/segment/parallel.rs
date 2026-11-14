@@ -640,7 +640,7 @@ fn slots_of_vecs<T>(n: usize) -> Vec<Mutex<Vec<T>>> {
 mod tests {
     use super::*;
     use crate::Posting;
-    use crate::segment::keys;
+    use crate::segment::{build_table_with, dense_slots, keys, sparse_slots};
 
     type Keep<'a> = &'a (dyn Fn(u32) -> bool + Sync);
 
@@ -753,7 +753,9 @@ mod tests {
 
     /// A directory filled in stretches finds every key where a directory
     /// filled in order does, including keys whose probe crosses from one
-    /// stretch into the next and wraps past the end of the table.
+    /// stretch into the next and wraps past the end of the table, at the
+    /// sparse load a small segment gets and at the dense one a large
+    /// segment uses.
     #[test]
     fn stretches_find_every_key() {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
@@ -774,45 +776,54 @@ mod tests {
             let n = hashes.len();
             let offsets: Vec<u64> = (0..=n as u64).map(|i| 3 * i).collect();
             let mults: Vec<u8> = (0..n).map(|i| (i % 7) as u8 + 1).collect();
-            let want = build_table(&hashes, &offsets, &mults);
-            for (threads, stretches) in [(1, 1), (2, 3), (4, 16), (3, 1_000)] {
-                let slots = want.len();
-                let regions = slots.div_ceil(REGION_SLOTS);
-                let mut by_region: Vec<Slot> = (0..n)
-                    .map(|k| Slot::new(hashes[k], offsets[k], 3, mults[k]))
-                    .collect();
-                by_region.sort_by_key(|s| slot_of(s.key, slots) / REGION_SLOTS);
-                let mut region_starts = vec![0usize; regions + 1];
-                for s in &by_region {
-                    region_starts[slot_of(s.key, slots) / REGION_SLOTS + 1] += 1;
-                }
-                for r in 0..regions {
-                    region_starts[r + 1] += region_starts[r];
-                }
-                let mut table = vec![Slot::EMPTY; slots];
-                late +=
-                    place_in_stretches(&mut table, &by_region, &region_starts, threads, stretches);
-                let find = |table: &[Slot], key: u32| {
-                    let mut i = slot_of(key, table.len());
-                    loop {
-                        let s = table[i];
-                        if s.len() == 0 {
-                            return None;
-                        }
-                        if s.key == key {
-                            return Some((s.start(), s.len(), s.mult()));
-                        }
-                        i = (i + 1) % table.len();
+            let find = |table: &[Slot], key: u32| {
+                let mut i = slot_of(key, table.len());
+                loop {
+                    let s = table[i];
+                    if s.len() == 0 {
+                        return None;
                     }
-                };
-                for &h in &hashes {
-                    assert_eq!(
-                        find(&table, h),
-                        find(&want, h),
-                        "{keys} keys, {stretches} stretches, {h}"
-                    );
+                    if s.key == key {
+                        return Some((s.start(), s.len(), s.mult()));
+                    }
+                    i = (i + 1) % table.len();
                 }
-                assert_eq!(table.iter().filter(|s| s.len() != 0).count(), n);
+            };
+            // Both loads: the sparse one this key count gets, and the dense
+            // one a segment above `SPARSE_KEYS` gets, which is a shorter
+            // table whose probes run further.
+            for slots in [sparse_slots(n), dense_slots(n)] {
+                let want = build_table_with(&hashes, &offsets, &mults, slots);
+                for (threads, stretches) in [(1, 1), (2, 3), (4, 16), (3, 1_000)] {
+                    let regions = slots.div_ceil(REGION_SLOTS);
+                    let mut by_region: Vec<Slot> = (0..n)
+                        .map(|k| Slot::new(hashes[k], offsets[k], 3, mults[k]))
+                        .collect();
+                    by_region.sort_by_key(|s| slot_of(s.key, slots) / REGION_SLOTS);
+                    let mut region_starts = vec![0usize; regions + 1];
+                    for s in &by_region {
+                        region_starts[slot_of(s.key, slots) / REGION_SLOTS + 1] += 1;
+                    }
+                    for r in 0..regions {
+                        region_starts[r + 1] += region_starts[r];
+                    }
+                    let mut table = vec![Slot::EMPTY; slots];
+                    late += place_in_stretches(
+                        &mut table,
+                        &by_region,
+                        &region_starts,
+                        threads,
+                        stretches,
+                    );
+                    for &h in &hashes {
+                        assert_eq!(
+                            find(&table, h),
+                            find(&want, h),
+                            "{keys} keys, {slots} slots, {stretches} stretches, {h}"
+                        );
+                    }
+                    assert_eq!(table.iter().filter(|s| s.len() != 0).count(), n);
+                }
             }
         }
         // The crowded regions did send probes across stretches.
