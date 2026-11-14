@@ -22,6 +22,7 @@ by about 10 %, so compare columns within one table only.
 - [Adding a batch](#adding-a-batch)
 - [A sparser directory for small segments](#a-sparser-directory-for-small-segments)
 - [Parallel merge](#parallel-merge)
+- [Scanning only the counters a search wrote](#scanning-only-the-counters-a-search-wrote)
 - [Trusted loads](#trusted-loads)
 - [Merging straight into a file](#merging-straight-into-a-file)
 - [A catalog in a directory](#a-catalog-in-a-directory)
@@ -499,6 +500,56 @@ Copying every piece in at the end instead held a second copy of the
 output, and the peak was 30 % higher; glibc keeps freed memory in its
 per-thread arenas rather than returning it to the system, so the
 pieces have to go as they are placed.
+
+## Scanning only the counters a search wrote
+
+The survivor scan reads the counters of the totals pass in blocks of 64,
+reduced with a bitwise OR, and resets the ones that hold a vote. Reading
+every block makes a search cost in proportion to the catalog's reference
+count whatever its query: on 2,000,000 references a 30-row query spent
+nearly all of its instructions there.
+
+A search can instead record the blocks its totals pass writes, a byte per
+block set beside the counter store, and have the scan walk those bytes
+eight at a time as a `u64`, skipping a word of zero bytes and reading the
+blocks the others name. The store costs about four instructions per
+posting, so it pays only when it leaves blocks out: a search that reads as
+many postings as the catalog has blocks, or more, writes nearly every
+block and would scan them all anyway. The choice is made per search, once
+its runs are located and their postings are known: it records when the
+postings are fewer than the blocks. The two totals passes are compiled
+separately, so no posting pays a branch for the choice, and the scratch
+holds one more byte per 64 references.
+
+Instruction counts from `examples/profile.rs` under callgrind, `simd` and
+`mmap` build, one CPU (`taskset -c 0`), a count covering 120 searches
+(three rounds of 40). Each catalog is 60 M postings over 3.6 M hashes, so
+runs are 17 postings long in all of them and a query reads the same
+postings in each; only the reference count changes. A 30-row query reads
+about 500 postings and an 800-row one about 13,600. "Every block" is the
+same code with the record switched off.
+
+| catalog, 60 M postings | blocks | 30 rows, before | 30 rows, every block | 30 rows | 800 rows, before | 800 rows, every block | 800 rows |
+|---|---|---|---|---|---|---|---|
+| 20,000 references (`build 20000 3000 3600000`) | 313 | 7,220,245 | 6,974,471 | 7,046,682 | 81,028,707 | 80,362,523 | 81,206,736 |
+| 65,536 (`build 65536 915 3600000`) | 1,024 | 14,350,328 | 13,999,482 | 11,061,268 | 90,982,611 | 89,828,579 | 90,760,163 |
+| 262,144 (`build 262144 229 3600000`) | 4,096 | 42,140,465 | 41,735,548 | 14,206,403 | 127,095,062 | 124,034,143 | 125,242,712 |
+| 1,048,576 (`build 1048576 57 3600000`) | 16,384 | 147,649,968 | 147,245,224 | 16,964,159 | 256,526,946 | 249,887,957 | 243,056,634 |
+| 2,000,000 (`build 2000000 30 3600000`) | 31,250 | 276,462,986 | 276,067,740 | 21,270,841 | 393,302,313 | 385,449,801 | 277,582,645 |
+
+The 30-row query records from 65,536 references up, where it has fewer
+postings than blocks, and no longer grows with the catalog: 13 times
+fewer instructions at 2,000,000 references. The 800-row query records at
+1,048,576 and 2,000,000 references and is 5 % and 29 % cheaper there;
+below, it scans every block as before and costs within 0.2 % of what it
+did (the choice itself is a sum over the located runs). The candidates
+are the same in every cell.
+
+A block of 64 counters per byte is what these numbers were taken with. The
+first version of the recording pass was not inlined into the function
+that enables AVX2, which cost it about 20 instructions per posting; the
+closures on the way to the block decoder are forced inline for that
+reason, and the count above is with them in place.
 
 ## Trusted loads
 `read_from_trusted` and `map_from_trusted` skip the checksum and the

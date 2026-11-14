@@ -758,6 +758,42 @@ fn a_removed_reference_cannot_overflow_the_search() {
     assert_eq!(cat.search(&q, &o, &mut s).unwrap(), got);
 }
 
+/// A catalog of 70,000 references, which has 1,094 blocks of counters. A
+/// query of one hash reads 700 postings, fewer than the blocks, so its
+/// search records the blocks it writes; a query of three hashes reads
+/// 2,100, so its search scans every block. The two take turns on one
+/// scratch and each finds its references every time: either scan reads
+/// every counter a search wrote and leaves none behind for the next.
+#[test]
+fn a_search_of_many_references_finds_every_survivor_every_time() {
+    let mut b = Catalog::builder();
+    for id in 0..70_000u32 {
+        b.add([(id % 100, 0u32)]);
+    }
+    let cat = b.build();
+    let mut o = SearchOptions::default();
+    o.min_total_votes = 1;
+    let mut s = Scratch::new();
+    let few = Query::from_pairs([(5u32, 0u32)], None);
+    let many = Query::from_pairs([(5u32, 0u32), (6, 0), (7, 0)], None);
+    let with = |hashes: core::ops::RangeInclusive<u32>| -> Vec<u32> {
+        (0..70_000u32)
+            .filter(|id| hashes.contains(&(id % 100)))
+            .collect()
+    };
+    for round in 0..3 {
+        for (query, want) in [(&few, with(5..=5)), (&many, with(5..=7))] {
+            let got: Vec<u32> = cat
+                .search(query, &o, &mut s)
+                .unwrap()
+                .iter()
+                .map(|c| c.reference)
+                .collect();
+            assert_eq!(got, want, "round {round}");
+        }
+    }
+}
+
 #[test]
 fn a_query_with_no_kept_times_casts_no_votes() {
     // `max_times_per_hash = Some(0)` keeps the hashes but none of their

@@ -356,18 +356,27 @@ impl Packed {
         decoder: D,
         mut f: impl FnMut(u32),
     ) {
-        let rest = self.for_each_block(lo, hi, decoder, |_, block, n| {
-            if n == LANES {
-                // The common block, with a loop of fixed length.
-                for &v in block {
-                    f(v);
+        let rest = self.for_each_block(
+            lo,
+            hi,
+            decoder,
+            // Left to itself the inliner keeps a larger `f` out of the
+            // caller, and with it this closure: outside the function that
+            // enabled the kernel's instructions a block costs calls.
+            #[inline(always)]
+            |_, block, n| {
+                if n == LANES {
+                    // The common block, with a loop of fixed length.
+                    for &v in block {
+                        f(v);
+                    }
+                } else {
+                    for &v in &block[..n] {
+                        f(v);
+                    }
                 }
-            } else {
-                for &v in &block[..n] {
-                    f(v);
-                }
-            }
-        });
+            },
+        );
         self.for_each(rest, hi, f);
     }
 

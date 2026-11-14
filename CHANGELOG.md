@@ -105,6 +105,14 @@ First release: the engine of the *afpindex* design notes as a library.
   fanout test on runs that cannot reach it; the survivor scan reduces
   each block of counters with a bitwise OR, which vectorises on any
   x86-64 CPU, rather than a maximum, which needs SSE4.1.
+- A search that reads fewer postings than the catalog has blocks of 64
+  vote counters records the blocks its totals pass writes, a byte per
+  block, and its survivor scan reads those blocks only instead of every
+  counter of the catalog: a 30-row query over 60 M postings and 2,000,000
+  references takes 21.3 M instructions where it took 276.5 M, and an
+  800-row one 277.6 M where it took 393.3 M. A search that reads more
+  postings than that writes nearly every block and scans them all as
+  before.
 - A directory of fewer than 2<sup>20</sup> keys leaves four slots per key
   where a larger one leaves 1.7. A lookup that misses then reaches an
   empty slot in under two probes instead of five, and most lookups in a
