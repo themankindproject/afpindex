@@ -32,6 +32,12 @@
 //!   (the mapping call), and `simd` decodes packed postings eight at a
 //!   time on x86-64 CPUs that report AVX2 when asked at run time (the
 //!   entry into the code compiled for AVX2).
+//! - **A catalog in a directory.** With `mmap`, [`CatalogStore`] owns a
+//!   directory of immutable segment files and a manifest, and writes a
+//!   large merge straight into a new segment file instead of the heap;
+//!   [`Catalog::map_dir`] reads such a directory with the postings left in
+//!   the files' pages. A catalog several times larger than memory can then
+//!   be changed and searched.
 //!
 //! # Example
 //!
@@ -101,6 +107,8 @@ extern crate alloc;
 
 mod catalog;
 mod error;
+#[cfg(feature = "mmap")]
+mod manifest;
 mod packed;
 #[cfg(feature = "std")]
 mod par;
@@ -112,6 +120,8 @@ mod simd;
 #[cfg(feature = "std")]
 mod snapshot;
 mod sort;
+#[cfg(feature = "mmap")]
+mod store;
 
 // The guide's examples run as doctests, so they cannot drift from the API.
 // They map snapshots, hence `mmap`; the first one uses the `audiofp`
@@ -130,6 +140,5 @@ pub use posting::Posting;
 pub use query::Query;
 pub use search::{Bin, Candidate, NoiseStats, Scratch, SearchOptions, Survivor, vote_floor};
 pub use segment::{Postings, Run, Segment};
-#[cfg(feature = "std")]
-#[doc(hidden)]
-pub use segment::{Written, merge_in_memory, merge_to_file};
+#[cfg(feature = "mmap")]
+pub use store::CatalogStore;

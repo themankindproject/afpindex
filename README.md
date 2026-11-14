@@ -161,6 +161,27 @@ postings for them. For a file you wrote and have loaded once,
 order check of every run, and read no posting at all. On the real
 catalog, a trusted map takes 0.14 s against 0.91 s for a full one.
 
+### A catalog larger than memory
+
+With `mmap`, a catalog can live in a directory of immutable segment files
+behind a manifest, and its merges can be written straight into new segment
+files instead of the heap:
+
+```rust
+let mut store = CatalogStore::create("/var/lib/fingerprints")?;
+store.add(rows)?;                        // ids as Catalog::add assigns them
+store.save()?;                           // the durable point
+
+let catalog = Catalog::map_dir("/var/lib/fingerprints")?;   // read-only, no pages faulted in
+```
+
+A merge whose inputs hold at least `spill_postings()` postings (2<sup>26</sup>
+by default) is written to a file and mapped back, so a large segment's
+postings stay in its file's pages; a smaller one stays on the heap until
+it is saved. `save` writes the segments that have no file, then the manifest,
+and only then deletes what the manifest no longer names, so a crash at any
+point leaves the catalog of the last `save` that returned.
+
 ## Architecture
 
 How rows become candidates, from the whole catalog down to the bits. Each

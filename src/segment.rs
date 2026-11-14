@@ -7,16 +7,10 @@ use crate::packed::{Packed, PackedBuilder, View};
 
 #[cfg(feature = "std")]
 mod parallel;
-#[cfg(feature = "std")]
-mod to_file;
-
-/// [`to_file::merge_to_file`], [`to_file::merge_in_memory`] and what the
-/// first reports. Not part of the crate's API: `examples/profile.rs` weighs
-/// a merge that writes to a file against one that holds the segment in
-/// memory.
-#[cfg(feature = "std")]
-#[doc(hidden)]
-pub use to_file::{Written, merge_in_memory, merge_to_file};
+// The merge that writes into a file is what a catalog directory spills
+// with; no other build reaches it.
+#[cfg(feature = "mmap")]
+pub(crate) mod to_file;
 
 /// One directory slot, 12 bytes: `key`'s run starts at `start` (40 bits),
 /// holds `len` postings (16 bits), and no reference has more than `mult`

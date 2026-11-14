@@ -27,23 +27,16 @@
 //! `load` mode profiles one load of the snapshot, chosen by its last
 //! argument: `map`, `map-trusted`, `read` or `read-trusted`.
 //!
-//! `spill` mode weighs the two ways of writing a merge out: `merge_all` on
-//! the catalog's segments, its result written with `write_to`, against
-//! `merge_to_file` over the same segments, which holds only its pieces.
-//! Both are timed, the files they write are compared byte for byte, and the
-//! mode fails if they differ. A last argument of `memory` or `file` runs
-//! one half alone, so that a peak resident set belongs to that half.
+//! `spill` mode weighs the two ways a catalog's segments become one: a
+//! compaction held in memory, against one whose merge is written to a
+//! segment file in a catalog directory. Both run on the same segments, are
+//! timed, and the file they write is compared byte for byte with the
+//! snapshot of the in-memory segment. A last argument of `memory` or `file`
+//! runs one half alone, so that a peak resident set belongs to that half.
 
 use std::time::Instant;
 
-use afpindex::{
-    Catalog, Query, Scratch, SearchOptions, Segment, Written, merge_in_memory, merge_to_file,
-    vote_floor,
-};
-
-/// A reference's filter, or none: these merges keep everything, the way a
-/// compaction with nothing removed does.
-type Keep = fn(u32) -> bool;
+use afpindex::{Catalog, CatalogStore, Query, Scratch, SearchOptions, vote_floor};
 
 struct Rng(u64);
 
@@ -130,27 +123,26 @@ fn measured_load(path: &str, bytes: &[u8], load: Load) -> Catalog {
     .unwrap()
 }
 
-/// One merge held in memory and written out, the way a catalog would: the
+/// One compaction whose merge result is held in memory: the
 /// `--toggle-collect` target of the mode's first half.
 #[inline(never)]
-fn measured_merge_memory(sides: &[(&Segment, Option<&Keep>)], path: &str) -> u64 {
-    let merged = merge_in_memory(sides);
-    let file = std::fs::File::create(path).unwrap();
-    let mut out = std::io::BufWriter::with_capacity(1 << 23, file);
-    merged.write_to(&mut out).unwrap();
-    out.into_inner().unwrap().sync_all().unwrap();
-    std::fs::metadata(path).unwrap().len()
+fn measured_compact_memory(catalog: &mut Catalog) {
+    catalog.compact();
 }
 
-/// One merge written straight to the file: the mode's second target.
+/// One compaction whose merge is written to a segment file: the mode's
+/// second target.
 #[inline(never)]
-fn measured_merge_file(sides: &[(&Segment, Option<&Keep>)], path: &str) -> (Written, u64) {
-    let written = merge_to_file(sides, std::path::Path::new(path)).unwrap();
-    let bytes = std::fs::metadata(path).unwrap().len();
-    (written, bytes)
+fn measured_compact_file(store: &mut CatalogStore) {
+    store.compact().unwrap();
 }
 
-/// The `spill` mode: a merge of the catalog's segments both ways.
+/// The `spill` mode: a compaction of the catalog's segments both ways.
+///
+/// Both halves compact the same catalog by the two routes a store has. The
+/// in-memory half's one segment is written out, and that snapshot is
+/// compared byte for byte with the segment file the store's compaction
+/// wrote.
 fn run_spill(a: &[String]) {
     let (refs, per_ref, hashes) = (
         a[1].parse::<u32>().unwrap(),
@@ -159,44 +151,57 @@ fn run_spill(a: &[String]) {
     );
     let path = &a[4];
     let adds = a.get(5).map_or(0, |n| n.parse::<usize>().unwrap());
-    // Which half to run: both write a file and compare them, one runs a
-    // half alone, so that a peak resident set belongs to that half.
+    // Which half to run: both compare what they wrote, one runs a half
+    // alone, so that a peak resident set belongs to that half.
     let half = a.get(6).map_or("both", String::as_str);
     let mut catalog = Catalog::map_from_trusted(path).unwrap();
     for i in 0..adds {
         catalog.add(rows_of(refs + i as u32, per_ref, hashes));
     }
-    // The segments as they stand, merged the way `compact` merges them.
-    let segments: Vec<Segment> = catalog.segments().cloned().collect();
+    let segments = catalog.segment_count();
     let postings = catalog.posting_count();
-    let sides: Vec<(&Segment, Option<&Keep>)> = segments.iter().map(|s| (s, None)).collect();
+    let dir = format!("{path}.store");
+    let _ = std::fs::remove_dir_all(&dir);
     let (memory_file, file_file) = (format!("{path}.memory"), format!("{path}.file"));
+    let mut in_memory = catalog.clone();
     if half != "file" {
         let t = Instant::now();
-        let bytes = measured_merge_memory(&sides, &memory_file);
+        measured_compact_memory(&mut in_memory);
         println!(
-            "{} segments, {} postings: merge_all + write_to {:.3} s, {} bytes",
-            sides.len(),
-            postings,
+            "{segments} segments, {postings} postings: compact in memory {:.3} s",
             t.elapsed().as_secs_f64(),
-            bytes
         );
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&memory_file).unwrap());
+        in_memory
+            .segment(0)
+            .expect("one segment")
+            .write_to(&mut out)
+            .unwrap();
     }
     if half != "memory" {
+        // Every merge goes to a file: the merge in memory is not what this
+        // half measures.
+        let mut store = CatalogStore::create_from(&dir, catalog).unwrap();
+        store.set_spill_postings(0);
         let t = Instant::now();
-        let (written, bytes) = measured_merge_file(&sides, &file_file);
-        assert_eq!(written.postings as usize, postings);
+        measured_compact_file(&mut store);
         println!(
-            "{} segments, {} postings: merge_to_file {:.3} s, {} bytes",
-            sides.len(),
-            postings,
+            "{segments} segments, {postings} postings: compact to a segment file {:.3} s",
             t.elapsed().as_secs_f64(),
-            bytes
         );
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "afs"))
+            .expect("the spill wrote a segment file");
+        std::fs::copy(&file, &file_file).unwrap();
     }
     if half == "both" {
-        let same = std::fs::read(&memory_file).unwrap() == std::fs::read(&file_file).unwrap();
-        println!("the two files are identical: {same}");
+        let want = std::fs::read(&memory_file).unwrap();
+        let got = std::fs::read(&file_file).unwrap();
+        let same = got == want;
+        println!("the two files are identical: {same} ({} bytes)", got.len());
         assert!(same, "the two files differ");
     }
     for file in [&memory_file, &file_file] {
@@ -204,6 +209,7 @@ fn run_spill(a: &[String]) {
             std::fs::remove_file(file).unwrap();
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The `load` mode: time one load, with the mode's name as the argument.

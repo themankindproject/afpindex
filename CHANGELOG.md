@@ -68,6 +68,19 @@ First release: the engine of the *afpindex* design notes as a library.
   same checks; the checksum runs on a core of its own alongside them.
   `map_from_trusted` maps as `read_from_trusted` reads. The mapping call
   is the feature's one `unsafe` block.
+- `CatalogStore` and `Catalog::map_dir` (`mmap`): a catalog kept in a
+  directory of immutable segment files and a manifest, for a catalog
+  larger than memory. The store is the directory's one writer; a merge
+  whose inputs hold at least `spill_postings()` postings is written
+  straight to a segment file by the merge that never holds its result and
+  mapped back, so a large segment's postings stay in its file's pages.
+  `save` writes the segments that have no file, then the manifest, and only
+  then deletes what the manifest no longer names, so a crash at any point
+  leaves the catalog of the last `save` that returned. `map_dir` reads a
+  directory without writing to it and without faulting its pages in. A
+  store removes only its own segment and temporary files, never writes a
+  segment file over an existing one, and refuses to save over a manifest
+  another writer replaced.
 - `simd` feature: on x86-64 CPUs that report AVX2 at run time, the totals
   pass, the search for a survivor's group in a short run and the check of
   every run at load decode packed values eight at a time. The kernel is

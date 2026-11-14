@@ -51,28 +51,15 @@ const BUFFER: usize = 1 << 18;
 /// Bytes read back from the file per call while it is summed.
 const CHUNK: usize = 1 << 18;
 
-/// What a merge wrote. Not part of the crate's API: it is what
-/// [`merge_to_file`] reports to `examples/profile.rs`.
-#[doc(hidden)]
+/// What a merge wrote.
 #[derive(Clone, Copy, Debug)]
-pub struct Written {
-    /// Distinct hashes in the result.
-    pub keys: u64,
-    /// Postings in the result.
-    pub postings: u64,
-    /// Smallest and largest reference, if there is a posting.
-    pub ids: Option<(u32, u32)>,
-    /// Length of the file.
-    pub bytes: u64,
-}
-
-/// What a merge wrote, and the most pieces it held merged but not yet
-/// written at one time.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), expect(dead_code))]
-pub(crate) struct Outcome {
-    pub(crate) written: Written,
-    /// The most pieces merged and not yet in the file at one time.
+pub(crate) struct Written {
+    /// Smallest and largest reference, or `None` when every posting was
+    /// dropped and the file holds an empty segment.
+    pub(crate) ids: Option<(u32, u32)>,
+    /// The most pieces merged and not yet in the file at one time: what a
+    /// test holds against the window.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) held: usize,
 }
 
@@ -103,36 +90,20 @@ impl Default for Settings {
 /// `path` as a segment snapshot, holding no array of the result in memory.
 ///
 /// The file is removed again if anything fails, so a caller never finds a
-/// half-written snapshot where it asked for one.
+/// half-written snapshot where it asked for one. `settings` says how the
+/// merge runs; [`Settings::default`] is the threads of the machine and the
+/// default piece size.
 ///
 /// # Errors
 ///
 /// Any error of creating, writing, reading back or syncing the file, and an
 /// error rather than the panic [`Segment::merge_all`] raises when the result
 /// would hold 2<sup>40</sup> postings.
-#[doc(hidden)]
-pub fn merge_to_file<F: Fn(u32) -> bool + Sync>(
-    sides: &[(&Segment, Option<&F>)],
-    path: &Path,
-) -> std::io::Result<Written> {
-    merge_to_file_in(sides, path, Settings::default()).map(|outcome| outcome.written)
-}
-
-/// [`Segment::merge_all`], for `examples/profile.rs` to weigh a merge that
-/// writes to a file against one that holds its result in memory. Not part of
-/// the crate's API.
-#[doc(hidden)]
-pub fn merge_in_memory<F: Fn(u32) -> bool + Sync>(sides: &[(&Segment, Option<&F>)]) -> Segment {
-    Segment::merge_all(sides)
-}
-
-/// [`merge_to_file`] with the threads, the piece size and the failure limit
-/// given: what the tests reach every path through.
-pub(crate) fn merge_to_file_in<F: Fn(u32) -> bool + Sync>(
+pub(crate) fn merge_to_file<F: Fn(u32) -> bool + Sync>(
     sides: &[(&Segment, Option<&F>)],
     path: &Path,
     settings: Settings,
-) -> std::io::Result<Outcome> {
+) -> std::io::Result<Written> {
     let widths = widths(sides);
     let pieces = postings(sides).div_ceil(settings.piece.max(1)).max(1);
     let plan = Plan::new(sides, pieces);
@@ -165,9 +136,9 @@ pub(crate) fn merge_to_file_in<F: Fn(u32) -> bool + Sync>(
     }
     let layout = Layout::new(widths, total);
     let guard = RemoveOnFailure::new(path);
-    let outcome = write_pieces(&plan, path, &layout, widths, settings)?;
+    let written = write_pieces(&plan, path, &layout, widths, settings)?;
     guard.keep();
-    Ok(outcome)
+    Ok(written)
 }
 
 /// The range that covers both ranges, if either has one.
@@ -322,7 +293,7 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
     layout: &Layout,
     widths: (u32, u32),
     settings: Settings,
-) -> std::io::Result<Outcome> {
+) -> std::io::Result<Written> {
     let mut head = Handle::create(path, settings.fail_after)?;
     // Each packed array is written through a handle of its own, positioned
     // at its section, so that both are appended in piece order at once.
@@ -393,13 +364,8 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
             "the merge to a file wrote a length of its own",
         ));
     }
-    Ok(Outcome {
-        written: Written {
-            keys: layout.keys,
-            postings: layout.postings,
-            ids: layout.ids,
-            bytes: layout.bytes,
-        },
+    Ok(Written {
+        ids: layout.ids,
         held: high,
     })
 }
@@ -837,23 +803,10 @@ mod tests {
         let (want, merged) = expected(sides);
         let scratch = Scratch::new(what);
         let path = scratch.path("out.afs");
-        let outcome = merge_to_file_in(sides, &path, settings).expect("the merge writes");
+        let written = merge_to_file(sides, &path, settings).expect("the merge writes");
         let got = std::fs::read(&path).expect("the file it wrote");
-        assert_eq!(got.len() as u64, outcome.written.bytes, "{what}: length");
         assert_eq!(got, want, "{what}: bytes");
-        assert_eq!(
-            (
-                outcome.written.keys,
-                outcome.written.postings,
-                outcome.written.ids
-            ),
-            (
-                merged.key_count() as u64,
-                merged.len() as u64,
-                merged_refs(&merged)
-            ),
-            "{what}: written"
-        );
+        assert_eq!(written.ids, merged_refs(&merged), "{what}: the range");
         let back = Segment::read_from(got.as_slice()).expect("a valid snapshot");
         assert_eq!(back, merged, "{what}: the file reads back");
         merged
@@ -1021,18 +974,14 @@ mod tests {
             (&[(&Segment::default(), None)][..], "an empty source"),
         ] {
             let path = scratch.path("empty.afs");
-            let written = merge_to_file(sides, &path).expect("the merge writes");
-            assert_eq!(
-                (written.keys, written.postings, written.ids),
-                (0, 0, None),
-                "{what}"
-            );
+            let written =
+                merge_to_file(sides, &path, Settings::default()).expect("the merge writes");
+            assert_eq!(written.ids, None, "{what}");
             let mut want = Vec::new();
             Segment::default()
                 .write_to(&mut want)
                 .expect("writing to memory");
             assert_eq!(std::fs::read(&path).expect("the file"), want, "{what}");
-            assert_eq!(written.bytes, want.len() as u64, "{what}");
             let back = Segment::read_from(want.as_slice()).expect("a valid snapshot");
             assert!(back.is_empty());
         }
@@ -1074,7 +1023,7 @@ mod tests {
             let (want, merged) = expected(&sides);
             let path = scratch.path("merged-by-pieces.afs");
             let settings = settings(threads, piece);
-            merge_to_file_in(&sides, &path, settings).expect("the merge writes");
+            merge_to_file(&sides, &path, settings).expect("the merge writes");
             assert_eq!(
                 std::fs::read(&path).expect("the file it wrote"),
                 want,
@@ -1095,11 +1044,11 @@ mod tests {
         // A source that is itself a file a merge wrote.
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&mapped, None)];
         let path = scratch.path("twice.afs");
-        merge_to_file_in(&sides, &path, settings(2, 300)).expect("the merge writes");
+        merge_to_file(&sides, &path, settings(2, 300)).expect("the merge writes");
         let once = Segment::map_from(&path).expect("a valid snapshot");
         let again = scratch.path("thrice.afs");
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&once, None)];
-        merge_to_file_in(&sides, &again, settings(3, 400)).expect("the second merge writes");
+        merge_to_file(&sides, &again, settings(3, 400)).expect("the second merge writes");
         let (want, _) = expected(&sides);
         assert_eq!(std::fs::read(&again).expect("the second file"), want);
     }
@@ -1116,18 +1065,17 @@ mod tests {
         for threads in [1usize, 2, 4] {
             // Pieces of 32 postings: 875 of them, so threads run well
             // ahead of the file if the merge lets them.
-            let outcome =
-                merge_to_file_in(&sides, &scratch.path("window.afs"), settings(threads, 32))
-                    .expect("the merge writes");
+            let written = merge_to_file(&sides, &scratch.path("window.afs"), settings(threads, 32))
+                .expect("the merge writes");
             assert!(
-                outcome.held <= WINDOW * threads + threads,
+                written.held <= WINDOW * threads + threads,
                 "{threads} threads held {} pieces",
-                outcome.held
+                written.held
             );
             assert!(
-                outcome.held >= threads.min(2),
+                written.held >= threads.min(2),
                 "{threads} threads, held {}",
-                outcome.held
+                written.held
             );
         }
     }
@@ -1141,7 +1089,8 @@ mod tests {
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&a, None)];
         let scratch = Scratch::new("failed-merge");
         let missing = scratch.path("no-such-directory").join("out.afs");
-        let err = merge_to_file(&sides, &missing).expect_err("no such directory");
+        let err =
+            merge_to_file(&sides, &missing, Settings::default()).expect_err("no such directory");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(
             !missing.exists(),
@@ -1160,13 +1109,13 @@ mod tests {
                 piece: 500,
                 fail_after: Some(limit),
             };
-            let err = merge_to_file_in(&sides, &path, settings).expect_err("the write fails");
+            let err = merge_to_file(&sides, &path, settings).expect_err("the write fails");
             assert_eq!(err.kind(), std::io::ErrorKind::Other, "{limit}");
             assert!(!path.exists(), "the file went with the error at {limit}");
         }
         // And the next merge without the limit writes the file.
         let path = scratch.path("fine.afs");
-        merge_to_file(&sides, &path).expect("the merge writes");
+        merge_to_file(&sides, &path, Settings::default()).expect("the merge writes");
         assert!(path.exists());
     }
 }

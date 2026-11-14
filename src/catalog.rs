@@ -10,6 +10,54 @@ type Shared<T> = alloc::sync::Arc<T>;
 #[cfg(not(target_has_atomic = "ptr"))]
 type Shared<T> = alloc::rc::Rc<T>;
 
+/// A merge the catalog's policy asks for, carried out by the caller.
+///
+/// [`Catalog::merge_tail_of`] and [`Catalog::merged_from`] decide when the
+/// catalog merges and which parts it merges; a catalog on the heap and one
+/// in a directory differ only in the implementation of this trait, so the
+/// policy exists once.
+pub(crate) trait MergeParts {
+    /// Why a merge can fail; a merge in memory cannot.
+    type Error;
+
+    /// Merge `sides`, each filtered by its `keep` if it has one, into one
+    /// part whose references lie in `ids`.
+    fn merge<F: Fn(u32) -> bool + Sync>(
+        &mut self,
+        sides: &[(&Segment, Option<&F>)],
+        ids: (u32, u32),
+    ) -> Result<Option<Part>, Self::Error>;
+}
+
+/// The merge of catalog parts in memory: what a catalog without a
+/// directory does.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct InMemory;
+
+impl MergeParts for InMemory {
+    type Error = core::convert::Infallible;
+
+    // Nothing a merge in memory returns is an error, so the caller's error
+    // path compiles away once this is inlined.
+    #[inline(always)]
+    fn merge<F: Fn(u32) -> bool + Sync>(
+        &mut self,
+        sides: &[(&Segment, Option<&F>)],
+        ids: (u32, u32),
+    ) -> Result<Option<Part>, Self::Error> {
+        let merged = Segment::merge_all(sides);
+        Ok((!merged.is_empty()).then(|| Part::new(merged, ids)))
+    }
+}
+
+/// The value of a result that cannot fail, for the in-memory merge.
+pub(crate) fn never<T>(result: Result<T, core::convert::Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
 /// A searchable set of references: segments, plus which reference ids are
 /// live.
 ///
@@ -54,24 +102,67 @@ pub struct Catalog {
 
 /// A segment of a catalog and what the catalog knows of its references.
 #[derive(Clone)]
-struct Part {
-    segment: Shared<Segment>,
+pub(crate) struct Part {
+    pub(crate) segment: Shared<Segment>,
     /// Every reference with a posting in the segment lies in
     /// `ids.0..=ids.1`.
-    ids: (u32, u32),
+    pub(crate) ids: (u32, u32),
     /// `true` while the segment may hold postings of removed references.
     /// A segment that cannot is merged without a look at its references.
-    stale: bool,
+    pub(crate) stale: bool,
+    /// The segment file the part was read from or written to in a catalog
+    /// directory, or [`NO_FILE`]: what `save` compares the directory with.
+    /// A plain `u32` rather than an `Option` keeps the part at 24 bytes, of
+    /// which a catalog of many segments holds one each.
+    #[cfg(feature = "mmap")]
+    pub(crate) file: u32,
 }
+
+/// The file id of a part that has no segment file.
+#[cfg(feature = "mmap")]
+pub(crate) const NO_FILE: u32 = u32::MAX;
 
 impl Part {
     /// A part whose references all lie in `ids` and are all live.
-    fn new(segment: Segment, ids: (u32, u32)) -> Self {
+    pub(crate) fn new(segment: Segment, ids: (u32, u32)) -> Self {
         Self {
             segment: Shared::new(segment),
             ids,
             stale: false,
+            #[cfg(feature = "mmap")]
+            file: NO_FILE,
         }
+    }
+
+    /// Hold the mapping of segment file `file` in place of the segment it
+    /// was written from. `ids` is the range the file holds, when it holds
+    /// a posting: it can only be narrower than the part's.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn move_to_file(&mut self, mapped: Segment, ids: Option<(u32, u32)>, file: u32) {
+        debug_assert_eq!(mapped.len(), self.segment.len(), "the same segment");
+        self.segment = Shared::new(mapped);
+        self.ids = ids.unwrap_or(self.ids);
+        self.file = file;
+    }
+
+    /// The same part, recorded as segment file `file`.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn with_file(mut self, file: u32) -> Self {
+        self.file = file;
+        self
+    }
+
+    /// The segment file of the part, if it has one.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn file(&self) -> Option<u32> {
+        (self.file != NO_FILE).then_some(self.file)
+    }
+
+    /// The same part, stale as `stale` says.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn stale_if(mut self, stale: bool) -> Self {
+        self.stale = stale;
+        self
     }
 }
 
@@ -148,9 +239,34 @@ impl Catalog {
         }
     }
 
+    /// Assemble from parts a manifest validated: segments already placed
+    /// with the file they came from, and the liveness table they share.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn from_files(parts: Vec<Part>, live: Vec<bool>) -> Self {
+        let live_count = live.iter().filter(|&&l| l).count();
+        Self {
+            parts,
+            live,
+            live_count,
+        }
+    }
+
     #[cfg(feature = "std")]
     pub(crate) fn live_table(&self) -> &[bool] {
         &self.live
+    }
+
+    /// The parts that make the catalog, in order.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+
+    /// The parts that make the catalog, in order, for a store that
+    /// rewrites them.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn parts_mut(&mut self) -> &mut Vec<Part> {
+        &mut self.parts
     }
 
     /// Add a reference from its `(hash, time)` rows and return its id.
@@ -161,7 +277,20 @@ impl Catalog {
     /// # Panics
     ///
     /// Panics once every id below `u32::MAX` has been assigned.
+    #[inline]
     pub fn add(&mut self, rows: impl IntoIterator<Item = (u32, u32)>) -> u32 {
+        never(self.add_of(rows, &mut InMemory))
+    }
+
+    /// [`Catalog::add`], with `merges` deciding where a merge goes.
+    ///
+    /// A merge that fails leaves the catalog as it was.
+    #[inline]
+    pub(crate) fn add_of<M: MergeParts>(
+        &mut self,
+        rows: impl IntoIterator<Item = (u32, u32)>,
+        merges: &mut M,
+    ) -> Result<u32, M::Error> {
         let id = self.next_id();
         // One reference: a row is its hash and time, which sort as one
         // 64-bit key.
@@ -173,12 +302,36 @@ impl Catalog {
         rows.dedup();
         self.live.push(true);
         self.live_count += 1;
-        if !rows.is_empty() {
-            self.parts
-                .push(Part::new(Segment::from_reference(id, &rows), (id, id)));
-            self.merge_tail();
+        if rows.is_empty() {
+            return Ok(id);
         }
-        id
+        let part = Part::new(Segment::from_reference(id, &rows), (id, id));
+        match self.merge_in(part, merges) {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                self.take_back(1);
+                Err(e)
+            }
+        }
+    }
+
+    /// Push `part` and merge from the tail, with `merges` carrying the
+    /// merges out. A merge that fails leaves the parts as they were, the
+    /// new one included: [`merge_tail_in`] replaces the parts it joined
+    /// only once their merge has returned.
+    #[inline]
+    fn merge_in<M: MergeParts>(&mut self, part: Part, merges: &mut M) -> Result<(), M::Error> {
+        self.parts.push(part);
+        let added = self.parts.len() - 1;
+        match merge_tail_in(&mut self.parts, &self.live, merges) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The merge left the parts it joined where they were, so
+                // the one this call added comes off and nothing else moves.
+                self.parts.truncate(added);
+                Err(e)
+            }
+        }
     }
 
     /// Add several references, each from its `(hash, time)` rows, and
@@ -199,6 +352,21 @@ impl Catalog {
     ///
     /// Panics once every id below `u32::MAX` has been assigned.
     pub fn add_many<I, R>(&mut self, references: I) -> core::ops::Range<u32>
+    where
+        I: IntoIterator<Item = R>,
+        R: IntoIterator<Item = (u32, u32)>,
+    {
+        never(self.add_many_of(references, &mut InMemory))
+    }
+
+    /// [`Catalog::add_many`], with `merges` deciding where a merge goes.
+    ///
+    /// A merge that fails leaves the catalog as it was.
+    pub(crate) fn add_many_of<I, R, M: MergeParts>(
+        &mut self,
+        references: I,
+        merges: &mut M,
+    ) -> Result<core::ops::Range<u32>, M::Error>
     where
         I: IntoIterator<Item = R>,
         R: IntoIterator<Item = (u32, u32)>,
@@ -224,7 +392,7 @@ impl Catalog {
             // No id is taken, but the range still starts where the next
             // reference's would.
             let next = self.next_id();
-            return next..next;
+            return Ok(next..next);
         }
         // Every id in the batch passed the check above, so both fit.
         let first = u32::try_from(start).expect("checked with the ids");
@@ -232,11 +400,27 @@ impl Catalog {
         self.live.resize(start + count, true);
         self.live_count += count;
         if !rows.is_empty() {
-            let segment = Segment::from_postings(rows);
-            self.parts.push(Part::new(segment, (first, last)));
-            self.merge_tail();
+            let part = Part::new(Segment::from_postings(rows), (first, last));
+            if let Err(e) = self.merge_in(part, merges) {
+                self.take_back(count);
+                return Err(e);
+            }
         }
-        first..last + 1
+        Ok(first..last + 1)
+    }
+
+    /// Give back the last `n` ids, all live, after a call that added them
+    /// failed.
+    fn take_back(&mut self, n: usize) {
+        self.live.truncate(self.live.len() - n);
+        self.live_count -= n;
+    }
+
+    fn next_id(&self) -> u32 {
+        u32::try_from(self.live.len())
+            .ok()
+            .filter(|&id| id < u32::MAX)
+            .expect("reference ids exhausted")
     }
 
     /// Tombstone a reference. Returns `false` if the id is unknown or
@@ -313,9 +497,28 @@ impl Catalog {
     /// next [`Catalog::add`] merges them. A no-op when there is at most one
     /// delta and it has nothing to drop.
     pub fn compact_deltas(&mut self) {
-        let merged = self.merged_from(1);
-        self.parts.truncate(1);
-        self.parts.extend(merged);
+        never(self.compact_deltas_of(&mut InMemory));
+    }
+
+    /// [`Catalog::compact_deltas`], with `merges` deciding where a merge
+    /// goes. A merge that fails leaves the catalog as it was.
+    pub(crate) fn compact_deltas_of<M: MergeParts>(
+        &mut self,
+        merges: &mut M,
+    ) -> Result<(), M::Error> {
+        let mut parts = core::mem::take(&mut self.parts);
+        match merged_from(&parts, 1, &self.live, merges) {
+            Ok(only) => {
+                parts.truncate(1);
+                parts.extend(only);
+                self.parts = parts;
+                Ok(())
+            }
+            Err(e) => {
+                self.parts = parts;
+                Err(e)
+            }
+        }
     }
 
     /// Merge everything into one segment, dropping the postings of removed
@@ -323,73 +526,24 @@ impl Catalog {
     /// runs, the result is held next to the segments it replaces. A no-op
     /// when there is one segment and it has nothing to drop.
     pub fn compact(&mut self) {
-        let merged = self.merged_from(0);
-        self.parts.clear();
-        self.parts.extend(merged);
+        never(self.compact_of(&mut InMemory));
     }
 
-    /// Segments `first..` as one part without the postings of removed
-    /// references, or `None` if no posting is left. A lone segment with
-    /// nothing to drop is shared rather than copied.
-    ///
-    /// One pass over all of them, so a posting is rewritten once however
-    /// many segments are merged. Only segments that may hold postings of
-    /// removed references are filtered; the others are copied run by run.
-    fn merged_from(&self, first: usize) -> Option<Part> {
-        let tail = self.parts.get(first..).unwrap_or_default();
-        match tail {
-            [] => return None,
-            [only] if !only.stale => return Some(only.clone()),
-            _ => {}
-        }
-        let live = &self.live;
-        let keep = |reference: u32| live[reference as usize];
-        let sides: Vec<_> = tail
-            .iter()
-            .map(|part| (&*part.segment, part.stale.then_some(&keep)))
-            .collect();
-        let merged = Segment::merge_all(&sides);
-        if merged.is_empty() {
-            return None;
-        }
-        let ids = tail.iter().fold((u32::MAX, 0), |(lo, hi), part| {
-            (lo.min(part.ids.0), hi.max(part.ids.1))
-        });
-        Some(Part::new(merged, ids))
-    }
-
-    fn next_id(&self) -> u32 {
-        u32::try_from(self.live.len())
-            .ok()
-            .filter(|&id| id < u32::MAX)
-            .expect("reference ids exhausted")
-    }
-
-    /// Restore the size invariant from the tail: the last segment joins
-    /// the one before it while it is at least half of it, and the two
-    /// together may then be half of the next. The segments such a cascade
-    /// reaches are merged in one pass rather than two at a time.
-    fn merge_tail(&mut self) {
-        loop {
-            let Some(last) = self.parts.last() else {
-                return;
-            };
-            let mut first = self.parts.len() - 1;
-            // Sizes are below 2^40, so the sums and doublings fit.
-            let mut size = last.segment.len() as u64;
-            while first > 0 && size * 2 >= self.parts[first - 1].segment.len() as u64 {
-                first -= 1;
-                size += self.parts[first].segment.len() as u64;
+    /// [`Catalog::compact`], with `merges` deciding where a merge goes. A
+    /// merge that fails leaves the catalog as it was.
+    pub(crate) fn compact_of<M: MergeParts>(&mut self, merges: &mut M) -> Result<(), M::Error> {
+        let mut parts = core::mem::take(&mut self.parts);
+        match merged_from(&parts, 0, &self.live, merges) {
+            Ok(only) => {
+                parts.clear();
+                parts.extend(only);
+                self.parts = parts;
+                Ok(())
             }
-            if first + 1 == self.parts.len() {
-                return;
+            Err(e) => {
+                self.parts = parts;
+                Err(e)
             }
-            // The merge may come out smaller than the sum (removed
-            // references, duplicates), which only helps the invariant; the
-            // next turn of the loop confirms it.
-            let merged = self.merged_from(first);
-            self.parts.truncate(first);
-            self.parts.extend(merged);
         }
     }
 }
@@ -403,6 +557,88 @@ impl fmt::Debug for Catalog {
             .field("segments", &self.parts.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Segments `first..` of `parts` as one part without the postings `live`
+/// rejects, or `None` if no posting is left. A lone segment with nothing to
+/// drop is shared rather than copied.
+///
+/// One pass over all of them, so a posting is rewritten once however many
+/// segments are merged. Only segments that may hold postings of removed
+/// references are filtered; the others are copied run by run. `merges`
+/// carries out the merge, in memory or to a file.
+fn merged_from<M: MergeParts>(
+    parts: &[Part],
+    first: usize,
+    live: &[bool],
+    merges: &mut M,
+) -> Result<Option<Part>, M::Error> {
+    let tail = parts.get(first..).unwrap_or_default();
+    match tail {
+        [] => return Ok(None),
+        [only] if !only.stale => return Ok(Some(only.clone())),
+        _ => {}
+    }
+    let keep = |reference: u32| live[reference as usize];
+    let sides: Vec<(&Segment, Option<&_>)> = tail
+        .iter()
+        .map(|part| (&*part.segment, part.stale.then_some(&keep)))
+        .collect();
+    let ids = tail.iter().fold((u32::MAX, 0), |(lo, hi), part| {
+        (lo.min(part.ids.0), hi.max(part.ids.1))
+    });
+    merges.merge(&sides, ids)
+}
+
+/// Restore the size invariant from the tail of `parts`: the last segment
+/// joins the one before it while it is at least half of it, and the two
+/// together may then be half of the next. The segments such a cascade
+/// reaches are merged in one pass rather than two at a time.
+///
+/// One merge is all it takes: [`tail_start`] stops at a part more than
+/// twice the size of everything after it, and the merge of those comes out
+/// no larger than their sum (removed references and duplicates only
+/// shrink it). So a merge that fails has changed nothing, and its result
+/// replaces the parts it joined only once it has returned.
+fn merge_tail_in<M: MergeParts>(
+    parts: &mut Vec<Part>,
+    live: &[bool],
+    merges: &mut M,
+) -> Result<(), M::Error> {
+    let Some(first) = tail_start(parts) else {
+        return Ok(());
+    };
+    let only = merged_from(parts, first, live, merges)?;
+    parts.truncate(first);
+    parts.extend(only);
+    debug_assert!(
+        tail_is_settled(parts, first),
+        "one merge restores the size rule"
+    );
+    Ok(())
+}
+
+/// Whether the part a merge left at `at`, if it left one, is less than
+/// half of the part before it.
+fn tail_is_settled(parts: &[Part], at: usize) -> bool {
+    match (at.checked_sub(1).and_then(|i| parts.get(i)), parts.get(at)) {
+        (Some(before), Some(merged)) => merged.segment.len() * 2 < before.segment.len(),
+        _ => true,
+    }
+}
+
+/// The first part a merge from the tail has to reach, or `None` when the
+/// sizes already obey the half-size rule.
+fn tail_start(parts: &[Part]) -> Option<usize> {
+    let last = parts.last()?;
+    let mut first = parts.len() - 1;
+    // Sizes are below 2^40, so the sums and doublings fit.
+    let mut size = last.segment.len() as u64;
+    while first > 0 && size * 2 >= parts[first - 1].segment.len() as u64 {
+        first -= 1;
+        size += parts[first].segment.len() as u64;
+    }
+    (first + 1 != parts.len()).then_some(first)
 }
 
 /// Collects references and builds a [`Catalog`] with one sort.

@@ -24,6 +24,7 @@ by about 10 %, so compare columns within one table only.
 - [Parallel merge](#parallel-merge)
 - [Trusted loads](#trusted-loads)
 - [Merging straight into a file](#merging-straight-into-a-file)
+- [A catalog in a directory](#a-catalog-in-a-directory)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -592,40 +593,60 @@ two arrays are written side by side.
 
 Instruction counts from `examples/profile.rs` under callgrind, `simd` build,
 one CPU (`taskset -c 0`), on the synthetic catalog of 60 M postings
-(`build 20000 3000 3600000`) with 20 additions on top, so the merge joins
-four segments of 60.06 M postings and writes 272,025,064 bytes:
+(`build 20000 3000 3600000`) with 20 additions on top, so the compaction
+joins four segments of 60.06 M postings into a file of 272,025,064 bytes:
 
 | | instructions |
 |---|---|
-| `merge_all`, then `write_to` on the result | 4,795,496,383 |
-| `merge_to_file` | 5,749,914,603 |
+| `Catalog::compact`, the result on the heap | 3,947,659,752 |
+| `CatalogStore::compact`, the result written to a segment file and mapped | 9,408,883,295 |
 
-The file the second writes is byte for byte the one the first writes, which
-the mode checks. It costs 20 % more instructions, and that is the price of
-the memory: the counting pass merges every piece a second time only for its
-key count, posting count and reference range, and `PackedBuilder::extend_bits`
-alone is 26 % of the count. In exchange the merge never holds a result
-larger than a piece plus the 13 bytes per distinct hash its keys, run
-starts and multiplicities take, and the largest array it allocates is one
-piece's packed references.
+The file is byte for byte the snapshot of the segment the first builds,
+which the mode checks. The store's route costs 2.4 times the instructions
+because it merges every piece twice: once in the counting pass, only for
+the key count, the posting count and the reference range, and once to
+write. `PackedBuilder::extend_bits` is 1.73 G of the first count and 3.45 G
+of the second, `merge_sources` 0.67 G and 1.35 G. The rest of the
+difference is the write, the read that sums the file and the map of the
+result. In exchange the merge never holds a result larger than a piece plus
+the 13 bytes per distinct hash its keys, run starts and multiplicities
+take, and the largest array it allocates is one piece's packed references.
+On four cores of the laptop the two take 0.43–0.53 s and 1.06–1.17 s, the
+second with its file written and synced.
 
 The default piece is 2<sup>22</sup> postings of input, so a piece in flight
 is tens of megabytes however large the merge; a thread starts a piece only
 while fewer than twice the thread count are merged ahead of the one the file
 waits for.
 
-`merge_all` itself costs what it did: 600 calls of `Catalog::add` on the
-same catalog take 5,330,486,224 instructions against 5,341,860,051 before,
-0.2 % fewer. Callgrind counts on this host move by about 6 % between runs
-when the merge's threads are not pinned to one CPU, so counts here are
-comparable only under `taskset -c 0`.
+A plain catalog's merges go through the same code as a store's. 600 calls
+of `Catalog::add` on the same catalog take 5,410,907,419 instructions
+against 5,330,486,224 before the two shared it, 1.5 % more, and 120
+searches take 81,028,707, as before. Callgrind counts on this host move
+by about 6 % between runs when the merge's threads are not pinned to one
+CPU, so counts here are comparable only under `taskset -c 0`.
 
 ```bash
 cargo build --release --features mmap,simd --example profile
-valgrind --tool=callgrind --toggle-collect='profile::measured_merge_file' \
+valgrind --tool=callgrind --toggle-collect='profile::measured_compact_file' \
   --callgrind-out-file=/tmp/cg.out \
   target/release/examples/profile spill 20000 3000 3600000 /tmp/s2.afc 20
 ```
+
+### A catalog in a directory
+
+A `CatalogStore` owns a directory of segment files and a manifest, and
+sends a merge to that directory instead of the heap when its inputs reach
+the spill threshold. What the heap then holds is the segments below the
+threshold that no save has written yet, the keys and the directory of
+every segment (24 bytes per distinct hash at the usual load), and the
+pieces of a merge in flight; the postings of a segment with a file stay in
+the file's pages, which the kernel can drop and read again.
+
+The piece of a merge holds whole runs, so the memory of a merge to a file
+is also bounded from below by the longest run among its inputs: a hash
+with many postings is merged inside one piece whatever the threshold.
+
 
 ## Allocators and huge pages
 

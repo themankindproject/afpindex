@@ -984,19 +984,29 @@ mod mapped {
     use crate::packed::Packed;
     use crate::{Catalog, Segment, SnapshotError};
 
-    /// Map `path` read-only with its pages faulted in.
+    /// Map `path` read-only, with its pages faulted in unless `populate`
+    /// is false.
     #[expect(
         unsafe_code,
         reason = "mapping a file is the one operation the crate cannot do safely"
     )]
-    fn map_file(path: &Path) -> Result<Arc<Mmap>, SnapshotError> {
+    fn map_file_with(path: &Path, populate: bool) -> Result<Arc<Mmap>, SnapshotError> {
         let file = std::fs::File::open(path)?;
+        let mut options = memmap2::MmapOptions::new();
+        if populate {
+            options.populate();
+        }
         // SAFETY: a read-only mapping that this crate never writes through.
         // The contract on `map_from` is that nothing modifies or truncates
         // the file while the mapping lives; that is the one condition
         // `memmap2` cannot enforce.
-        let map = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
+        let map = unsafe { options.map(&file)? };
         Ok(Arc::new(map))
+    }
+
+    /// Map `path` read-only with its pages faulted in.
+    fn map_file(path: &Path) -> Result<Arc<Mmap>, SnapshotError> {
+        map_file_with(path, true)
     }
 
     /// Wrap the packed array whose data starts at `start` (where `r` also
@@ -1086,6 +1096,16 @@ mod mapped {
         let map = map_file(path)?;
         read_segment_at(&map, 0, check).map(|(seg, _, _)| seg)
     }
+
+    /// The segment at `path` and the range of its references.
+    pub(super) fn segment_with(
+        path: &Path,
+        check: Check,
+        populate: bool,
+    ) -> Result<(Segment, Ids), SnapshotError> {
+        let map = map_file_with(path, populate)?;
+        read_segment_at(&map, 0, check).map(|(seg, ids, _)| (seg, ids))
+    }
 }
 
 #[cfg(feature = "mmap")]
@@ -1153,6 +1173,19 @@ impl Segment {
     pub fn map_from_trusted(path: impl AsRef<std::path::Path>) -> Result<Segment, SnapshotError> {
         mapped::segment(path.as_ref(), Check::Trusted)
     }
+}
+
+/// Map the segment snapshot at `path`. A trusted map takes the stored
+/// multiplicities and range, and `populate` says whether the pages are
+/// faulted in.
+#[cfg(feature = "mmap")]
+pub(crate) fn map_segment(
+    path: &std::path::Path,
+    trusted: bool,
+    populate: bool,
+) -> Result<(Segment, Option<(u32, u32)>), SnapshotError> {
+    let check = if trusted { Check::Trusted } else { Check::Full };
+    mapped::segment_with(path, check, populate)
 }
 
 #[cfg(test)]

@@ -972,6 +972,126 @@ Flags and reserved fields are written as zero and ignored on read. The
 directory is not stored; it is rebuilt from the keys and the
 multiplicities on load (0.05 s on the real catalog).
 
+### A catalog in a directory
+
+With `mmap`, a catalog can live in a directory instead of one process's
+heap, for a catalog larger than memory:
+
+```text
+<dir>/MANIFEST           which segments make the catalog, the id space, the removals
+<dir>/seg-<8 hex>.afs    one segment snapshot per segment, immutable
+<dir>/seg-<8 hex>.tmp    a segment being written
+<dir>/MANIFEST.tmp       a manifest being written
+```
+
+`CatalogStore` is the one writer of such a directory. It holds the
+catalog in memory as a `Catalog` does and decides, merge by merge, whether
+the result goes to the heap or straight into a new segment file: a merge
+whose inputs hold at least `spill_postings()` postings (2<sup>26</sup> by
+default) is written to a file and mapped back, so a large segment's
+postings stay in its file's pages. A smaller merge stays on the heap until
+a save writes it. `Catalog::map_dir` reads the directory without writing to
+it and without faulting its pages in.
+
+```rust
+use afpindex::{Catalog, CatalogStore, Query, Scratch, SearchOptions};
+use std::path::Path;
+
+/// Build a catalog in a directory, save it, reopen it, and search it.
+pub fn directory_tour(dir: &Path) -> usize {
+    let mut store = CatalogStore::create(dir).expect("a fresh directory");
+    // Every merge goes to a segment file: what a catalog larger than
+    // memory does. The default is 2^26 postings of input.
+    store.set_spill_postings(0);
+    store.add([(7u32, 10u32), (7, 11), (9, 4)]).expect("an addition");
+    store.add([(7, 30), (9, 24)]).expect("an addition");
+    assert_eq!(store.catalog().segment_count(), 2);
+    // The durable point: segments, then the manifest, then the deletions.
+    store.save().expect("a save");
+    drop(store);
+
+    let catalog = Catalog::map_dir(dir).expect("a mapped directory");
+    let query = Query::from_pairs([(7u32, 0u32), (9, 0)], Some(64));
+    let candidates = catalog
+        .search(&query, &SearchOptions::default(), &mut Scratch::new())
+        .expect("a search");
+    candidates.len()
+}
+```
+
+The layout:
+
+```text
+0   "AFCM"            4   version u32 = 1
+8   generation u64    16  reference_count u64
+24  segment_count u64 32  next_file u32
+36  reserved u32 = 0
+40  live bitmap, one bit per id, LSB first, ceil(n / 8) bytes
+    (zero-padded to 8)
+    segment_count entries of 40 bytes, in catalog order (largest first)
+    checksum u64
+```
+
+Each entry is the segment's file id (`u32`), a reserved word, its length
+in bytes, its key count, its posting count and its reference range. A
+load checks every file against its entry, so a segment that does not match
+its manifest is `SnapshotError::Corrupt` rather than a wrong catalog.
+
+**`save` is the durable point.** It writes every segment that has no file
+to `seg-<id>.tmp`, syncs it and renames it to `.afs`; then writes
+`MANIFEST.tmp`, syncs it and renames it over `MANIFEST`; syncs the
+directory (on Unix); and only then deletes the segment files the previous
+manifest named and the new one does not. A crash at any point leaves the
+directory as the catalog of the last `save` that returned, and so does a
+`save` that returns an error before it has replaced the manifest: the
+segment files it finished stay, and the next `save` goes on from them.
+**What was added or removed since the last `save` is lost.** The id the next reference gets is
+`catalog().reference_count()` of that catalog, so a caller that needs to
+recover those changes keeps its own log of additions and replays it from
+there:
+
+```rust
+use afpindex::CatalogStore;
+use std::path::Path;
+
+/// Replay a log of additions from the last durable state.
+pub fn resume(
+    dir: &Path,
+    log: &[Vec<(u32, u32)>],
+) -> Result<CatalogStore, Box<dyn std::error::Error>> {
+    let mut store = CatalogStore::open(dir)?;
+    // The id the next reference gets is the id space of the catalog the
+    // last `save` wrote; the log names the rows of every reference in
+    // order, so it resumes from there.
+    let next = store.catalog().reference_count();
+    for rows in log.iter().skip(next) {
+        store.add(rows.iter().copied())?;
+    }
+    store.save()?;
+    Ok(store)
+}
+```
+
+The `SnapshotError` of `open` and the `io::Error` of `add` and `save`
+travel as one boxed error here; a caller that has to tell them apart
+matches on them instead.
+
+**One writer, one directory.** A store is the only writer of its
+directory, and the directory is the store's: `open` and `save` remove the
+segment and temporary files (the names above) that the manifest does not
+name, which is what a crash or a replaced segment leaves behind. Files of
+any other name are left alone. Nothing locks the directory. Two things
+stand in the way of a second writer instead: `save` refuses to replace a
+manifest whose generation is not the one this store read or wrote last,
+and a store never writes a segment file over an existing one, so the
+store that comes second gets an error and the catalog on disk stays whole.
+
+**The pages are not faulted in.** `map_dir` and the store map their
+segments without asking the kernel to populate them, so opening a catalog
+larger than memory costs only the keys and directories it builds. As with
+`map_from`, nothing in the directory may change while a catalog mapped from
+it, a clone of it or a catalog sharing one of its segments is alive.
+
 ---
 
 ## 14. Working with segments directly
