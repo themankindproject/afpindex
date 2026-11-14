@@ -122,7 +122,8 @@ fn build(shape: &Shape) -> Catalog {
 }
 
 /// Add `adds` references one at a time, remove a tenth of them, and
-/// compact: the deltas alone on a copy, then everything.
+/// compact: the deltas alone on a copy, then everything. The search after
+/// the additions, before any compaction, is what the segment list costs.
 fn grow_and_compact(catalog: &mut Catalog, shape: &Shape, adds: usize) {
     // The rows are generated outside the clock.
     let (mut total, mut worst) = (Duration::ZERO, Duration::ZERO);
@@ -142,6 +143,13 @@ fn grow_and_compact(catalog: &mut Catalog, shape: &Shape, adds: usize) {
         secs(worst) * 1e3
     );
 
+    let before = time_search(catalog, shape);
+    println!(
+        "  search, {} segments: {:.2} ms per query",
+        catalog.segment_count(),
+        secs(before) * 1e3
+    );
+
     for &id in added.iter().step_by(10) {
         catalog.remove(id);
     }
@@ -157,6 +165,32 @@ fn grow_and_compact(catalog: &mut Catalog, shape: &Shape, adds: usize) {
         secs(t),
         secs(t) * 1e9 / catalog.posting_count().max(1) as f64
     );
+}
+
+/// The best of five rounds of a search over the catalog, per query: the
+/// cost a query pays for the segments there are.
+fn time_search(catalog: &Catalog, shape: &Shape) -> Duration {
+    let queries: Vec<Query> = make_pairs(20, shape)
+        .iter()
+        .map(|q| Query::from_pairs(q.iter().copied(), Some(64)))
+        .collect();
+    let mut scratch = Scratch::new();
+    let mut options = SearchOptions::default();
+    options.min_total_votes = 16;
+    let mut best = Duration::MAX;
+    for _ in 0..5 {
+        let ((), t) = timed(|| {
+            for q in &queries {
+                std::hint::black_box(
+                    catalog
+                        .search(q, &options, &mut scratch)
+                        .expect("a search within the vote limit"),
+                );
+            }
+        });
+        best = best.min(t);
+    }
+    best / queries.len() as u32
 }
 
 /// Write the snapshot to memory, read it back with every check and

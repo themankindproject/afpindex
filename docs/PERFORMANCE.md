@@ -18,6 +18,7 @@ by about 10 %, so compare columns within one table only.
 - [Building, changing and loading](#building-changing-and-loading)
 - [Real data](#real-data)
 - [Run lines, vector decoding and parallel loads](#run-lines-vector-decoding-and-parallel-loads)
+- [A sparser directory for small segments](#a-sparser-directory-for-small-segments)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -266,6 +267,54 @@ Measured here and left out:
   lower clock and a vector port given up while they run; this host has
   no counters to confirm it. The kernel also needs Rust 1.89 for the
   AVX-512 intrinsics.
+
+## A sparser directory for small segments
+
+A search looks every query hash up in every segment, and in a delta
+segment most of those lookups miss. A miss walks the directory to an
+empty slot: five slots on average at the load of three keys per five
+slots a segment used to have, and most of what a lookup in a small
+segment costs, on a branch the CPU cannot predict. Segments of fewer
+than 2<sup>20</sup> keys now get four slots per key, which ends a miss
+in under two probes, for 48 bytes of directory per key instead of 20 (at
+most about 50 MB for a segment that small).
+
+Instruction counts from `examples/profile.rs` under callgrind, `simd`
+build, on the synthetic catalogs of the sections above; a count covers
+120 searches (one warm-up round and two measured rounds of 40). The
+cache columns are from `--cache-sim=yes`, on the laptop: D1 counts the
+data reads that missed the first-level cache, LLd those that missed the
+last.
+
+| catalog, segments | instructions | D1 read misses | LLd read misses |
+|---|---|---|---|
+| s2 plus 300 adds, 6 segments, before | 127,402,436 | 1,600,402 | 556,449 |
+| s2 plus 300 adds, 6 segments, after | 114,100,618 | 1,473,790 | 581,578 |
+| s1, 1 segment of 450 k keys, before | 177,096,755 | 2,567,145 | 643,924 |
+| s1, 1 segment of 450 k keys, after | 177,001,013 | 2,565,283 | 650,828 |
+
+The 6-segment search is 10 % cheaper in instructions. Its last-level
+read misses rise a little, by the extra directory bytes a lookup now
+walks, and the first-level read misses fall by 8 %, which is the point:
+fewer probes per miss. The 450 k-key segment is neutral, as intended.
+
+The three single-segment sizes the audit named, measured the same way
+before and after, are neutral too (a catalog of one small segment gains
+little, since its hashes are there to be found, and pays for a larger
+directory):
+
+| catalog (keys) | instructions before | instructions after | D1 read misses before / after | LLd read misses before / after |
+|---|---|---|---|---|
+| 40 k keys, 600 k postings | 548,494,125 | 548,494,266 | 1,693,379 / 1,694,693 | 15,370 / 15,370 |
+| 400 k keys, 6 M postings | 76,651,202 | 76,614,899 | 640,928 / 639,572 | 124,103 / 138,555 |
+| 900 k keys, 15 M postings | 73,334,770 | 72,913,994 | 660,114 / 653,155 | 190,732 / 191,451 |
+
+The 400 k-key catalog's directory grows past the laptop's 8 MiB last
+level cache, which is the 12 % more last-level read misses; it costs
+nothing measurable in instructions. On the laptop, where wall clock is
+noisy (see the note at the top), the three single-segment sizes were not
+slower by more than that noise in any round, so the threshold stayed at
+2<sup>20</sup>.
 
 ## Parallel merge
 

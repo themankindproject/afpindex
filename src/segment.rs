@@ -119,7 +119,8 @@ pub struct Segment {
     keys: Vec<u32>,
     refs: Packed,
     times: Packed,
-    /// Linear-probing directory, at most three keys per five slots.
+    /// Linear-probing directory: at most three keys per five slots, or one
+    /// per four below [`SPARSE_KEYS`] keys (see [`build_table`]).
     table: Vec<Slot>,
 }
 
@@ -178,16 +179,33 @@ const DIRECT_SLOTS: usize = 1 << 16;
 /// Slots per region when a larger directory is filled region by region.
 const REGION_SLOTS: usize = 1 << 13;
 
+/// Keys below which a directory gets four slots per key.
+///
+/// A miss walks to an empty slot, and a delta segment is mostly misses: a
+/// search looks every query hash up in every segment, and most of them are
+/// not in the small ones. Four slots per key make the table sparser, so a
+/// miss finds an empty slot sooner; the price is 48 bytes per key instead
+/// of 20, at most about 50 MB per segment.
+const SPARSE_KEYS: usize = 1 << 20;
+
 /// Directory over sorted `keys` and their `offsets`: linear probing at a
-/// load of three keys per five slots, so a hit costs about 1.5 probes and
-/// a miss about 3.5, almost always inside one cache line.
+/// load of three keys per five slots, or one key per four below
+/// [`SPARSE_KEYS`] keys. A lookup that misses probes on to an empty slot,
+/// and that walk is most of what a lookup in a delta segment costs: at the
+/// denser load it is five slots, and at the sparser one under two. A hit
+/// costs one or two probes either way, and both stay inside one cache
+/// line.
 fn build_table(keys: &[u32], offsets: &[u64], mults: &[u8]) -> Vec<Slot> {
     debug_assert_eq!(mults.len(), keys.len());
     if keys.is_empty() {
         return Vec::new();
     }
     let n = keys.len();
-    let slots = n + n / 3 * 2 + 1;
+    let slots = if n < SPARSE_KEYS {
+        4 * n + 1
+    } else {
+        n + n / 3 * 2 + 1
+    };
     let mut table = alloc::vec![Slot::EMPTY; slots];
     // A key without postings (only arrays a reader has yet to reject) gets
     // no slot, which reads as "absent".
@@ -879,7 +897,9 @@ impl Segment {
     /// Heap bytes held by the arrays and the directory.
     ///
     /// A posting costs its two widths (see [`Segment::widths`]); a distinct
-    /// hash costs 4 bytes of key and about 20 of directory.
+    /// hash costs 4 bytes of key and about 20 of directory, or 4 bytes of
+    /// key and 48 of directory in a segment of fewer than 2<sup>20</sup>
+    /// keys.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         self.keys.capacity() * size_of::<u32>()
@@ -1436,10 +1456,11 @@ mod tests {
     #[test]
     fn heap_bytes_counts_every_array_and_finish_trims_capacity() {
         let s = Segment::from_postings(vec![p(1, 0, 0), p(2, 0, 0)]);
-        // Two keys get a three-slot directory of 12-byte slots; references
-        // and times are all zero, so they pack to no data bytes plus slack.
+        // Two keys get a nine-slot directory of 12-byte slots, the sparse
+        // load of a small segment; references and times are all zero, so
+        // they pack to no data bytes plus slack.
         assert_eq!(s.widths(), (0, 0));
-        assert!(s.heap_bytes() >= 2 * 4 + 8 + 8 + 3 * 12);
+        assert!(s.heap_bytes() >= 2 * 4 + 8 + 8 + 9 * 12);
         // Ten duplicates of one posting: the hint was 10, the segment holds 1
         // reference of one bit.
         let s = Segment::from_postings(vec![p(1, 1, 0); 10]);

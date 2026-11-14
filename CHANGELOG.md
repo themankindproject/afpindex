@@ -77,6 +77,12 @@ First release: the engine of the *afpindex* design notes as a library.
   fanout test on runs that cannot reach it; the survivor scan reduces
   each block of counters with a bitwise OR, which vectorises on any
   x86-64 CPU, rather than a maximum, which needs SSE4.1.
+- A directory of fewer than 2<sup>20</sup> keys leaves four slots per key
+  instead of the 1.7 of a larger one, which is what most lookups in a
+  delta segment, all of them misses, spend their time on: on a synthetic
+  catalog of six segments a search took 10 % fewer instructions, and
+  single-segment catalogs are unchanged. The price is 48 bytes of
+  directory per key instead of 20, at most about 50 MB per segment.
 - `no_std + alloc` core with no `unsafe` code by default; `libm` is the
   only dependency. Minimum Rust version 1.87.
 - Examples: `quickstart` (build, search, add, remove), `bench`

@@ -699,7 +699,7 @@ segments are freed when the last search lets go.
 | What | Cost |
 |---|---|
 | A posting | Its reference width plus its time width, in bits (`Segment::widths`) |
-| A distinct hash, per segment | 4 bytes of key plus about 20 of directory |
+| A distinct hash, per segment | 4 bytes of key plus about 20 of directory, or plus about 48 in a segment of fewer than 2<sup>20</sup> keys |
 | An id | 1 byte of liveness table |
 | A `Scratch`, per thread | 4 bytes and a bit per id of the largest catalog it searched, plus buffers that grow with the queries |
 | A search's histogram | 16 bytes per survivor vote and 32 bytes per survivor group, while it runs |
@@ -717,12 +717,17 @@ cycles per search.
 whenever a segment is built or loaded (never stored). A slot holds the
 run's start and length and the most postings any one reference has in
 it, which is what lets the search skip the fanout test on most runs.
-There is no offsets array: iteration in key order looks each key up in
-the directory, and a merge recovers the order of the runs from one scan
-of the directory and a sort of what it finds (16 bytes per distinct hash
-while the merge runs). A directory too large for the cache is filled a
-region at a time from a copy of its entries sorted by region, another 12
-bytes per hash until it is built.
+A directory of fewer than 2<sup>20</sup> keys leaves four slots per key
+instead of the 1.7 of a larger one: a lookup that misses then reaches an
+empty slot in under two probes instead of five, which is what most
+lookups in a delta segment are, at 48 bytes per key instead of 20 (at
+most about 50 MB for a segment that small). There is no offsets array:
+iteration in key order looks each key up in the directory, and a merge
+recovers the order of the runs from one scan of the directory and a sort
+of what it finds (16 bytes per distinct hash while the merge runs). A
+directory too large for the cache is filled a region at a time from a
+copy of its entries sorted by region, another 12 bytes per hash until it
+is built.
 
 **Measuring.** `Catalog::heap_bytes()` (segments and liveness table),
 `Segment::heap_bytes()`, `Scratch::heap_bytes()`, and
