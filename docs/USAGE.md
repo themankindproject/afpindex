@@ -843,11 +843,13 @@ Use a large buffer (8 MiB above): the reader and writer move gigabytes.
 Reading verifies, before the catalog is usable:
 
 - the magic (`AFCT` for a catalog, `AFIX` for a segment) and the format
-  version (2);
+  version (3);
 - a checksum over the header and every array;
 - that the arrays describe a valid segment: keys ascending, offsets
   consistent, each run sorted by `(reference, time)` without duplicates,
-  and every reference inside the id space.
+  and every reference inside the id space;
+- that the multiplicities and the reference range the file stores are the
+  ones the runs hold (see [Trusted loads](#trusted-loads)).
 
 A large segment's runs are checked on every core. A file that fails any
 check returns a `SnapshotError` ([section 15](#15-errors)) instead of a
@@ -867,9 +869,11 @@ about 2 s and `map_from` about 1 s with the `simd` feature (2.7 s and
 (and the same pair on `Segment`) skip the two checks that read every
 posting: the checksum of each segment, and the order of each run. The
 header, the sizes, the keys and offsets, the liveness table and its
-checksum, and the id space are still checked. The references are still
-read once, because the search needs to know the most postings one
-reference has in each run.
+checksum, and the id space are still checked, and so is the stored
+reference range: that its smallest reference is not above its largest,
+and that the largest fits the segment's reference width. No posting is
+read at all, because each run's multiplicity and the segment's reference
+range are stored in the file (see [The format](#the-format)).
 
 ```rust
 use std::path::Path;
@@ -886,10 +890,12 @@ Use them for files you wrote and have checked once, when the time to load
 matters: a server restarting on the snapshot it saved, or a fleet that
 checks a new snapshot on one host before every host maps it. A file
 damaged since loads without an error, and searches and changes on it
-return wrong candidates or panic; nothing undefined happens. On the real
-catalog on two hardware threads with huge pages, `read_from_trusted` took
-0.96 s against 1.65 s for `read_from`, and `map_from_trusted` 0.39 s
-against 0.94 s.
+return wrong candidates or panic; nothing undefined happens. Because the
+file stores each run's multiplicity and the reference range, a trusted
+load reads no posting: it is the checksum and the run check that it
+skips, and on the real catalog that was most of a load. The instruction
+counts are in
+[PERFORMANCE.md](PERFORMANCE.md#format-3-what-a-trusted-load-recomputes).
 
 ### Mapping: `map_from`
 
@@ -900,8 +906,10 @@ With the `mmap` feature, `Catalog::map_from(path)` and
   that maps the same file, and reclaimable by the kernel without a write
   (they are clean file pages). Only the keys and the directories are
   built on the heap.
-- The pages are faulted in before the call returns, and the same checksum
-  and structural checks run in full.
+- The pages are faulted in before the call returns on Linux and Android,
+  where the mapping asks the kernel to (`MAP_POPULATE`); elsewhere they
+  are faulted in as the checks reach them, and the same checksum and
+  structural checks run in full.
 - **The file must not be modified or truncated while the catalog, any
   clone of it, or any catalog still sharing one of its segments is
   alive.** A write through another handle is undefined behaviour for the
@@ -917,24 +925,28 @@ anyway).
 
 ### The format
 
-Both formats are version 2: little-endian arrays behind a 32-byte header,
-every section 8-byte aligned, with a checksum trailer. References and
-times are stored packed as they are in memory, so a file is about the
-size of the catalog.
+Both formats are version 3: little-endian arrays behind a header, every
+section 8-byte aligned, with a checksum trailer. References and times are
+stored packed as they are in memory, so a file is about the size of the
+catalog. A file of an earlier version is refused with
+`SnapshotError::UnsupportedVersion`: there is no reader for it, so write
+the catalog out again with the current version.
 
 ```text
 Segment snapshot
-0   "AFIX"            4   version u32 = 2
+0   "AFIX"            4   version u32 = 3
 8   ref_bits u32      12  time_bits u32
 16  key_count u64     24  posting_count u64
-32  keys    u32 × key_count                             (zero-padded to 8)
+32  min_ref u32       36  max_ref u32      (both 0 without postings)
+40  keys    u32 × key_count                             (zero-padded to 8)
     offsets u64 × (key_count + 1)
+    mults   u8  × key_count                             (zero-padded to 8)
     refs    ceil(posting_count × ref_bits / 8) bytes    (zero-padded to 8)
     times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
     checksum u64
 
 Catalog snapshot
-0   "AFCT"            4   version u32 = 2
+0   "AFCT"            4   version u32 = 3
 8   flags u32 = 0     12  reserved u32 = 0
 16  reference_count u64   24  segment_count u64
 32  live bitmap, one bit per id, LSB first              (zero-padded to 8)
@@ -942,9 +954,19 @@ Catalog snapshot
     segment_count segment snapshots, back to back
 ```
 
+`mults` is, per key, what the directory records of its run: the most
+postings any one reference has in it, saturating at 255. `min_ref` and
+`max_ref` are the smallest and the largest reference in the segment.
+A load would otherwise walk every run for the two, a posting at a time;
+stored, a trusted load takes them and reads no posting, while a full load
+checks them against the runs it walks (`Corrupt` if they differ). One walk
+of the directory gives the writer both what it needs: the start of each
+run, which the offsets hold, and its multiplicity. Each run is sorted by
+reference, so its first and last posting bound the segment's range.
+
 Flags and reserved fields are written as zero and ignored on read. The
-directory is not stored; it is rebuilt from the keys on load (0.05 s on
-the real catalog).
+directory is not stored; it is rebuilt from the keys and the
+multiplicities on load (0.05 s on the real catalog).
 
 ---
 
@@ -1173,8 +1195,9 @@ copies an array that grows where glibc remaps its pages.
   ([section 11](#the-threads-a-build-merge-or-load-takes)).
 - **Load with `map_from`** for fast restarts and shared pages across
   processes; `read_from` for a catalog that changes heavily. Once a
-  snapshot has passed a full load, `map_from_trusted` maps it again in
-  under half the time ([section 13](#trusted-loads)).
+  snapshot has passed a full load, `map_from_trusted` maps it again
+  without reading a posting, in about half the instructions
+  ([section 13](#trusted-loads)).
 - **Write snapshots atomically** (temporary file, sync, rename) and
   compact first.
 - **Keep the id table** (id to recording) next to the snapshot, written in

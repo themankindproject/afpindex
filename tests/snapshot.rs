@@ -3,7 +3,9 @@
 
 use afpindex::{Catalog, Posting, Query, Scratch, SearchOptions, Segment, SnapshotError};
 
-const HEADER: usize = 32;
+const HEADER: usize = 40;
+/// Bytes before a catalog snapshot's liveness bitmap.
+const CATALOG_HEADER: usize = 32;
 
 fn sample() -> Segment {
     let rows: Vec<Posting> = (0..5_000u32)
@@ -12,10 +14,10 @@ fn sample() -> Segment {
     Segment::from_postings(rows)
 }
 
-/// Byte offsets of the four arrays, the end of the times data, and the
+/// Byte offsets of the five arrays, the end of the times data, and the
 /// trailer in a segment snapshot. References and times are packed at the
 /// width of their largest value.
-fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize) {
+fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize, usize) {
     let k = seg.key_count();
     let p = seg.len();
     let packed = |max: u32| (p * (32 - max.leading_zeros()) as usize).div_ceil(8);
@@ -23,11 +25,12 @@ fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize) {
     let time_bytes = packed(seg.postings().map(|r| r.time).max().unwrap_or(0));
     let keys = HEADER;
     let offsets = (keys + 4 * k).next_multiple_of(8);
-    let refs = offsets + 8 * (k + 1);
+    let mults = offsets + 8 * (k + 1);
+    let refs = (mults + k).next_multiple_of(8);
     let times = (refs + ref_bytes).next_multiple_of(8);
     let times_end = times + time_bytes;
     let trailer = times_end.next_multiple_of(8);
-    (keys, offsets, refs, times, times_end, trailer)
+    (keys, offsets, mults, refs, times, times_end, trailer)
 }
 
 fn query() -> Query {
@@ -64,7 +67,7 @@ fn corruption_is_reported_not_trusted() {
     let seg = sample();
     let mut good = Vec::new();
     seg.write_to(&mut good).unwrap();
-    let (keys_at, offsets_at, refs_at, times_at, times_end, trailer_at) = layout(&seg);
+    let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, trailer_at) = layout(&seg);
 
     let mut bad = good.clone();
     bad[0] = b'X';
@@ -78,6 +81,13 @@ fn corruption_is_reported_not_trusted() {
     assert!(matches!(
         Segment::read_from(bad.as_slice()),
         Err(SnapshotError::UnsupportedVersion(9))
+    ));
+    // Version 2 is not read: there is no reader for it.
+    let mut bad = good.clone();
+    bad[4] = 2;
+    assert!(matches!(
+        Segment::read_from(bad.as_slice()),
+        Err(SnapshotError::UnsupportedVersion(2))
     ));
 
     for cut in [HEADER - 1, offsets_at + 3, trailer_at, good.len() - 1] {
@@ -103,6 +113,7 @@ fn corruption_is_reported_not_trusted() {
     for at in [
         keys_at,
         offsets_at + 8,
+        mults_at + 2,
         refs_at + 5,
         times_at + 9,
         times_end - 1,
@@ -254,7 +265,7 @@ fn trusted_catalog_loads_match_full_ones() {
 
     // The liveness bitmap is still checked.
     let mut bad = bytes;
-    bad[HEADER] ^= 1;
+    bad[CATALOG_HEADER] ^= 1;
     assert!(matches!(
         Catalog::read_from_trusted(bad.as_slice()),
         Err(SnapshotError::Checksum)
@@ -285,7 +296,7 @@ fn catalog_snapshot_corruption_is_reported() {
 
     // Flip a liveness bit: the bitmap checksum catches it.
     let mut bad = good.clone();
-    bad[HEADER] ^= 1;
+    bad[CATALOG_HEADER] ^= 1;
     assert!(matches!(
         Catalog::read_from(bad.as_slice()),
         Err(SnapshotError::Checksum)
@@ -348,9 +359,9 @@ fn full_width_references_and_times_round_trip() {
 }
 
 /// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
-/// snapshots (format version 2).
-const CATALOG_GOLDEN: (usize, u64) = (91_568, 7_667_176_456_971_685_523);
-const SEGMENT_GOLDEN: (usize, u64) = (30_056, 9_864_878_237_036_170_439);
+/// snapshots (format version 3).
+const CATALOG_GOLDEN: (usize, u64) = (96_864, 5_356_885_839_193_813_427);
+const SEGMENT_GOLDEN: (usize, u64) = (32_064, 16_497_302_139_298_787_675);
 
 /// FNV-1a over `bytes`.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -504,10 +515,12 @@ mod mapped {
         assert_eq!(back.max_reference(), seg.max_reference());
         drop(back);
         // Every data byte is checksummed in place, as on the read path.
-        let (keys_at, offsets_at, refs_at, times_at, times_end, trailer_at) = layout(&seg);
+        let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, trailer_at) =
+            layout(&seg);
         for at in [
             keys_at,
             offsets_at + 8,
+            mults_at + 2,
             refs_at + 5,
             times_at + 9,
             times_end - 1,
@@ -530,7 +543,7 @@ mod mapped {
         let path = temp("bad.afc");
 
         // The liveness bitmap and the packed arrays are checksummed in place.
-        for at in [HEADER, good.len() / 2] {
+        for at in [CATALOG_HEADER, good.len() / 2] {
             let mut bad = good.clone();
             bad[at] ^= 0x10;
             std::fs::write(&path, &bad).unwrap();
@@ -538,7 +551,12 @@ mod mapped {
             assert!(matches!(err, SnapshotError::Checksum), "byte {at}: {err}");
         }
         // Truncated anywhere: refused, never read past the file.
-        for cut in [HEADER - 1, good.len() / 3, good.len() - 4, good.len() - 1] {
+        for cut in [
+            CATALOG_HEADER - 1,
+            good.len() / 3,
+            good.len() - 4,
+            good.len() - 1,
+        ] {
             std::fs::write(&path, &good[..cut]).unwrap();
             let err = Catalog::map_from(&path).unwrap_err();
             assert!(

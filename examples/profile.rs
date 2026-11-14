@@ -23,6 +23,9 @@
 //! or `COMPACT` in the environment compacts after the additions; without
 //! them the additions are what leave many segments behind, and a search
 //! then pays for a lookup in every one.
+//!
+//! `load` mode profiles one load of the snapshot, chosen by its last
+//! argument: `map`, `map-trusted`, `read` or `read-trusted`.
 
 use std::time::Instant;
 
@@ -89,6 +92,51 @@ fn measured_adds(catalog: &mut Catalog, rows: Vec<Vec<(u32, u32)>>) {
 #[inline(never)]
 fn measured_batch(catalog: &mut Catalog, rows: Vec<Vec<(u32, u32)>>) {
     catalog.add_many(rows);
+}
+
+/// How a `load` run reads the snapshot.
+#[derive(Clone, Copy)]
+enum Load {
+    Map,
+    MapTrusted,
+    Read,
+    ReadTrusted,
+}
+
+/// One load of the snapshot, with every check or trusting the file: the
+/// work `load` counts.
+#[inline(never)]
+fn measured_load(path: &str, bytes: &[u8], load: Load) -> Catalog {
+    match load {
+        Load::Map => Catalog::map_from(path),
+        Load::MapTrusted => Catalog::map_from_trusted(path),
+        Load::Read => Catalog::read_from(bytes),
+        Load::ReadTrusted => Catalog::read_from_trusted(bytes),
+    }
+    .unwrap()
+}
+
+/// The `load` mode: time one load, with the mode's name as the argument.
+fn run_load(a: &[String]) {
+    let (path, which) = (&a[4], a[5].as_str());
+    let load = match which {
+        "map" => Load::Map,
+        "map-trusted" => Load::MapTrusted,
+        "read" => Load::Read,
+        "read-trusted" => Load::ReadTrusted,
+        other => panic!("load mode {other}"),
+    };
+    // The read modes need the bytes; mapping only the path, but reading
+    // them keeps every mode's work outside the load itself.
+    let bytes = std::fs::read(path).unwrap();
+    let t = Instant::now();
+    let catalog = measured_load(path, &bytes, load);
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "{} segments, {} postings: {secs:.3} s",
+        catalog.segment_count(),
+        catalog.posting_count(),
+    );
 }
 
 fn main() {
@@ -191,6 +239,8 @@ fn main() {
                 catalog.segment_count()
             );
         }
-        _ => panic!("mode: build, search, adds or batch"),
+        // load refs per_ref hashes path map|map-trusted|read|read-trusted
+        "load" => run_load(&a),
+        _ => panic!("mode: build, search, adds, batch or load"),
     }
 }

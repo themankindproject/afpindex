@@ -758,15 +758,20 @@ impl Segment {
     /// Where each key's run starts, then the posting count: `key_count + 1`
     /// values, one directory lookup each, read a batch of keys ahead.
     pub(crate) fn offsets(&self) -> impl Iterator<Item = u64> + '_ {
-        self.touch_first();
-        self.keys
-            .iter()
-            .enumerate()
-            .map(|(k, &key)| {
-                self.touch_ahead(k);
-                self.slot(key).map_or(0, |s| s.start())
-            })
+        self.starts_and_mults()
+            .map(|(start, _)| start)
             .chain(core::iter::once(self.refs.len() as u64))
+    }
+
+    /// Where each key's run starts and the most postings any one reference
+    /// has in it, in key order: one directory lookup each, read a batch of
+    /// keys ahead, for a caller that wants both.
+    pub(crate) fn starts_and_mults(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+        self.touch_first();
+        self.keys.iter().enumerate().map(|(k, &key)| {
+            self.touch_ahead(k);
+            self.slot(key).map_or((0, 0), |s| (s.start(), s.mult()))
+        })
     }
 
     /// Plain arrays packed at the width of their largest value (tests).

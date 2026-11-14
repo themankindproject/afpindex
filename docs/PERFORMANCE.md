@@ -409,7 +409,6 @@ per-thread arenas rather than returning it to the system, so the
 pieces have to go as they are placed.
 
 ## Trusted loads
-
 `read_from_trusted` and `map_from_trusted` skip the checksum and the
 order check of every run, and read the references alone for each run's
 multiplicity. On the AWS `m7i-flex.large`, huge pages on, `simd` build,
@@ -432,6 +431,37 @@ references on two hardware threads. What remains of a trusted map is
 faulting in the file's pages, copying the keys and offsets, and the
 directory. The synthetic catalog's runs are 17 postings long, so its
 keys and directory are a larger share of its load and it gains less.
+
+Format 3 is that change: it stores the multiplicities and the reference
+range, and a trusted load reads no posting. The counts are below, in
+[Format 3: what a trusted load recomputes](#format-3-what-a-trusted-load-recomputes).
+
+### Format 3: what a trusted load recomputes
+
+Format 3 stores, per segment, each run's multiplicity and the segment's
+reference range, the two things a trusted load used to recompute from the
+references. Writing them costs one walk of the directory, which the writer
+already made for the offsets; the file grows by a byte per distinct hash
+and 8 bytes per segment. A trusted load now reads no posting at all.
+
+Instruction counts from `examples/profile.rs` under callgrind, `simd`
+build, one CPU (`taskset -c 0`, so the parallel load and the checksum on a
+core of their own land on the counted thread), on the synthetic catalog
+of 60 M postings (`build 20000 3000 3600000`):
+
+| load | before | after |
+|---|---|---|
+| `map_from_trusted` | 1,414,460,075 | 613,834,915 |
+| `read_from_trusted` | 1,583,889,579 | 822,315,819 |
+| `map_from` | 2,577,832,442 | 2,590,960,794 |
+| `read_from` | 2,718,786,263 | 2,735,514,418 |
+
+A trusted map costs 57 % fewer instructions and a trusted read 48 %
+fewer: what is left is copying the keys, the offsets and the
+multiplicities, and building the directory, which is now most of a
+trusted map. A full load costs 0.5 to 0.6 % more, for the multiplicities
+it reads and the comparison of the stored values with what its walk
+finds; that is the price of the format checking what it stores.
 
 ## Allocators and huge pages
 
