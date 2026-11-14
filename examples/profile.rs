@@ -33,6 +33,11 @@
 //! timed, and the file they write is compared byte for byte with the
 //! snapshot of the in-memory segment. A last argument of `memory` or `file`
 //! runs one half alone, so that a peak resident set belongs to that half.
+//!
+//! `bulk` mode builds `refs × per_ref` postings into a catalog directory
+//! through `CatalogStore::builder` and prints the time and the process's
+//! peak resident set (from `/proc/self/status`, on Linux). An optional
+//! last argument sets the chunk size in postings.
 
 use std::time::Instant;
 
@@ -235,6 +240,64 @@ fn run_load(a: &[String]) {
     );
 }
 
+/// The `bulk` mode: a build through the store builder, timed, with the
+/// peak resident set it reached.
+fn run_bulk(a: &[String]) {
+    let (refs, per_ref, hashes) = (
+        a[1].parse::<u32>().unwrap(),
+        a[2].parse::<usize>().unwrap(),
+        a[3].parse::<u64>().unwrap(),
+    );
+    let dir = &a[4];
+    let _ = std::fs::remove_dir_all(dir);
+    // The peak resident set counts the pages of mapped files, which the
+    // kernel can drop and read again; the heap is the anonymous part,
+    // sampled here since the kernel keeps no peak of it.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut peak = 0u64;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                peak = peak.max(status_kb("RssAnon").unwrap_or(0));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            peak
+        })
+    };
+    let t = Instant::now();
+    let mut builder = CatalogStore::builder(dir).unwrap();
+    if let Some(chunk) = a.get(5) {
+        builder.chunk_postings(chunk.parse().unwrap());
+    }
+    for r in 0..refs {
+        builder.add(rows_of(r, per_ref, hashes)).unwrap();
+    }
+    let store = builder.finish().unwrap();
+    println!(
+        "{} postings in {} segment: {:.3} s",
+        store.catalog().posting_count(),
+        store.catalog().segment_count(),
+        t.elapsed().as_secs_f64()
+    );
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let anon = sampler.join().unwrap();
+    if let Some(hwm) = status_kb("VmHWM") {
+        println!("peak resident set {hwm} kB, of it anonymous at most {anon} kB");
+    }
+}
+
+/// A `kB` field of `/proc/self/status`, where there is one.
+fn status_kb(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with(field))?;
+    line[field.len() + 1..]
+        .trim()
+        .trim_end_matches(" kB")
+        .parse()
+        .ok()
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let num = |i: usize| a[i].parse::<usize>().expect("integer");
@@ -339,6 +402,8 @@ fn main() {
         "load" => run_load(&a),
         // spill refs per_ref hashes path [adds]
         "spill" => run_spill(&a),
-        _ => panic!("mode: build, search, adds, batch, load or spill"),
+        // bulk refs per_ref hashes dir [chunk]
+        "bulk" => run_bulk(&a),
+        _ => panic!("mode: build, search, adds, batch, load, spill or bulk"),
     }
 }

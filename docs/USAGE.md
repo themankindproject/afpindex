@@ -1087,6 +1087,32 @@ The `SnapshotError` of `open` and the `io::Error` of `add` and `save`
 travel as one boxed error here; a caller that has to tell them apart
 matches on them instead.
 
+**A bulk build larger than memory.** `CatalogStore::builder` assigns ids
+as `CatalogBuilder` does, but sorts every `chunk_postings` rows
+(2<sup>24</sup> unless set) into a temporary segment file and frees them;
+`finish` merges the files eight at a time, each merge written straight to
+a file, and saves the one segment left as the directory's catalog. The
+catalog is the one `CatalogBuilder` builds from the same calls. A build
+that fails or is dropped leaves nothing in the directory.
+
+```rust
+use afpindex::CatalogStore;
+use std::path::Path;
+
+/// Build a catalog directory from references too many to hold at once.
+pub fn bulk(dir: &Path, references: impl Iterator<Item = Vec<(u32, u32)>>) -> std::io::Result<CatalogStore> {
+    let mut builder = CatalogStore::builder(dir).map_err(std::io::Error::other)?;
+    for rows in references {
+        builder.add(rows)?;
+    }
+    builder.finish()
+}
+```
+
+The heap holds one chunk while references are added, and during the
+merges the keys and directory of each file a merge joins (about 32 bytes
+per distinct hash each); neither grows with the number of postings.
+
 **One writer, one directory.** A store is the only writer of its
 directory, and the directory is the store's: `open` and `save` remove the
 segment and temporary files (the names above) that the manifest does not

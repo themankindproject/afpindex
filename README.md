@@ -175,6 +175,10 @@ store.save()?;                           // the durable point
 let catalog = Catalog::map_dir("/var/lib/fingerprints")?;   // read-only, no pages faulted in
 ```
 
+`CatalogStore::builder` builds such a directory from more postings than
+fit in memory: it sorts the rows a chunk at a time into temporary files
+and merges them, eight at a time, into one segment.
+
 A merge whose inputs hold at least `spill_postings()` postings (2<sup>26</sup>
 by default) is written to a file and mapped back, so a large segment's
 postings stay in its file's pages; a smaller one stays on the heap until

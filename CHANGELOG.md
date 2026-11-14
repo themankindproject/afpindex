@@ -82,6 +82,11 @@ First release: the engine of the *afpindex* design notes as a library.
   store removes only its own segment and temporary files, never writes a
   segment file over an existing one, and refuses to save over a manifest
   another writer replaced.
+- `CatalogStore::builder` (`mmap`): a bulk build into a catalog directory
+  in bounded memory. Rows are sorted a chunk at a time into temporary
+  segment files, which `finish` merges eight at a time straight to files
+  until one segment is left; ids and segment are those `CatalogBuilder`
+  gives. A failed or dropped build leaves nothing behind.
 - `simd` feature: on x86-64 CPUs that report AVX2 at run time, the totals
   pass, the search for a survivor's group in a short run and the check of
   every run at load decode packed values eight at a time. The kernel is

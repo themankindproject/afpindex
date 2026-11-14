@@ -14,6 +14,9 @@ use crate::segment::to_file::{Settings, merge_to_file};
 use crate::snapshot::map_segment;
 use crate::{Catalog, Segment, SnapshotError};
 
+mod build;
+pub use build::CatalogStoreBuilder;
+
 /// Postings of input from which a merge is written to a file rather than
 /// built on the heap: 64 M, about 0.3 GiB of postings at the widths of a
 /// real catalog.

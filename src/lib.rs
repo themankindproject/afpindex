@@ -141,4 +141,4 @@ pub use query::Query;
 pub use search::{Bin, Candidate, NoiseStats, Scratch, SearchOptions, Survivor, vote_floor};
 pub use segment::{Postings, Run, Segment};
 #[cfg(feature = "mmap")]
-pub use store::CatalogStore;
+pub use store::{CatalogStore, CatalogStoreBuilder};
