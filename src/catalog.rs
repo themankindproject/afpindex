@@ -181,6 +181,64 @@ impl Catalog {
         id
     }
 
+    /// Add several references, each from its `(hash, time)` rows, and
+    /// return the range of ids they were given. One sort builds one
+    /// segment for the batch, and one merge from the tail follows, where
+    /// [`Catalog::add`] would sort and merge once per reference.
+    ///
+    /// Ids are assigned from the next one upward, in the order the
+    /// references come, exactly as repeated [`Catalog::add`] calls would
+    /// assign them. A reference without rows still takes an id. An empty
+    /// batch changes nothing and returns the empty range at the id the
+    /// next reference would get, so the returned range always starts at
+    /// that id. The catalog is changed only once the input is consumed,
+    /// so a panicking iterator leaves it as it was. Exact duplicate rows
+    /// are dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics once every id below `u32::MAX` has been assigned.
+    pub fn add_many<I, R>(&mut self, references: I) -> core::ops::Range<u32>
+    where
+        I: IntoIterator<Item = R>,
+        R: IntoIterator<Item = (u32, u32)>,
+    {
+        let start = self.live.len();
+        let mut rows = Vec::new();
+        let mut count = 0usize;
+        for reference in references {
+            // The check `next_id` makes, once per reference.
+            let id = start
+                .checked_add(count)
+                .and_then(|id| u32::try_from(id).ok())
+                .filter(|&id| id < u32::MAX)
+                .expect("reference ids exhausted");
+            count += 1;
+            rows.extend(reference.into_iter().map(|(hash, time)| Posting {
+                hash,
+                reference: id,
+                time,
+            }));
+        }
+        if count == 0 {
+            // No id is taken, but the range still starts where the next
+            // reference's would.
+            let next = self.next_id();
+            return next..next;
+        }
+        // Every id in the batch passed the check above, so both fit.
+        let first = u32::try_from(start).expect("checked with the ids");
+        let last = first + (count - 1) as u32;
+        self.live.resize(start + count, true);
+        self.live_count += count;
+        if !rows.is_empty() {
+            let segment = Segment::from_postings(rows);
+            self.parts.push(Part::new(segment, (first, last)));
+            self.merge_tail();
+        }
+        first..last + 1
+    }
+
     /// Tombstone a reference. Returns `false` if the id is unknown or
     /// already removed.
     pub fn remove(&mut self, id: u32) -> bool {
@@ -540,6 +598,76 @@ mod tests {
         let built = b.build();
         inc.compact();
         assert_eq!(built.segment(0), inc.segment(0));
+    }
+
+    /// The same references through `add_many` and through repeated `add`
+    /// calls give equal ids, counts and (after compaction, which puts them
+    /// in one segment either way) equal segments.
+    #[test]
+    fn add_many_agrees_with_repeated_add() {
+        let references: Vec<Vec<(u32, u32)>> = (0..30u32).map(|i| rows(i, 40 + i % 7)).collect();
+        let mut many = Catalog::new();
+        let mut one = Catalog::new();
+        let range = many.add_many(references.iter().map(|r| r.iter().copied()));
+        assert_eq!(range, 0..30);
+        for (i, r) in references.iter().enumerate() {
+            assert_eq!(one.add(r.iter().copied()), i as u32);
+        }
+        assert_eq!(many.reference_count(), one.reference_count());
+        assert_eq!(many.live_count(), one.live_count());
+        assert_eq!(many.posting_count(), one.posting_count());
+        many.compact();
+        one.compact();
+        assert_eq!(many.segment_count(), 1);
+        assert_eq!(many.segment(0), one.segment(0));
+
+        // A second batch continues the ids where the first stopped.
+        let more: Vec<Vec<(u32, u32)>> = (0..5u32).map(|i| rows(100 + i, 30)).collect();
+        assert_eq!(
+            many.add_many(more.iter().map(|r| r.iter().copied())),
+            30..35
+        );
+        for (i, r) in more.iter().enumerate() {
+            assert_eq!(one.add(r.iter().copied()), 30 + i as u32);
+        }
+        many.compact();
+        one.compact();
+        assert_eq!(many.segment(0), one.segment(0));
+    }
+
+    /// An empty batch changes nothing and takes no id, but its range still
+    /// starts at the id the next reference would get; a batch of empty
+    /// references takes their ids and adds no postings, as repeated `add`
+    /// calls would.
+    #[test]
+    fn add_many_covers_empty_batches_and_empty_references() {
+        let mut cat = Catalog::new();
+        let nothing: Vec<Vec<(u32, u32)>> = Vec::new();
+        assert_eq!(cat.add_many(nothing), 0..0);
+        assert_eq!(cat.reference_count(), 0);
+        assert_eq!(cat.segment_count(), 0);
+        assert_eq!(cat.live_count(), 0);
+
+        assert_eq!(cat.add_many([Vec::new(), rows(1, 5), Vec::new()]), 0..3);
+        assert_eq!(cat.reference_count(), 3);
+        assert_eq!(cat.live_count(), 3);
+        assert!(cat.is_live(0) && cat.is_live(2));
+        assert_eq!(cat.posting_count(), 5);
+        assert_eq!(cat.segment_count(), 1);
+        assert_eq!(cat.segment(0).unwrap().max_reference(), Some(1));
+
+        // A batch of nothing but empty references leaves no segment.
+        let before = cat.segment_count();
+        assert_eq!(cat.add_many([Vec::new(), Vec::new()]), 3..5);
+        assert_eq!(cat.segment_count(), before);
+        assert_eq!(cat.reference_count(), 5);
+
+        // An empty batch now starts its range at the next id, 5, and the
+        // next `add` still gets that id.
+        assert_eq!(cat.add_many(Vec::<Vec<(u32, u32)>>::new()), 5..5);
+        assert_eq!(cat.reference_count(), 5);
+        assert_eq!(cat.add(rows(2, 3)), 5);
+        assert_eq!(cat.add_many(Vec::<Vec<(u32, u32)>>::new()), 6..6);
     }
 
     #[test]

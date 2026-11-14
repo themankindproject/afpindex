@@ -550,6 +550,11 @@ pub fn lifecycle(catalog: &mut Catalog, rows: Vec<(u32, u32)>) {
     catalog.compact_deltas(); // merge the deltas, drop dead postings
     catalog.compact(); // one segment for everything
 }
+
+/// A day of additions in one call: one sort and one merge for the batch.
+pub fn load_day(catalog: &mut Catalog, day: Vec<Vec<(u32, u32)>>) -> core::ops::Range<u32> {
+    catalog.add_many(day) // the ids the batch was given, in order
+}
 ```
 
 ### Segments
@@ -564,6 +569,7 @@ shorter runs.
 | Operation | What it does | Cost |
 |---|---|---|
 | `add(rows)` | Sorts the reference into a segment and merges from the tail while a segment is at least half its predecessor | Usually about a millisecond; occasionally a merge reaches a large segment (209 ms at worst at 60 M postings) |
+| `add_many(references)` | Collects a batch of references, sorts them into one segment and merges from the tail once; returns the ids in order | One sort over the batch's postings plus one merge, so a batch costs a fraction of the same references added one by one |
 | `remove(id)` | Tombstones the id; returns `false` if unknown or already removed | Constant. The postings stay until a merge or compaction drops them |
 | `compact_deltas()` | Merges every segment but the largest into one, dropping removed references' postings | One pass over the deltas (0.23 s for four deltas of 5.4 M postings) |
 | `compact()` | Merges everything into one segment, dropping removed postings | One pass over everything (0.58 s for 65 M postings); holds the result next to the segments it replaces while it runs |
@@ -678,7 +684,7 @@ impl Served {
     /// Searches never wait for the work, only for the swap.
     pub fn add_all(&self, references: Vec<Vec<(u32, u32)>>) -> Vec<u32> {
         let mut next = (*self.get()).clone(); // shares the segments
-        let ids = references.into_iter().map(|rows| next.add(rows)).collect();
+        let ids = next.add_many(references).collect();
         if next.segment_count() > 10 {
             next.compact_deltas();
         }

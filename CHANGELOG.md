@@ -18,6 +18,7 @@ First release: the engine of the *afpindex* design notes as a library.
   hash's run up, iterate, `merge` two segments, `filter` by reference.
 - `Catalog` and `CatalogBuilder`: dense reference ids, bulk build with one
   sort, incremental `add` into geometrically merged delta segments,
+  `add_many` to add a batch of references with one sort and one merge,
   `remove` by tombstone, `compact_deltas` and `compact`. A merge is one
   pass over every segment it joins, copies runs that need no change as
   packed bits, and looks at references only in segments that may hold a
@@ -25,7 +26,9 @@ First release: the engine of the *afpindex* design notes as a library.
   every core: the hash space is cut into pieces of about equal postings,
   merged on their own and copied into place in order, for the same
   segment; a compaction ran 3 times faster on 8 vCPUs and 4 times on 16.
-  Segments are shared (`Arc`), so a clone is cheap.
+  Segments are shared (`Arc`), so a clone is cheap. `add_many` takes a
+  batch of references and assigns their ids in the order repeated `add`
+  calls would, with one sort over the batch and one merge from the tail.
 - `Query::from_pairs`: group a clip's `(hash, time)` rows by hash with a
   per-hash cap on the times kept.
 - `Catalog::search`: the two-pass exact search (branch-free totals pass

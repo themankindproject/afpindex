@@ -342,22 +342,42 @@ fn search_with_hands_out_the_bins_the_candidates_came_from() {
 /// Live rows per reference, the model's view of a mutating catalog.
 type Live = BTreeMap<u32, Vec<Posting>>;
 
-fn add_reference(cat: &mut Catalog, live: &mut Live, rng: &mut Rng, hashes: u32) -> u32 {
+fn reference_rows(rng: &mut Rng, hashes: u32) -> Vec<(u32, u32)> {
     let n = 50 + rng.below(400) as usize;
-    let rows: Vec<(u32, u32)> = (0..n)
+    (0..n)
         .map(|_| {
             (
                 hash_of(rng.below(u64::from(hashes)) as u32, true),
                 rng.below(3_000) as u32,
             )
         })
-        .collect();
-    let id = cat.add(rows.iter().copied());
+        .collect()
+}
+
+/// Record a reference's rows in the model under `id`.
+fn record(live: &mut Live, id: u32, rows: &[(u32, u32)]) {
     let mut mine: Vec<Posting> = rows.iter().map(|&(h, t)| Posting::new(h, id, t)).collect();
     mine.sort_unstable();
     mine.dedup();
     live.insert(id, mine);
+}
+
+fn add_reference(cat: &mut Catalog, live: &mut Live, rng: &mut Rng, hashes: u32) -> u32 {
+    let rows = reference_rows(rng, hashes);
+    let id = cat.add(rows.iter().copied());
+    record(live, id, &rows);
     id
+}
+
+/// One `add_many` of a random batch, recorded in the model.
+fn add_batch(cat: &mut Catalog, live: &mut Live, rng: &mut Rng, hashes: u32) -> Vec<u32> {
+    let n = 1 + rng.below(6) as usize;
+    let batch: Vec<Vec<(u32, u32)>> = (0..n).map(|_| reference_rows(rng, hashes)).collect();
+    let ids = cat.add_many(batch.iter().map(|r| r.iter().copied()));
+    for (id, rows) in ids.clone().zip(&batch) {
+        record(live, id, rows);
+    }
+    ids.collect()
 }
 
 fn check_against_model(
@@ -448,15 +468,16 @@ fn random_mutation_sequences_match_the_model() {
         let mut live: Live = BTreeMap::new();
         let mut ids: Vec<u32> = Vec::new();
         for step in 0..60 {
-            match rng.below(10) {
-                0..=4 => ids.push(add_reference(&mut cat, &mut live, &mut rng, hashes)),
-                5..=6 if !ids.is_empty() => {
+            match rng.below(12) {
+                0..=3 => ids.push(add_reference(&mut cat, &mut live, &mut rng, hashes)),
+                4..=5 => ids.extend(add_batch(&mut cat, &mut live, &mut rng, hashes)),
+                6..=7 if !ids.is_empty() => {
                     let id = ids[rng.below(ids.len() as u64) as usize];
                     let was_live = live.remove(&id).is_some();
                     assert_eq!(cat.remove(id), was_live);
                 }
-                7 => cat.compact_deltas(),
-                8 => cat.compact(),
+                8 => cat.compact_deltas(),
+                9 => cat.compact(),
                 _ => {}
             }
             assert_eq!(cat.live_count(), live.len());
@@ -533,6 +554,53 @@ fn a_panicking_visitor_leaves_the_scratch_clean() {
     }));
     assert!(outcome.is_err());
     assert_eq!(cat.search(&query, &o, &mut scratch).unwrap(), expected);
+}
+
+/// A batch with a panicking iterator in the middle leaves the catalog as
+/// it was: no ids, no postings, no segment. The batch may be large enough
+/// to build a segment, too.
+#[test]
+fn a_panicking_add_many_leaves_the_catalog_alone() {
+    let mut rng = Rng(11);
+    let mut cat = Catalog::new();
+    let mut live: Live = BTreeMap::new();
+    for _ in 0..6 {
+        add_reference(&mut cat, &mut live, &mut rng, 100);
+    }
+    let (refs, segments, postings) = (
+        cat.reference_count(),
+        cat.segment_count(),
+        cat.posting_count(),
+    );
+    let good = cat.clone();
+    let before = cat.segment(0).unwrap().clone();
+    for panic_at in [0usize, 1, 3] {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let batch: Vec<Vec<(u32, u32)>> =
+                (0..6).map(|_| reference_rows(&mut rng, 100)).collect();
+            cat.add_many(batch.into_iter().enumerate().map(|(i, rows)| {
+                assert_ne!(i, panic_at, "the iterator gave up");
+                rows
+            }));
+        }));
+        assert!(outcome.is_err(), "panicking at {panic_at}");
+        assert_eq!(cat.reference_count(), refs);
+        assert_eq!(cat.segment_count(), segments);
+        assert_eq!(cat.posting_count(), postings);
+        assert_eq!(cat.segment(0), Some(&before));
+        assert_eq!(cat.live_count(), good.live_count());
+    }
+    // And it still takes a batch afterwards.
+    let ids = add_batch(&mut cat, &mut live, &mut rng, 100);
+    assert_eq!(ids.first().copied(), Some(refs as u32));
+    check_against_model(
+        &cat,
+        &live,
+        &mut Scratch::new(),
+        "after a panic",
+        &mut rng,
+        100,
+    );
 }
 
 #[test]

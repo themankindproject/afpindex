@@ -18,6 +18,7 @@ by about 10 %, so compare columns within one table only.
 - [Building, changing and loading](#building-changing-and-loading)
 - [Real data](#real-data)
 - [Run lines, vector decoding and parallel loads](#run-lines-vector-decoding-and-parallel-loads)
+- [Adding a batch](#adding-a-batch)
 - [A sparser directory for small segments](#a-sparser-directory-for-small-segments)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
@@ -267,6 +268,28 @@ Measured here and left out:
   lower clock and a vector port given up while they run; this host has
   no counters to confirm it. The kernel also needs Rust 1.89 for the
   AVX-512 intrinsics.
+
+## Adding a batch
+
+`Catalog::add` builds a one-reference segment and merges it from the
+tail, so 600 additions of 3,000 rows each pay for 600 sorts, 600
+directory builds and the merges between them. `Catalog::add_many`
+collects the batch, sorts every row into one segment, pushes it as one
+part and merges once; the ids it hands out are the ones repeated `add`
+calls would have. On the synthetic catalog of 60 M postings
+(`examples/profile.rs`, `simd` build, callgrind, `adds` and `batch` modes
+with `n = 600` and 3,000 rows per reference):
+
+| | instructions | segments left |
+|---|---|---|
+| 600 calls of `add` | 4,945,900,574 | 6 |
+| the same 600 references as one `add_many` | 498,253,754 | 2 |
+
+The batch costs a tenth of the instructions: the per-addition directory
+builds and the tail merges between them are gone, and the batch segment
+is large enough that the one merge it needs takes the whole of it in a
+single piece. It also leaves fewer segments, so the searches that follow
+look fewer places for their hashes.
 
 ## A sparser directory for small segments
 

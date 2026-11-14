@@ -18,9 +18,11 @@
 //!
 //! Arguments after the path are query rows, floor (0 for a proportional
 //! one), additions before the first search, and rounds of 40 searches.
-//! `adds` mode profiles `n` single additions. Setting `COMPACT_DELTAS` or
-//! `COMPACT` in the environment compacts after the additions, so a search
-//! can be profiled against many segments.
+//! `adds` mode profiles `n` single additions; `batch` mode profiles the
+//! same `n` references added as one `add_many`. Setting `COMPACT_DELTAS`
+//! or `COMPACT` in the environment compacts after the additions; without
+//! them the additions are what leave many segments behind, and a search
+//! then pays for a lookup in every one.
 
 use std::time::Instant;
 
@@ -81,6 +83,12 @@ fn measured_adds(catalog: &mut Catalog, rows: Vec<Vec<(u32, u32)>>) {
     for r in rows {
         catalog.add(r);
     }
+}
+
+/// The same references as one [`Catalog::add_many`] batch.
+#[inline(never)]
+fn measured_batch(catalog: &mut Catalog, rows: Vec<Vec<(u32, u32)>>) {
+    catalog.add_many(rows);
 }
 
 fn main() {
@@ -168,6 +176,21 @@ fn main() {
                 catalog.segment_count()
             );
         }
-        _ => panic!("mode: build, search or adds"),
+        // batch refs per_ref hashes path n
+        "batch" => {
+            let n = num(5);
+            let mut catalog = Catalog::map_from_trusted(path).unwrap();
+            let rows: Vec<_> = (0..n)
+                .map(|i| rows_of((refs + i) as u32, per_ref, hashes))
+                .collect();
+            let t = Instant::now();
+            measured_batch(&mut catalog, rows);
+            println!(
+                "{n} in one batch: {:.2} ms each, {} segments",
+                t.elapsed().as_secs_f64() * 1e3 / n as f64,
+                catalog.segment_count()
+            );
+        }
+        _ => panic!("mode: build, search, adds or batch"),
     }
 }
