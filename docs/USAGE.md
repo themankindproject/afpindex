@@ -569,7 +569,7 @@ shorter runs.
 | Operation | What it does | Cost |
 |---|---|---|
 | `add(rows)` | Sorts the reference into a segment and merges from the tail while a segment is at least half its predecessor | Usually about a millisecond; occasionally a merge reaches a large segment (209 ms at worst at 60 M postings) |
-| `add_many(references)` | Collects a batch of references, sorts them into one segment and merges from the tail once; returns the ids in order | One sort over the batch's postings plus one merge, so a batch costs a fraction of the same references added one by one |
+| `add_many(references)` | Collects a batch of references, sorts them into one segment and merges from the tail once; returns the ids in order | One sort over the batch's postings plus one merge, so a batch costs a fraction of the same references added one by one: 0.14 ms per reference for a batch of 600 against 0.92 ms for `add` |
 | `remove(id)` | Tombstones the id; returns `false` if unknown or already removed | Constant. The postings stay until a merge or compaction drops them |
 | `compact_deltas()` | Merges every segment but the largest into one, dropping removed references' postings | One pass over the deltas (0.23 s for four deltas of 5.4 M postings) |
 | `compact()` | Merges everything into one segment, dropping removed postings | One pass over everything (0.58 s for 65 M postings); holds the result next to the segments it replaces while it runs |
@@ -601,7 +601,10 @@ removing many references, `compact_deltas` (if they were recent) or
 
 - `segment_count()` grows by about one per doubling of what has been
   added since the last compaction. Compact the deltas when it passes 10
-  or so, or on a timer.
+  or so, or on a timer. On a catalog of 60 M postings, each extra delta
+  segment adds about 10 µs to a search of 800 rows (68.5 µs on one
+  segment against 117.4 µs on six), so set the threshold by what that
+  costs your query rate.
 - `posting_count()` against the postings of live references tells you how
   much removed data is still held.
 - Compact on a clone, not on the catalog that serves (next section).
@@ -893,8 +896,9 @@ damaged since loads without an error, and searches and changes on it
 return wrong candidates or panic; nothing undefined happens. Because the
 file stores each run's multiplicity and the reference range, a trusted
 load reads no posting: it is the checksum and the run check that it
-skips, and on the real catalog that was most of a load. The instruction
-counts are in
+skips, and on the real catalog that is most of a load. A trusted map of
+the real catalog takes 0.14 s against 0.91 s for a full map, and a trusted
+read 0.71 s against 1.62 s for a full read. The instruction counts are in
 [PERFORMANCE.md](PERFORMANCE.md#format-3-what-a-trusted-load-recomputes).
 
 ### Mapping: `map_from`

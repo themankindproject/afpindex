@@ -28,7 +28,9 @@ First release: the engine of the *afpindex* design notes as a library.
   segment; a compaction ran 3 times faster on 8 vCPUs and 4 times on 16.
   Segments are shared (`Arc`), so a clone is cheap. `add_many` takes a
   batch of references and assigns their ids in the order repeated `add`
-  calls would, with one sort over the batch and one merge from the tail.
+  calls would, with one sort over the batch and one merge from the tail;
+  a batch of 600 references is 6.6 times faster per reference than 600
+  `add` calls.
 - `Query::from_pairs`: group a clip's `(hash, time)` rows by hash with a
   per-hash cap on the times kept.
 - `Catalog::search`: the two-pass exact search (branch-free totals pass
@@ -56,7 +58,9 @@ First release: the engine of the *afpindex* design notes as a library.
   are not the ones its runs hold. `read_from_trusted` skips the checksum
   and the order of the runs for files the caller wrote and has checked:
   it still checks the headers, sizes, keys, offsets and id space, and
-  takes the stored multiplicities and range without reading a posting.
+  takes the stored multiplicities and range without reading a posting; a
+  trusted map of the real catalog takes 0.14 s against 0.37 s with
+  format 2.
   Version 2 files are not read (`SnapshotError::UnsupportedVersion`);
   write them out again with this version.
 - `mmap` feature: `Catalog::map_from` and `Segment::map_from` leave the
@@ -92,9 +96,9 @@ First release: the engine of the *afpindex* design notes as a library.
   where a larger one leaves 1.7. A lookup that misses then reaches an
   empty slot in under two probes instead of five, and most lookups in a
   delta segment are misses: on a synthetic catalog of six segments a
-  search took 10 % fewer instructions, and single-segment catalogs are
-  unchanged. The price is 48 bytes of directory per key instead of 20,
-  at most about 50 MB per segment.
+  search takes 10 % fewer instructions and 31 % less time; single-segment
+  catalogs are unchanged; additions are 2 % slower. The price is 48 bytes
+  of directory per key instead of 20, at most about 50 MB per segment.
 - A merge reserves its writer's key, start and multiplicity arrays at the
   sum of its sources' key counts rather than growing them by doubling,
   which took 2.8 % of the instructions off 600 single additions of 3,000

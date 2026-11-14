@@ -21,6 +21,8 @@ by about 10 %, so compare columns within one table only.
 - [Sizing a merge's key arrays once](#sizing-a-merges-key-arrays-once)
 - [Adding a batch](#adding-a-batch)
 - [A sparser directory for small segments](#a-sparser-directory-for-small-segments)
+- [Parallel merge](#parallel-merge)
+- [Trusted loads](#trusted-loads)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -137,6 +139,34 @@ made a load a quarter slower, on runs of 17 postings and of 136, and huge pages
 for the allocator (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) took 4.5 % off
 the additions, which is a deployment choice rather than the crate's.
 
+This version against the one before it, on one AWS `m7i-flex.large` (two
+hardware threads of one Sapphire Rapids core, 8 GiB), `simd` and `mmap`
+features, huge pages on, five alternating rounds of each build, the
+median of each:
+
+| | before | after |
+|---|---|---|
+| bulk build, 60 M postings | 2.45 s | 2.45 s |
+| 2,000 additions of 3,000 rows, total | 2.25 s | 2.30 s |
+| worst addition | 205.3 ms | 204.0 ms |
+| heap after the additions, 5 segments | 0.417 GiB | 0.444 GiB |
+| `compact_deltas` | 0.22 s | 0.22 s |
+| `compact` | 0.57 s | 0.57 s |
+| snapshot size, 65.4 M postings | 0.291 GiB | 0.295 GiB |
+| `write_to` memory | 0.21 s | 0.22 s |
+| `read_from` | 0.33 s | 0.33 s |
+| `read_from_trusted` | 0.23 s | 0.17 s |
+| `map_from` | 0.25 s | 0.25 s |
+| `map_from_trusted` | 0.16 s | 0.09 s |
+| search, floor 16, one thread | 0.099 ms | 0.095 ms |
+
+The trusted loads move because format 3 stores each run's multiplicity, so
+they read no posting at all ([Trusted loads](#trusted-loads)). `write_to`
+writes those multiplicities as well: 0.22 s against 0.21 s, for a snapshot
+1.4 % larger. The additions and the heap after them are the sparser
+directory
+([A sparser directory for small segments](#a-sparser-directory-for-small-segments)).
+
 ## Real data
 
 `examples/replay.rs` runs the crate over the catalog of the *afpindex*
@@ -175,6 +205,15 @@ older build, and 9 % less with `-C target-cpu=native`), so compare columns
 within one table only. The hypervisor exposes no hardware counters on this
 size, so cycle counts come from the laptop. The design notes estimated 50
 to 450 searches per second for a two-vCPU task.
+
+This version and the one before it, on one AWS `m7i-flex.large`, with the
+`simd` and `mmap` features and huge pages on, five alternating rounds in
+each of the four load modes (`read_from`, `map_from` and their trusted
+forms), return the same 71 candidates for the 104 clips, byte for byte, in
+every mode, and searches of the single-segment catalog are unchanged to
+slightly faster. Each clip's best time, summed over the 104 clips, is
+121.2 ms after `read_from` against 122.8 ms before, and 126.5 ms after
+`map_from` against 129.1 ms, within what two runs on this host differ by.
 
 ## Run lines, vector decoding and parallel loads
 
@@ -297,6 +336,10 @@ bins, not in a merge. A batch of 600 references in one `add_many` is
 unchanged (751.6 M against 751.6 M): it merges once, and one merge was
 not where the copies showed.
 
+In wall clock, on the same catalog in five alternating rounds, an addition
+took 0.90 ms per reference before and 0.87 ms after, 3 % less, with the
+directory load held at its old value for every segment in both builds.
+
 ## Adding a batch
 
 `Catalog::add` builds a one-reference segment and merges it from the
@@ -318,6 +361,16 @@ builds and the tail merges between them are gone, and the batch segment
 is large enough that the one merge it needs takes the whole of it in a
 single piece. It also leaves fewer segments, so the searches that follow
 look fewer places for their hashes.
+
+Wall clock on the same catalog, `simd` build, `examples/profile.rs` in
+`adds` and `batch` modes with `n = 600` and 3,000 rows per reference, the
+`add` rows in five alternating rounds and the batch in three, per
+reference added:
+
+| | per reference | segments left |
+|---|---|---|
+| 600 calls of `add` | 0.92 ms | 6 |
+| the same 600 references as one `add_many` | 0.14 ms | 2 |
 
 ## A sparser directory for small segments
 
@@ -349,10 +402,9 @@ read misses rise a little, by the extra directory bytes a lookup now
 walks, and the first-level read misses fall by 8 %, which is the point:
 fewer probes per miss. The 450 k-key segment is neutral, as intended.
 
-The three single-segment sizes the audit named, measured the same way
-before and after, are neutral too (a catalog of one small segment gains
-little, since its hashes are there to be found, and pays for a larger
-directory):
+Three catalogs of one small segment, where the sparser directory can only
+cost (the hashes are there to be found and the directory is larger),
+measured the same way before and after, are neutral too:
 
 | catalog (keys) | instructions before | instructions after | D1 read misses before / after | LLd read misses before / after |
 |---|---|---|---|---|
@@ -362,10 +414,48 @@ directory):
 
 The 400 k-key catalog's directory grows past the laptop's 8 MiB last
 level cache, which is the 12 % more last-level read misses; it costs
-nothing measurable in instructions. On the laptop, where wall clock is
-noisy (see the note at the top), the three single-segment sizes were not
-slower by more than that noise in any round, so the threshold stayed at
-2<sup>20</sup>.
+nothing measurable in instructions.
+
+Wall clock, on one AWS `m7i-flex.large` (two hardware threads of one
+Sapphire Rapids core), `simd` build, `examples/profile.rs` `search` mode,
+queries of 800 rows, 60 rounds of 40 queries, five alternating rounds of
+each build. On the synthetic catalog of 60 M postings
+(`build 20000 3000 3600000`), with delta segments from `add` calls of
+3,000 rows each after the load:
+
+| catalog | before | after |
+|---|---|---|
+| 1 segment, no additions | 71.4 µs | 68.5 µs |
+| 2 segments, 1 addition | 85.9 µs | 75.4 µs |
+| 6 segments, 300 additions | 169.7 µs | 117.4 µs |
+
+That is 4 % faster on one segment, 12 % on two and 31 % on six. A search
+pays about 20 µs per extra delta segment before and about 10 µs after
+((169.7 − 71.4) / 5 and (117.4 − 68.5) / 5).
+
+The three single-segment sizes in wall clock, same harness and host, five
+alternating rounds of each build:
+
+| catalog (keys) | before | after |
+|---|---|---|
+| 40 k keys, 600 k postings (`build 200 3000 40000`) | 404.4 µs | 404.6 µs |
+| 400 k keys, 6 M postings (`build 2000 3000 400000`) | 77.1 µs | 76.8 µs |
+| 900 k keys, 15 M postings (`build 5000 3000 900000`) | 69.9 µs | 65.4 µs |
+
+None is slower, so the threshold stayed at 2<sup>20</sup>. The 400 k-key
+directory, 19 MB, is larger than the laptop's 8 MiB last-level cache,
+which is where the laptop's extra last-level misses come from; on this
+host it costs nothing.
+
+The cost is on the other side. With the directory at the old load an
+addition took 0.87 ms per reference; with the sparser one it takes
+0.92 ms, 6 % slower, because every one-reference segment and every tail
+merge now allocates and fills four slots per key instead of five slots
+per three keys. The heap after the additions is 0.027 GiB higher for the
+four delta segments (0.417 GiB to 0.444 GiB), and additions are 2 %
+slower than before this version on balance (2.25 s to 2.30 s for the
+2,000 additions). In return the searches over those segments are 12 to
+31 % faster.
 
 ## Parallel merge
 
@@ -414,7 +504,7 @@ order check of every run, and read the references alone for each run's
 multiplicity. On the AWS `m7i-flex.large`, huge pages on, `simd` build,
 each load in a fresh process with the file in the page cache, five
 alternating rounds on the real catalog and three on the synthetic one
-of 65 M postings:
+of 65 M postings (format 2, on another host of that instance type):
 
 | | real, full | real, trusted | real, no pass | synthetic, full | synthetic, trusted |
 |---|---|---|---|---|---|
@@ -462,6 +552,31 @@ multiplicities, and building the directory, which is now most of a
 trusted map. A full load costs 0.5 to 0.6 % more, for the multiplicities
 it reads and the comparison of the stored values with what its walk
 finds; that is the price of the format checking what it stores.
+
+Wall clock, alternating rounds on one AWS `m7i-flex.large` with `simd`
+and `mmap`, huge pages on, each load in a fresh process with the file in
+the page cache, five rounds of each build:
+
+| real catalog, 2.04 GiB | before, format 2 | after, format 3 |
+|---|---|---|
+| `read_from` | 1.67 s | 1.62 s |
+| `map_from` | 0.89 s | 0.91 s |
+| `read_from_trusted` | 0.93 s | 0.71 s |
+| `map_from_trusted` | 0.37 s | 0.14 s |
+
+| synthetic catalog, 0.29 GiB | before, format 2 | after, format 3 |
+|---|---|---|
+| `read_from` | 0.33 s | 0.33 s |
+| `map_from` | 0.25 s | 0.25 s |
+| `read_from_trusted` | 0.23 s | 0.17 s |
+| `map_from_trusted` | 0.16 s | 0.09 s |
+
+Full loads are unchanged, a trusted map of the real catalog takes 0.14 s
+instead of 0.37 s and a trusted read 0.71 s instead of 0.93 s. What is
+left of the trusted map is faulting in the file's pages, copying the
+keys, offsets and multiplicities, and building the directory: the 0.14 s
+is close to the 0.13 s the "no pass" column of the older table predicted
+for a trusted map that reads no posting.
 
 ## Allocators and huge pages
 
