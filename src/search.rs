@@ -254,7 +254,8 @@ struct RunLoc {
 /// bit per id of the largest catalog searched), plus the run, group, vote
 /// and bin buffers.
 /// After the first search on a catalog, [`Catalog::search_with`] on a
-/// query of similar size allocates nothing; [`Catalog::search`] also
+/// query of similar size allocates nothing but the small vector of
+/// segment handles it collects on every search; [`Catalog::search`] also
 /// allocates its result. One scratch serves any number of catalogs.
 /// Searches leave it clean, including on an error, and so does a panic
 /// inside a visitor.

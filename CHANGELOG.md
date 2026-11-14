@@ -81,11 +81,12 @@ First release: the engine of the *afpindex* design notes as a library.
   each block of counters with a bitwise OR, which vectorises on any
   x86-64 CPU, rather than a maximum, which needs SSE4.1.
 - A directory of fewer than 2<sup>20</sup> keys leaves four slots per key
-  instead of the 1.7 of a larger one, which is what most lookups in a
-  delta segment, all of them misses, spend their time on: on a synthetic
-  catalog of six segments a search took 10 % fewer instructions, and
-  single-segment catalogs are unchanged. The price is 48 bytes of
-  directory per key instead of 20, at most about 50 MB per segment.
+  where a larger one leaves 1.7. A lookup that misses then reaches an
+  empty slot in under two probes instead of five, and most lookups in a
+  delta segment are misses: on a synthetic catalog of six segments a
+  search took 10 % fewer instructions, and single-segment catalogs are
+  unchanged. The price is 48 bytes of directory per key instead of 20,
+  at most about 50 MB per segment.
 - A merge reserves its writer's key, start and multiplicity arrays at the
   sum of its sources' key counts rather than growing them by doubling,
   which took 2.8 % of the instructions off 600 single additions of 3,000
