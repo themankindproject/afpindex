@@ -1323,8 +1323,8 @@ mod tests {
         let (mut survivors, mut survivor_totals) = (Vec::new(), Vec::new());
         cat.take_survivors(&mut totals, 20, &mut survivors, &mut survivor_totals)
             .expect("no counter overflows");
-        assert!(survivors.is_empty());
-        assert!(survivor_totals.is_empty());
+        assert_eq!(survivors, Vec::<u32>::new());
+        assert_eq!(survivor_totals, Vec::<u32>::new());
         assert_eq!(totals, [0, 0]);
 
         // The same block with one counter that reaches the floor keeps it.
