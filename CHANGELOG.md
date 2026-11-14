@@ -75,7 +75,8 @@ First release: the engine of the *afpindex* design notes as a library.
   stream, answers the fanout test from a ring of the last 64 references,
   adds without saturation when no counter can overflow, and skips the
   fanout test on runs that cannot reach it; the survivor scan reduces
-  counter blocks on vector instructions.
+  each block of counters with a bitwise OR, which vectorises on any
+  x86-64 CPU, rather than a maximum, which needs SSE4.1.
 - `no_std + alloc` core with no `unsafe` code by default; `libm` is the
   only dependency. Minimum Rust version 1.87.
 - Examples: `quickstart` (build, search, add, remove), `bench`

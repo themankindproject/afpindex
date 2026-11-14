@@ -332,8 +332,9 @@ const LOOKUP_BATCH: usize = 32;
 const RUN_BATCH: usize = 16;
 /// Vote groups per batch of the histogram pass, loaded one batch ahead.
 const GROUP_BATCH: usize = 32;
-/// Counters per block of the survivor scan; a block is reduced to its
-/// maximum on vector instructions, and all-zero blocks are skipped.
+/// Counters per block of the survivor scan; a block is reduced with a
+/// bitwise OR, which a 32-bit lane does without SSE4.1, and all-zero
+/// blocks are skipped.
 const SCAN_BLOCK: usize = 64;
 /// Fanouts up to this answer the fanout test from a fixed ring of the
 /// last references instead of a second read of the run.
@@ -965,8 +966,9 @@ impl Catalog {
     /// Move the survivors out of the counters: the references that were
     /// touched, are live and reach `floor`, in ascending order, each with
     /// its total. The scan also resets the counters, so the scratch is
-    /// clean from here on. A block's maximum decides whether it holds
-    /// anything to look at.
+    /// clean from here on. A block's bitwise OR decides whether it holds
+    /// anything to look at: every counter is at most the OR of its block,
+    /// and the OR is zero exactly when the block is all zero.
     fn take_survivors(
         &self,
         totals: &mut [u32],
@@ -978,11 +980,11 @@ impl Catalog {
         survivor_totals.clear();
         let mut overflow = None;
         for (b, block) in totals.chunks_mut(SCAN_BLOCK).enumerate() {
-            let max = block.iter().fold(0u32, |m, &t| m.max(t));
-            if max == 0 {
+            let any = block.iter().fold(0u32, |m, &t| m | t);
+            if any == 0 {
                 continue;
             }
-            if max >= floor {
+            if any >= floor {
                 for (i, &t) in block.iter().enumerate() {
                     if t >= floor {
                         let r = (b * SCAN_BLOCK + i) as u32;
@@ -1307,5 +1309,29 @@ mod tests {
         assert!(alloc::format!("{s:?}").contains("reference_capacity: 100"));
         s.shrink_to_fit();
         assert_eq!(s.heap_bytes(), 0);
+    }
+
+    /// The block filter is an OR, so a block can pass it with no counter at
+    /// the floor: 16 and 4 OR to 20 while neither reaches it. Nothing comes
+    /// out, and the counters are still reset.
+    #[test]
+    fn block_or_at_the_floor_without_a_survivor() {
+        let rows = vec![Posting::new(1, 0, 0), Posting::new(1, 1, 0)];
+        let cat = Catalog::from_segment(Segment::from_postings(rows));
+        let mut totals = vec![16u32, 4];
+        let (mut survivors, mut survivor_totals) = (Vec::new(), Vec::new());
+        cat.take_survivors(&mut totals, 20, &mut survivors, &mut survivor_totals)
+            .expect("no counter overflows");
+        assert!(survivors.is_empty());
+        assert!(survivor_totals.is_empty());
+        assert_eq!(totals, [0, 0]);
+
+        // The same block with one counter that reaches the floor keeps it.
+        let mut totals = vec![20u32, 4];
+        cat.take_survivors(&mut totals, 20, &mut survivors, &mut survivor_totals)
+            .expect("no counter overflows");
+        assert_eq!(survivors, [0]);
+        assert_eq!(survivor_totals, [20]);
+        assert_eq!(totals, [0, 0]);
     }
 }

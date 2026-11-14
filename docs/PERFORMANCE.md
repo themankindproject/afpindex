@@ -63,8 +63,8 @@ read, and uses plain adds whenever no counter can overflow; a run where
 no reference has as many postings as the fanout (every run but 2 % of
 postings on the real catalog) skips the fanout test in both passes, which
 took a third off the instructions per search on the real clips; the
-survivor scan reduces each block of counters to its maximum on vector
-instructions; and the
+survivor scan reduces each block of counters with a bitwise OR, which
+vectorises on any x86-64 CPU; and the
 histogram pass finds a survivor's group in a run by binary search rather
 than a walk. On the same machine the version without those arrangements
 took 0.30 ms at the median and 6,700 searches per second on four threads:
