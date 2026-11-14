@@ -23,16 +23,14 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::thread;
 
 use super::{
     MAX_POSTINGS, REGION_SLOTS, Segment, Slot, Writer, build_table, merge_sources, place, postings,
     slot_of, widths,
 };
 use crate::packed::Packed;
+use crate::par::{lock, run_tasks, slots, threads};
 
 /// Postings below which a merge runs on the calling thread: below this,
 /// starting threads costs more than it saves.
@@ -47,49 +45,6 @@ const SCAN_SLOTS: usize = 1 << 18;
 
 /// The joined arrays are sized to the inputs, which no merge outgrows.
 const ROOM: &str = "room for every piece";
-
-/// Hardware threads, or 1 if the platform does not say.
-fn threads() -> usize {
-    thread::available_parallelism().map_or(1, NonZeroUsize::get)
-}
-
-/// Run `task(i)` for every `i` in `0..tasks` on up to `threads` threads,
-/// each taking the next task until none are left. The calling thread
-/// works too, so a thread that cannot be spawned costs nothing but
-/// parallelism.
-fn run_tasks(threads: usize, tasks: usize, task: impl Fn(usize) + Sync) {
-    let next = AtomicUsize::new(0);
-    let worker = || {
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= tasks {
-                break;
-            }
-            task(i);
-        }
-    };
-    if threads <= 1 || tasks <= 1 {
-        worker();
-        return;
-    }
-    thread::scope(|s| {
-        for _ in 1..threads.min(tasks) {
-            // A failed spawn leaves its share to the others.
-            // The closure captures only references, so it is `Copy`.
-            let _ = thread::Builder::new().spawn_scoped(s, worker);
-        }
-        worker();
-    });
-}
-
-/// A slot per task for what it hands back.
-fn slots<T>(n: usize) -> Vec<Mutex<Option<T>>> {
-    (0..n).map(|_| Mutex::new(None)).collect()
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// [`Segment::merge_all`] on every core, or `None` for a merge too small
 /// to be worth it or a single core.

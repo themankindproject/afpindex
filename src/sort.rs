@@ -182,25 +182,29 @@ fn sort_buckets(rows: &mut [Posting], start: &[usize], shift: u32) {
 
 #[cfg(feature = "std")]
 mod parallel {
-    use std::sync::{Mutex, PoisonError};
-    use std::thread;
+    use alloc::vec::Vec;
+    use std::sync::Mutex;
 
     use super::Posting;
+    use crate::par::{lock, run_tasks, threads};
+
+    /// A range of the buckets to sort, and the bounds of its buckets.
+    type Piece<'a> = (&'a mut [Posting], &'a [usize]);
 
     /// Sort the buckets of `rows` on every core: the buckets are cut into
     /// contiguous ranges holding about equal shares of the rows, and each
-    /// thread takes ranges from a shared queue until none are left. The
-    /// calling thread works too, so a thread that cannot be spawned costs
-    /// nothing but parallelism.
+    /// range is a task of the shared worker pool. The calling thread works
+    /// too, so a thread that cannot be spawned costs nothing but
+    /// parallelism.
     pub(super) fn sort_buckets(rows: &mut [Posting], start: &[usize], shift: u32) {
-        let threads = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let threads = threads();
         if threads <= 1 {
             super::sort_buckets(rows, start, shift);
             return;
         }
         let total = rows.len();
         let pieces = threads * 4;
-        let mut items: Vec<(&mut [Posting], &[usize])> = Vec::with_capacity(pieces);
+        let mut items: Vec<Piece<'_>> = Vec::with_capacity(pieces);
         let mut rest = rows;
         let mut b = 0;
         for piece in 1..=pieces {
@@ -220,23 +224,19 @@ mod parallel {
             items.push((chunk, &start[b..=b_end]));
             b = b_end;
         }
-        let queue = Mutex::new(items);
-        let worker = || {
-            loop {
-                let item = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
-                match item {
-                    Some((chunk, bounds)) => super::sort_buckets(chunk, bounds, shift),
-                    None => break,
-                }
-            }
-        };
-        thread::scope(|s| {
-            for _ in 1..threads {
-                // A failed spawn leaves its share to the others (the
-                // closure captures only references, so it is `Copy`).
-                let _ = thread::Builder::new().spawn_scoped(s, worker);
-            }
-            worker();
+        // One slot per piece, which the task that takes it empties, so the
+        // pool hands every piece to exactly one task. Each piece carries
+        // its own range of the rows, so the order the tasks take them in
+        // does not matter.
+        let slots: Vec<Mutex<Option<Piece<'_>>>> = items
+            .into_iter()
+            .map(|item| Mutex::new(Some(item)))
+            .collect();
+        run_tasks(threads, slots.len(), |piece| {
+            let (chunk, bounds) = lock(&slots[piece])
+                .take()
+                .expect("each piece is sorted once");
+            super::sort_buckets(chunk, bounds, shift);
         });
     }
 }

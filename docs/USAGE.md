@@ -652,6 +652,52 @@ threads answered 779 searches per second on the real catalog. Separate
 cores scale further: four laptop cores answered 33,000–34,000 searches per
 second on the synthetic catalog.
 
+### The threads a build, merge or load takes
+
+A search uses the thread that calls it, but the passes that have work to
+spread do not: a segment's sort, a merge, a large directory's fill and a
+large segment's check at load each hand their tasks to up to as many
+threads as the machine has. A server that shares its host with other work,
+or that would rather its background compactions did not take the cores its
+searches run on, can cap that process-wide:
+
+```rust
+use afpindex::{Catalog, max_threads, set_max_threads};
+
+/// Cap the passes of this process once, before it serves: a host with 8
+/// hardware threads can leave a core for something else out of process,
+/// or run its compactions on the calling thread alone.
+pub fn start(cap: usize) {
+    set_max_threads(cap); // 0: no cap, the machine's hardware threads
+    assert!(max_threads() >= 1);
+}
+
+/// A compaction on a copy, whatever cap the process runs under.
+pub fn compact_on_a_copy(catalog: &Catalog) -> Catalog {
+    let mut next = catalog.clone(); // shares the segments
+    next.compact();
+    next
+}
+```
+
+`set_max_threads(n)` caps the threads a pass may take at `n`, and `0`
+removes the cap; `max_threads()` reports what a pass would take now, which
+is the machine's hardware parallelism unless a cap is set below it. The
+setting is process-wide, and a pass reads it when it starts rather than
+once at startup: a thread that caps one background compaction and then
+removes the cap makes every other thread's compactions and loads run
+single-threaded while the cap holds. Set it once, before work starts; a
+process that wants different caps for different kinds of work has to
+serialize the changes itself. `set_max_threads(1)` keeps every sort,
+merge, directory fill and load on the calling thread.
+
+The cap changes only how many threads a pass takes, never what it
+computes: the same segment, the same loaded catalog and the same
+candidates come out under any cap. A pass too small to be worth threads,
+and a machine with one hardware thread, run on the calling thread
+whichever cap is set. Searches are not affected: they use the thread that
+calls them ([section 11](#11-threads-and-serving)).
+
 ### Changing a catalog while it serves
 
 Mutations take `&mut self`, and a clone shares its segments (it costs
@@ -1049,7 +1095,7 @@ source rows, or fall back to the previous file.
 
 | Feature | Default | Adds |
 |---|---|---|
-| `std` | yes | Snapshots (`write_to`, `read_from`, `read_from_trusted`), `std::error::Error` for `SnapshotError`, sorting the build's buckets, merging and checking loads on every core |
+| `std` | yes | Snapshots (`write_to`, `read_from`, `read_from_trusted`), `std::error::Error` for `SnapshotError`, sorting the build's buckets, merging, filling directories and checking loads on every core, and `set_max_threads` / `max_threads` to cap those threads |
 | `mmap` | no | `Catalog::map_from`, `map_from_trusted` and the same on `Segment` (implies `std`; adds `memmap2`). The mapping call is the feature's one `unsafe` block |
 | `simd` | no | AVX2 decoding of packed postings (implies `std`) |
 
@@ -1122,7 +1168,9 @@ copies an array that grows where glibc remaps its pages.
 
 - **Build with `simd`** on x86-64 hosts (`features = ["mmap", "simd"]`).
 - **One `Scratch` per worker thread**, created once; as many search
-  threads as hardware threads.
+  threads as hardware threads. If a compaction or a load shares the host
+  with them, cap the threads it takes with `set_max_threads`
+  ([section 11](#the-threads-a-build-merge-or-load-takes)).
 - **Load with `map_from`** for fast restarts and shared pages across
   processes; `read_from` for a catalog that changes heavily. Once a
   snapshot has passed a full load, `map_from_trusted` maps it again in

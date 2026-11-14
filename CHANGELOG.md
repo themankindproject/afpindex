@@ -66,6 +66,11 @@ First release: the engine of the *afpindex* design notes as a library.
   every run at load decode packed values eight at a time. The kernel is
   safe code; entering the code compiled for AVX2 is the feature's one
   `unsafe` block. A no-op on other targets and CPUs.
+- `set_max_threads` and `max_threads` (`std`): one process-wide cap on
+  the threads a sort, merge, directory fill or load takes, where 0 removes
+  the cap and 1 keeps every pass on the calling thread. A server can then
+  keep a background compaction or a load off the cores its searches run
+  on. What a pass computes does not depend on the cap.
 - In-place radix sort on the hash when a segment is built from rows,
   whose swaps do not wait for one another and which skips the hash bits a
   bucket's rows agree on, so a build holds no buffer beyond the rows and

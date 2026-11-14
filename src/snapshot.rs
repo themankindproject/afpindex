@@ -33,14 +33,12 @@
 //! Flags and reserved fields are written as zero and ignored on read.
 
 use std::io::{Read, Write};
-use std::num::NonZeroUsize;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::thread;
 use std::vec::Vec;
 
 use crate::packed::Packed;
+use crate::par::{lock, run_tasks, slots, threads};
 use crate::segment::MAX_POSTINGS;
 use crate::simd::{self, Decoder, LANES, Pass};
 use crate::{Catalog, Segment, SnapshotError};
@@ -508,10 +506,11 @@ type Walk = Result<(Vec<u8>, Ids), SnapshotError>;
 ///
 /// A large segment's runs are cut into pieces of about equal postings, a
 /// few per core so that a slow piece does not hold the rest up, and every
-/// thread takes the next piece until none are left; `side` is the first
-/// piece taken. The calling thread works too, so a thread that cannot be
-/// spawned costs nothing but parallelism. A small segment, or a single
-/// core, does it all in order on the calling thread.
+/// thread takes the next task until none are left: task 0 is `side`, task
+/// `i` is piece `i - 1`, so the checksum starts as soon as a thread is
+/// free rather than waiting for a walk. The calling thread works too, so a
+/// thread that cannot be spawned costs nothing but parallelism. A small
+/// segment, or a single core, does it all in order on the calling thread.
 fn walk_runs<T: Send, P: Pass<Out = Walk>>(
     offsets: &[u64],
     piece: impl Fn(RangeInclusive<usize>) -> P + Sync,
@@ -519,7 +518,7 @@ fn walk_runs<T: Send, P: Pass<Out = Walk>>(
 ) -> (T, Walk) {
     let n_keys = offsets.len() - 1;
     let n_post = offsets[n_keys];
-    let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let threads = threads();
     if threads <= 1 || n_post < PARALLEL_MIN as u64 {
         let out = side();
         return (out, simd::run(piece(0..=n_keys)));
@@ -538,40 +537,21 @@ fn walk_runs<T: Send, P: Pass<Out = Walk>>(
         bounds.push(n_keys);
     }
     let n = bounds.len() - 1;
-    let next = AtomicUsize::new(0);
     let side = Mutex::new(Some(side));
     let side_out = Mutex::new(None);
-    let walks: Vec<Mutex<Option<Walk>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    let worker = || {
-        loop {
-            match next.fetch_add(1, Ordering::Relaxed) {
-                0 => {
-                    let side = side.lock().unwrap_or_else(PoisonError::into_inner).take();
-                    if let Some(side) = side {
-                        let out = side();
-                        *side_out.lock().unwrap_or_else(PoisonError::into_inner) = Some(out);
-                    }
-                }
-                i if i <= n => {
-                    let walk = simd::run(piece(bounds[i - 1]..=bounds[i]));
-                    *walks[i - 1].lock().unwrap_or_else(PoisonError::into_inner) = Some(walk);
-                }
-                _ => break,
-            }
+    let walks = slots::<Walk>(n);
+    run_tasks(threads, n + 1, |task| {
+        if task == 0 {
+            let side = lock(&side).take().expect("task 0 is `side`");
+            *lock(&side_out) = Some(side());
+        } else {
+            *lock(&walks[task - 1]) = Some(simd::run(piece(bounds[task - 1]..=bounds[task])));
         }
-    };
-    thread::scope(|s| {
-        for _ in 1..threads {
-            // A failed spawn leaves its share to the others (the closure
-            // captures only references, so it is `Copy`).
-            let _ = thread::Builder::new().spawn_scoped(s, worker);
-        }
-        worker();
     });
     let out = side_out
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner)
-        .expect("the first piece taken is `side`");
+        .expect("task 0 ran `side`");
     let mut mults = Vec::with_capacity(n_keys);
     let mut ids: Ids = None;
     for walk in walks {

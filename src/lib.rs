@@ -102,6 +102,8 @@ extern crate alloc;
 mod catalog;
 mod error;
 mod packed;
+#[cfg(feature = "std")]
+mod par;
 mod posting;
 mod query;
 mod search;
@@ -122,6 +124,8 @@ pub use catalog::{Catalog, CatalogBuilder};
 pub use error::SearchError;
 #[cfg(feature = "std")]
 pub use error::SnapshotError;
+#[cfg(feature = "std")]
+pub use par::{max_threads, set_max_threads};
 pub use posting::Posting;
 pub use query::Query;
 pub use search::{Bin, Candidate, NoiseStats, Scratch, SearchOptions, Survivor, vote_floor};
