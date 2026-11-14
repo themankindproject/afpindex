@@ -1,20 +1,26 @@
 //! Merges that write straight into a snapshot file (`std`).
 //!
 //! [`merge_to_file`] joins segments the way [`Segment::merge_all`] does and
-//! writes the result as a segment snapshot (format 3, see
-//! [`crate::snapshot`]) without ever holding the result in memory. The
-//! merge is cut into pieces by hash, as the merge on every core cuts it
-//! ([`Plan`]): a counting pass over the pieces gives the key count, the
-//! posting count and the reference range of the result, which fix the
-//! header and the offset of every section of the file, and a second pass
-//! over the same pieces appends each to the file in piece order. The bytes
-//! are the ones [`Segment::write_to`] writes for the merged segment.
+//! writes the result as a segment snapshot (see [`crate::snapshot`])
+//! without ever holding the result in memory. The merge is cut into pieces
+//! by hash, as the merge on every core cuts it ([`Plan`]), and each piece
+//! is appended to the file in piece order as soon as the pieces before it
+//! are. The bytes are the ones [`Segment::write_to`] writes for the merged
+//! segment.
 //!
-//! The file is written by three handles: the header, the keys, the offsets
-//! and the multiplicities through one, and each packed array through its
-//! own, positioned at its section. A piece rarely ends on a whole byte, so
-//! the byte two pieces share is put together in memory as the pieces
-//! arrive and every other byte has a single writer.
+//! One pass is enough because of how a snapshot is laid out: the two
+//! packed arrays come first, each with a checksum of its own, and
+//! everything that is known only at the end (the counts in the header, the
+//! keys, the offsets, the multiplicities) is small and written last. The
+//! references are appended right behind the header through one handle and
+//! the times through another, which starts where the times of a merge that
+//! drops nothing belong. Most merges drop nothing; when one did (removed
+//! references, repeated postings), the times are moved down to where the
+//! references ended, which is the one part of the file written twice.
+//!
+//! A piece rarely ends on a whole byte, so the byte two pieces share is
+//! put together in memory as the pieces arrive and every other byte has a
+//! single writer.
 //!
 //! Memory is bounded by what a piece is worth and by what the result holds
 //! per distinct hash (its keys, the start of each run and its
@@ -33,9 +39,7 @@ use super::parallel::{Parts, Plan};
 use super::{MAX_POSTINGS, Segment, postings, widths};
 use crate::packed::Packed;
 use crate::par::{lock, run_tasks, slots};
-use crate::snapshot::{
-    Checksum, HEADER, SEGMENT_MAGIC, checksum_of_segment, pad_len, range_word, write_header,
-};
+use crate::snapshot::{ByteSum, HEADER, Head, index_sum, pad_len, write_index};
 
 /// Postings of input a piece holds at most: a piece in flight is tens of
 /// megabytes however large the merge is.
@@ -48,8 +52,8 @@ const WINDOW: usize = 2;
 /// Bytes gathered in a buffer before they go to a handle.
 const BUFFER: usize = 1 << 18;
 
-/// Bytes read back from the file per call while it is summed.
-const CHUNK: usize = 1 << 18;
+/// Bytes moved per read when the times are moved down.
+const MOVE: usize = 1 << 20;
 
 /// What a merge wrote.
 #[derive(Clone, Copy, Debug)]
@@ -96,47 +100,20 @@ impl Default for Settings {
 ///
 /// # Errors
 ///
-/// Any error of creating, writing, reading back or syncing the file, and an
-/// error rather than the panic [`Segment::merge_all`] raises when the result
-/// would hold 2<sup>40</sup> postings.
+/// Any error of creating, writing or syncing the file, and an error rather
+/// than the panic [`Segment::merge_all`] raises when the result would hold
+/// 2<sup>40</sup> postings.
 pub(crate) fn merge_to_file<F: Fn(u32) -> bool + Sync>(
     sides: &[(&Segment, Option<&F>)],
     path: &Path,
     settings: Settings,
 ) -> std::io::Result<Written> {
-    let widths = widths(sides);
-    let pieces = postings(sides).div_ceil(settings.piece.max(1)).max(1);
+    // The result holds at most the postings of its sources.
+    let most = postings(sides);
+    let pieces = most.div_ceil(settings.piece.max(1)).max(1);
     let plan = Plan::new(sides, pieces);
-    // The counting pass fixes the header and where every section starts,
-    // and each piece is dropped as soon as it is counted: four numbers
-    // survive the whole merge.
-    let counts = merge_pieces(&plan, settings.threads, count_of);
-    let mut total = Count {
-        keys: counts.iter().map(|one| one.keys).sum(),
-        postings: 0,
-        ids: None,
-    };
-    for one in &counts {
-        total.postings += one.postings;
-        total.ids = ids_of(total.ids, one.ids);
-    }
-    if total.postings >= MAX_POSTINGS {
-        return Err(std::io::Error::other(
-            "the merged segment holds 2^40 postings or more",
-        ));
-    }
-    // The section sizes are counts as the target's `usize` holds them: a
-    // 32-bit target cannot lay out a file this large, mapped inputs or no.
-    for count in [total.keys, total.postings] {
-        if usize::try_from(count).is_err() {
-            return Err(std::io::Error::other(
-                "the merged segment is larger than this target can address",
-            ));
-        }
-    }
-    let layout = Layout::new(widths, total);
     let guard = RemoveOnFailure::new(path);
-    let written = write_pieces(&plan, path, &layout, widths, settings)?;
+    let written = write_pieces(&plan, path, widths(sides), most, settings)?;
     guard.keep();
     Ok(written)
 }
@@ -149,16 +126,8 @@ fn ids_of(all: Option<(u32, u32)>, one: Option<(u32, u32)>) -> Option<(u32, u32)
     }
 }
 
-/// What one piece adds to the result.
-#[derive(Clone, Copy, Debug)]
-struct Count {
-    keys: u64,
-    postings: u64,
-    ids: Option<(u32, u32)>,
-}
-
-/// The keys, the postings and the reference range of one merged piece.
-fn count_of((keys, starts, _, refs, _): &Parts) -> Count {
+/// The reference range of one merged piece.
+fn range_of((_, starts, _, refs, _): &Parts) -> Option<(u32, u32)> {
     let postings = refs.len();
     let mut ids: Option<(u32, u32)> = None;
     for (k, &start) in starts.iter().enumerate() {
@@ -170,95 +139,13 @@ fn count_of((keys, starts, _, refs, _): &Parts) -> Count {
             ids = ids_of(ids, Some((refs.get(lo), refs.get(hi - 1))));
         }
     }
-    Count {
-        keys: keys.len() as u64,
-        postings: postings as u64,
-        ids,
-    }
+    ids
 }
 
-/// Deal the runs out to the pieces, merge every piece on up to `threads`
-/// threads, and collect what `each` makes of each piece in piece order.
-fn merge_pieces<F, T>(
-    plan: &Plan<'_, F>,
-    threads: usize,
-    each: impl Fn(&Parts) -> T + Sync,
-) -> Vec<T>
-where
-    F: Fn(u32) -> bool + Sync,
-    T: Send,
-{
-    plan.deal(threads);
-    let out = slots::<T>(plan.pieces);
-    run_tasks(threads, plan.pieces, |piece| {
-        let parts = plan.merge(piece);
-        *lock(&out[piece]) = Some(each(&parts));
-    });
-    out.into_iter()
-        .map(|slot| {
-            slot.into_inner()
-                .unwrap_or_else(PoisonError::into_inner)
-                .expect("every piece is merged")
-        })
-        .collect()
-}
-
-/// Where every section of the file starts, from the widths and the counts
-/// of the result: the layout [`Segment::write_to`] gives a segment of that
-/// shape.
-struct Layout {
-    keys: u64,
-    postings: u64,
-    ids: Option<(u32, u32)>,
-    keys_at: u64,
-    mults_at: u64,
-    refs_at: u64,
-    refs_len: u64,
-    times_at: u64,
-    times_len: u64,
-    trailer_at: u64,
-    bytes: u64,
-}
-
-impl Layout {
-    fn new((ref_bits, time_bits): (u32, u32), total: Count) -> Self {
-        let postings = total.postings;
-        let keys_at = HEADER as u64;
-        let offsets_at = (keys_at + 4 * total.keys).next_multiple_of(8);
-        let mults_at = offsets_at + 8 * (total.keys + 1);
-        let refs_at = (mults_at + total.keys).next_multiple_of(8);
-        // Both counts fit the address space: `merge_to_file` refuses them
-        // otherwise.
-        let n = usize::try_from(postings).unwrap_or(usize::MAX);
-        let refs_len = Packed::data_len(n, ref_bits) as u64;
-        let times_at = (refs_at + refs_len).next_multiple_of(8);
-        let times_len = Packed::data_len(n, time_bits) as u64;
-        let trailer_at = (times_at + times_len).next_multiple_of(8);
-        Self {
-            keys: total.keys,
-            postings,
-            ids: total.ids,
-            keys_at,
-            mults_at,
-            refs_at,
-            refs_len,
-            times_at,
-            times_len,
-            trailer_at,
-            bytes: trailer_at + 8,
-        }
-    }
-
-    /// The header's reference range word, zero without postings.
-    fn range(&self) -> (u32, u32) {
-        self.ids.unwrap_or((0, 0))
-    }
-
-    /// The checksum of the header words: what the file's trailer starts
-    /// from.
-    fn checksum(&self, widths: (u32, u32)) -> Checksum {
-        checksum_of_segment(widths, self.keys, self.postings, self.range())
-    }
+/// Where the section after a packed array of `n` values of `bits` starts,
+/// when the array starts at `at`.
+fn after_packed(at: u64, n: usize, bits: u32) -> u64 {
+    (at + Packed::data_len(n, bits) as u64).next_multiple_of(8)
 }
 
 /// A path written here, removed again unless the merge finished.
@@ -285,38 +172,33 @@ impl Drop for RemoveOnFailure<'_> {
     }
 }
 
-/// The writing pass: merge every piece again and append it to the file, in
-/// piece order, then write the collected sections and the checksum.
+/// Merge every piece and append it to the file in piece order, then write
+/// what only the whole merge knows: the keys, the offsets, the
+/// multiplicities, the checksums and the header.
 fn write_pieces<F: Fn(u32) -> bool + Sync>(
     plan: &Plan<'_, F>,
     path: &Path,
-    layout: &Layout,
-    widths: (u32, u32),
+    (ref_bits, time_bits): (u32, u32),
+    most: usize,
     settings: Settings,
 ) -> std::io::Result<Written> {
     let mut head = Handle::create(path, settings.fail_after)?;
-    // Each packed array is written through a handle of its own, positioned
-    // at its section, so that both are appended in piece order at once.
-    let refs = Handle::open_at(path, layout.refs_at, settings.fail_after)?;
-    let times = Handle::open_at(path, layout.times_at, settings.fail_after)?;
-    write_header(
-        &mut head,
-        SEGMENT_MAGIC,
-        widths,
-        layout.keys,
-        layout.postings,
-    )?;
-    head.put(&range_word(layout.range()).to_le_bytes())?;
-    let keys = usize::try_from(layout.keys)
-        .map_err(|_| std::io::Error::other("the result has more keys than the address space"))?;
+    // Each packed array is written through a handle of its own, so that
+    // both are appended in piece order at once. The times start where
+    // they belong if no posting is dropped.
+    let refs_at = HEADER as u64;
+    let room = after_packed(refs_at, most, ref_bits);
+    let refs = Handle::open_at(path, refs_at, settings.fail_after)?;
+    let times = Handle::open_at(path, room, settings.fail_after)?;
     let writer = Writer {
         next: 0,
         postings: 0,
-        keys: Vec::with_capacity(keys),
-        starts: Vec::with_capacity(keys.saturating_add(1)),
-        mults: Vec::with_capacity(keys),
-        refs: Sink::new(refs, widths.0),
-        times: Sink::new(times, widths.1),
+        keys: Vec::new(),
+        starts: Vec::new(),
+        mults: Vec::new(),
+        ids: None,
+        refs: Sink::new(refs, ref_bits),
+        times: Sink::new(times, time_bits),
         held: 0,
         high: 0,
         stop: false,
@@ -330,6 +212,7 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
         mut starts,
         keys,
         mults,
+        ids,
         refs,
         times,
         postings,
@@ -339,35 +222,38 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
         .writer
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
-    // The last start is where the postings end, which closes the offsets.
-    starts.push(postings);
-    head.seek_to(layout.keys_at)?;
-    head.put_u32s(&keys)?;
-    head.pad_to(layout.keys_at + 4 * keys.len() as u64)?;
-    head.put_u64s(&starts)?;
-    head.put(&mults)?;
-    head.pad_to(layout.mults_at + mults.len() as u64)?;
-    head.flush()?;
-    refs.finish()?;
-    times.finish()?;
-    // The checksum covers the header words and then the arrays in file
-    // order, which no pass over the pieces can sum while two arrays are
-    // written side by side: one sequential read of the finished file sums
-    // it, a block at a time and with no buffer in proportion to the file.
-    let sum = sum_file(path, layout, widths)?;
-    head.seek_to(layout.trailer_at)?;
-    head.put(&sum.to_le_bytes())?;
-    head.flush()?;
-    head.sync()?;
-    if std::fs::metadata(path)?.len() != layout.bytes {
+    if postings >= MAX_POSTINGS {
         return Err(std::io::Error::other(
-            "the merge to a file wrote a length of its own",
+            "the merged segment holds 2^40 postings or more",
         ));
     }
-    Ok(Written {
-        ids: layout.ids,
-        held: high,
-    })
+    // No more than the sources hold, which are in this address space.
+    let n = usize::try_from(postings).unwrap_or(most);
+    // The last start is where the postings end, which closes the offsets.
+    starts.push(postings);
+    let refs_sum = refs.finish()?;
+    let times_sum = times.finish()?;
+    let times_at = after_packed(refs_at, n, ref_bits);
+    let index_at = after_packed(times_at, n, time_bits);
+    if times_at != room {
+        head.move_down(room, times_at, index_at - times_at)?;
+    }
+    head.seek_to(index_at)?;
+    write_index(&mut head, &keys, &starts, &mults)?;
+    let header = Head {
+        widths: (ref_bits, time_bits),
+        keys: keys.len() as u64,
+        postings,
+        range: ids.unwrap_or((0, 0)),
+    };
+    head.put(&header.footer([refs_sum, times_sum, index_sum(&keys, &starts, &mults)]))?;
+    // Times that moved down left their old bytes past the end.
+    head.end_here()?;
+    head.seek_to(0)?;
+    head.put(&header.bytes())?;
+    head.flush()?;
+    head.sync()?;
+    Ok(Written { ids, held: high })
 }
 
 /// The file as the pieces are written into it, and how many of them are
@@ -381,6 +267,8 @@ struct Writer {
     /// Where each key's run starts, counted from the file's first posting.
     starts: Vec<u64>,
     mults: Vec<u8>,
+    /// The range of the references written so far.
+    ids: Option<(u32, u32)>,
     refs: Sink,
     times: Sink,
     /// Pieces merged but not yet written.
@@ -391,13 +279,18 @@ struct Writer {
     stop: bool,
 }
 
+/// A merged piece and the range of its references.
+type Piece = (Parts, Option<(u32, u32)>);
+
 impl Writer {
     /// Append one merged piece after the pieces before it.
-    fn place(&mut self, (keys, starts, mults, refs, times): Parts) -> std::io::Result<()> {
+    fn place(&mut self, (parts, ids): Piece) -> std::io::Result<()> {
+        let (keys, starts, mults, refs, times) = parts;
         self.keys.extend_from_slice(&keys);
         self.starts
             .extend(starts.iter().map(|&start| start + self.postings));
         self.mults.extend_from_slice(&mults);
+        self.ids = ids_of(self.ids, ids);
         self.refs.append(&refs)?;
         self.times.append(&times)?;
         self.postings += refs.len() as u64;
@@ -426,8 +319,7 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
     let threads = settings.threads.max(1);
     let window = WINDOW * threads;
     let failure: Mutex<Option<std::io::Error>> = Mutex::new(None);
-    let merged = slots::<Parts>(plan.pieces);
-    // The counting pass took the dealt runs as it merged them.
+    let merged = slots::<Piece>(plan.pieces);
     plan.deal(threads);
     run_tasks(threads, plan.pieces, |piece| {
         // Wait for the piece to come within the window; the piece the file
@@ -443,6 +335,7 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
             }
         }
         let parts = plan.merge(piece);
+        let ids = range_of(&parts);
         {
             // The piece is published under the writer's lock, so that the
             // count of pieces held moves with it: the thread that writes
@@ -450,7 +343,7 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
             let mut w = lock(&gate.writer);
             w.held += 1;
             w.high = w.high.max(w.held);
-            *lock(&merged[piece]) = Some(parts);
+            *lock(&merged[piece]) = Some((parts, ids));
         }
         // Write every piece that is next in line: this one, or the ones
         // before it that finished first.
@@ -459,10 +352,10 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
             if w.stop {
                 return;
             }
-            let Some(parts) = merged.get(w.next).and_then(|slot| lock(slot).take()) else {
+            let Some(piece) = merged.get(w.next).and_then(|slot| lock(slot).take()) else {
                 return;
             };
-            let placed = w.place(parts);
+            let placed = w.place(piece);
             w.held -= 1;
             gate.wake.notify_all();
             if let Err(e) = placed {
@@ -494,8 +387,16 @@ struct Handle {
 }
 
 impl Handle {
+    /// Create `path`, or empty it, for writing and for reading back what
+    /// was written.
     fn create(path: &Path, fail_after: Option<u64>) -> std::io::Result<Self> {
-        Ok(Self::wrap(File::create(path)?, fail_after))
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Self::wrap(file, fail_after))
     }
 
     /// A handle on `path` positioned at byte `at`.
@@ -521,39 +422,36 @@ impl Handle {
         self.out.write_all(bytes)
     }
 
-    fn put_u32s(&mut self, values: &[u32]) -> std::io::Result<()> {
-        let mut buf = Vec::with_capacity(BUFFER);
-        for values in values.chunks(BUFFER / 4) {
-            buf.clear();
-            buf.extend(values.iter().flat_map(|v| v.to_le_bytes()));
-            self.put(&buf)?;
-        }
-        Ok(())
-    }
-
-    fn put_u64s(&mut self, values: &[u64]) -> std::io::Result<()> {
-        let mut buf = Vec::with_capacity(BUFFER);
-        for values in values.chunks(BUFFER / 8) {
-            buf.clear();
-            buf.extend(values.iter().flat_map(|v| v.to_le_bytes()));
-            self.put(&buf)?;
-        }
-        Ok(())
-    }
-
-    /// Zero bytes that bring `pos` to the next multiple of 8.
-    fn pad_to(&mut self, pos: u64) -> std::io::Result<()> {
-        let pad = pad_len(pos);
-        if pad > 0 {
-            self.put(&[0u8; 8][..pad])?;
-        }
-        Ok(())
-    }
-
     fn seek_to(&mut self, at: u64) -> std::io::Result<()> {
-        self.out.flush()?;
         self.out.seek(SeekFrom::Start(at))?;
         Ok(())
+    }
+
+    /// Move the `len` bytes at `from` down to `to`, a block at a time from
+    /// the front, so that a block is read before anything is written over
+    /// it.
+    fn move_down(&mut self, from: u64, to: u64, len: u64) -> std::io::Result<()> {
+        debug_assert!(to < from, "bytes move towards the start of the file");
+        self.out.flush()?;
+        let mut buf = alloc::vec![0u8; MOVE.min(usize::try_from(len).unwrap_or(MOVE))];
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(buf.len() as u64) as usize;
+            let file = self.out.get_mut();
+            file.seek(SeekFrom::Start(from + done))?;
+            file.read_exact(&mut buf[..n])?;
+            file.seek(SeekFrom::Start(to + done))?;
+            self.put(&buf[..n])?;
+            self.out.flush()?;
+            done += n as u64;
+        }
+        Ok(())
+    }
+
+    /// End the file where this handle stands.
+    fn end_here(&mut self) -> std::io::Result<()> {
+        let at = self.out.stream_position()?;
+        self.out.get_ref().set_len(at)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -576,10 +474,12 @@ impl Write for Handle {
     }
 }
 
-/// One packed array's section: the values appended so far and the bits
-/// already placed in the byte at bit `at` on, its low `at % 8` of them.
+/// One packed array's section: the values appended so far, the bits
+/// already placed in the byte at bit `at` on (its low `at % 8` of them),
+/// and the checksum of the bytes written.
 struct Sink {
     out: Handle,
+    sum: ByteSum,
     width: u32,
     /// Bits appended so far.
     at: u64,
@@ -593,11 +493,18 @@ impl Sink {
     fn new(out: Handle, width: u32) -> Self {
         Self {
             out,
+            sum: ByteSum::new(),
             width,
             at: 0,
             pending: 0,
             buf: Vec::new(),
         }
+    }
+
+    /// Write `bytes` of the array and sum them.
+    fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.sum.feed(bytes);
+        self.out.put(bytes)
     }
 
     /// Append `piece`'s values after the values appended so far.
@@ -614,7 +521,7 @@ impl Sink {
             let k = (8 - phase).min(total);
             self.pending |= (piece.bits_at(0, k as u32) << phase) as u8;
             if phase + k == 8 {
-                self.out.put(&[self.pending])?;
+                self.put(&[self.pending])?;
                 self.pending = 0;
             }
             from = k;
@@ -622,18 +529,15 @@ impl Sink {
         // From there the piece's bits start a byte of the file, so the
         // whole bytes among them are copied as they are.
         let own = (total - from) / 8;
-        debug_assert!(
-            own == 0 || from + 8 * own <= piece.len() as u64 * u64::from(self.width),
-            "bits past the piece"
-        );
+        // Every byte of a block is written by the copy, so the buffer is
+        // sized once and never cleared.
         let mut buf = core::mem::take(&mut self.buf);
+        buf.resize(BUFFER, 0);
         let mut done = 0;
         while done < own {
             let n = (own - done).min(BUFFER as u64) as usize;
-            buf.clear();
-            buf.resize(n, 0);
-            piece.copy_bits_into(&mut buf, from + 8 * done);
-            self.out.put(&buf)?;
+            piece.copy_bits_into(&mut buf[..n], from + 8 * done);
+            self.put(&buf[..n])?;
             done += n as u64;
         }
         let rest = (total - from) % 8;
@@ -646,77 +550,19 @@ impl Sink {
         Ok(())
     }
 
-    /// Write what is left of the array and pad its section to 8 bytes.
-    fn finish(mut self) -> std::io::Result<()> {
+    /// Write what is left of the array, pad its section to 8 bytes and
+    /// return the checksum of the array.
+    fn finish(mut self) -> std::io::Result<u64> {
         if !self.at.is_multiple_of(8) {
-            self.out.put(&[self.pending])?;
+            let last = self.pending;
+            self.put(&[last])?;
         }
-        self.out.pad_to(self.at.div_ceil(8))?;
-        self.out.flush()
+        // Zero bytes sum as the zeros a last word is padded with.
+        let pad = pad_len(self.at.div_ceil(8));
+        self.put(&[0u8; 8][..pad])?;
+        self.out.flush()?;
+        Ok(self.sum.finish())
     }
-}
-
-/// Sum the finished file as [`Segment::write_to`] sums what it writes: the
-/// header words, then the keys, the offsets, the multiplicities and the two
-/// packed arrays in file order, a block at a time.
-fn sum_file(path: &Path, layout: &Layout, widths: (u32, u32)) -> std::io::Result<u64> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(HEADER as u64))?;
-    let mut ck = layout.checksum(widths);
-    let mut buf = alloc::vec![0u8; CHUNK];
-    // The keys are summed as values, not as the bytes they lie in.
-    read_section(&mut file, layout.keys * 4, &mut buf, |bytes| {
-        for value in bytes.chunks_exact(4) {
-            ck.word(u64::from(u32::from_le_bytes(
-                value.try_into().expect("4 bytes"),
-            )));
-        }
-    })?;
-    skip(&mut file, layout.keys * 4)?;
-    read_section(&mut file, (layout.keys + 1) * 8, &mut buf, |bytes| {
-        for value in bytes.chunks_exact(8) {
-            ck.word(u64::from_le_bytes(value.try_into().expect("8 bytes")));
-        }
-    })?;
-    read_section(&mut file, layout.keys, &mut buf, |bytes| ck.words(bytes))?;
-    skip(&mut file, layout.keys)?;
-    read_section(&mut file, layout.refs_len, &mut buf, |bytes| {
-        ck.words(bytes);
-    })?;
-    skip(&mut file, layout.refs_len)?;
-    read_section(&mut file, layout.times_len, &mut buf, |bytes| {
-        ck.words(bytes);
-    })?;
-    skip(&mut file, layout.times_len)?;
-    debug_assert_eq!(file.stream_position()?, layout.trailer_at);
-    Ok(ck.finish())
-}
-
-/// Read `bytes` of `file` in blocks of `buf` and fold each block into
-/// `each`: one sequential read of the section, whatever its length.
-fn read_section(
-    file: &mut File,
-    bytes: u64,
-    buf: &mut [u8],
-    mut each: impl FnMut(&[u8]),
-) -> std::io::Result<()> {
-    let mut remaining = bytes;
-    while remaining > 0 {
-        let take = remaining.min(buf.len() as u64) as usize;
-        file.read_exact(&mut buf[..take])?;
-        each(&buf[..take]);
-        remaining -= take as u64;
-    }
-    Ok(())
-}
-
-/// Step over the padding after a section of `bytes`.
-fn skip(file: &mut File, bytes: u64) -> std::io::Result<()> {
-    let pad = pad_len(bytes) as i64;
-    if pad > 0 {
-        file.seek(SeekFrom::Current(pad))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

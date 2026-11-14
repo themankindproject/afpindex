@@ -1,22 +1,24 @@
 //! Snapshot files (`std`): little-endian arrays behind a small header,
-//! every section 8-byte aligned, with a checksum trailer.
+//! every section 8-byte aligned, closed by checksums.
 //!
-//! Segment snapshot, version 3:
+//! Segment snapshot, version 4:
 //!
 //! ```text
-//! 0   "AFIX"            4   version u32 = 3
+//! 0   "AFIX"            4   version u32 = 4
 //! 8   ref_bits u32      12  time_bits u32
 //! 16  key_count u64     24  posting_count u64
 //! 32  min_ref u32       36  max_ref u32      (both 0 without postings)
-//! 40  keys    u32 × key_count                             (zero-padded to 8)
+//! 40  refs    ceil(posting_count × ref_bits / 8) bytes    (zero-padded to 8)
+//!     times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
+//!     keys    u32 × key_count                             (zero-padded to 8)
 //!     offsets u64 × (key_count + 1)
 //!     mults   u8  × key_count                             (zero-padded to 8)
-//!     refs    ceil(posting_count × ref_bits / 8) bytes    (zero-padded to 8)
-//!     times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
-//!     checksum u64 over the header words (widths, key_count,
-//!     posting_count, min_ref and max_ref), the keys and offsets as
-//!     values, the multiplicities and the packed bytes as little-endian
-//!     64-bit words
+//!     checksum u64 of refs, as little-endian 64-bit words
+//!     checksum u64 of times, likewise
+//!     checksum u64 of the keys and the offsets as values, then the
+//!     multiplicities as little-endian 64-bit words
+//!     checksum u64 of the header words (widths, key_count, posting_count,
+//!     min_ref and max_ref) and the three checksums before it
 //! ```
 //!
 //! References and times are packed at the width of the largest value in
@@ -27,10 +29,17 @@
 //! otherwise recompute both from the runs one posting at a time; stored,
 //! a trusted load can take them, and a full load checks them.
 //!
-//! Catalog snapshot, version 3:
+//! The postings come first and every section has a checksum of its own so
+//! that a merge can write the file in one pass
+//! ([`crate::segment::to_file`]): the two packed arrays grow side by side,
+//! each summed as it is written, and the counts in the header are known
+//! only once the last posting is. A reader likewise sums the two arrays
+//! apart, on two cores.
+//!
+//! Catalog snapshot, version 4 (the segments' format gave it the number):
 //!
 //! ```text
-//! 0   "AFCT"            4   version u32 = 3
+//! 0   "AFCT"            4   version u32 = 4
 //! 8   flags u32 = 0     12  reserved u32 = 0
 //! 16  reference_count u64   24  segment_count u64
 //! 32  live bitmap, one bit per id, LSB first, ceil(n / 8) bytes (zero-padded to 8)
@@ -53,9 +62,11 @@ use crate::{Catalog, Segment, SnapshotError};
 
 pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"AFIX";
 const CATALOG_MAGIC: [u8; 4] = *b"AFCT";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// Bytes before the first array of a segment snapshot.
 pub(crate) const HEADER: usize = 40;
+/// Bytes of the four checksums that close a segment snapshot.
+pub(crate) const FOOTER: usize = 32;
 /// Bytes before the first array of a catalog snapshot, which has no
 /// reference range.
 const CATALOG_HEADER: usize = 32;
@@ -107,6 +118,54 @@ impl Checksum {
     }
 }
 
+/// The checksum of a section whose bytes arrive in pieces cut anywhere:
+/// what [`Checksum::words`] gives for all of them at once.
+#[cfg(feature = "mmap")]
+pub(crate) struct ByteSum {
+    sum: Checksum,
+    /// The bytes of a word that is not whole yet.
+    carry: [u8; 8],
+    held: usize,
+}
+
+#[cfg(feature = "mmap")]
+impl ByteSum {
+    pub(crate) fn new() -> Self {
+        Self {
+            sum: Checksum::new(),
+            carry: [0; 8],
+            held: 0,
+        }
+    }
+
+    pub(crate) fn feed(&mut self, mut bytes: &[u8]) {
+        if self.held > 0 {
+            let take = (8 - self.held).min(bytes.len());
+            self.carry[self.held..self.held + take].copy_from_slice(&bytes[..take]);
+            self.held += take;
+            bytes = &bytes[take..];
+            if self.held < 8 {
+                return;
+            }
+            self.sum.word(u64::from_le_bytes(self.carry));
+            self.held = 0;
+        }
+        let whole = bytes.len() - bytes.len() % 8;
+        self.sum.words(&bytes[..whole]);
+        let rest = &bytes[whole..];
+        self.carry[..rest.len()].copy_from_slice(rest);
+        self.held = rest.len();
+    }
+
+    pub(crate) fn finish(mut self) -> u64 {
+        if self.held > 0 {
+            self.carry[self.held..].fill(0);
+            self.sum.word(u64::from_le_bytes(self.carry));
+        }
+        self.sum.finish()
+    }
+}
+
 /// Zero bytes that bring `pos` to the next multiple of 8.
 pub(crate) fn pad_len(pos: u64) -> usize {
     (pos.next_multiple_of(8) - pos) as usize
@@ -118,72 +177,54 @@ fn write_pad<W: Write>(w: &mut W, pos: usize) -> std::io::Result<usize> {
     Ok(pos + pad)
 }
 
-fn write_u32s<W: Write>(
+/// Write `values` as little-endian bytes, a block at a time.
+fn write_values<W: Write, T: Copy, const N: usize>(
     w: &mut W,
-    values: impl Iterator<Item = u32>,
-    ck: &mut Checksum,
-    pos: usize,
-) -> std::io::Result<usize> {
+    values: &[T],
+    bytes: impl Fn(T) -> [u8; N],
+) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(CHUNK);
-    let mut n = 0;
-    for v in values {
-        ck.word(u64::from(v));
-        buf.extend_from_slice(&v.to_le_bytes());
-        n += 1;
-        if buf.len() >= CHUNK {
-            w.write_all(&buf)?;
-            buf.clear();
-        }
+    for block in values.chunks(CHUNK / N) {
+        buf.clear();
+        buf.extend(block.iter().flat_map(|&v| bytes(v)));
+        w.write_all(&buf)?;
     }
-    w.write_all(&buf)?;
-    Ok(pos + n * 4)
+    Ok(())
 }
 
-fn write_u64s<W: Write>(
+/// Write the keys, the offsets and the multiplicities of a segment whose
+/// arrays end at `pos`, each padded to 8 bytes.
+pub(crate) fn write_index<W: Write>(
     w: &mut W,
-    values: impl Iterator<Item = u64>,
-    ck: &mut Checksum,
-    pos: usize,
-) -> std::io::Result<usize> {
-    let mut buf = Vec::with_capacity(CHUNK);
-    let mut n = 0;
-    for v in values {
-        ck.word(v);
-        buf.extend_from_slice(&v.to_le_bytes());
-        n += 1;
-        if buf.len() >= CHUNK {
-            w.write_all(&buf)?;
-            buf.clear();
-        }
-    }
-    w.write_all(&buf)?;
-    Ok(pos + n * 8)
+    keys: &[u32],
+    offsets: &[u64],
+    mults: &[u8],
+) -> std::io::Result<()> {
+    write_values(w, keys, u32::to_le_bytes)?;
+    w.write_all(&[0u8; 8][..pad_len(4 * keys.len() as u64)])?;
+    write_values(w, offsets, u64::to_le_bytes)?;
+    w.write_all(mults)?;
+    w.write_all(&[0u8; 8][..pad_len(mults.len() as u64)])
 }
 
-/// Write bytes, checksummed as little-endian 64-bit words (the last one
-/// zero-padded): the multiplicities.
-fn write_u8s<W: Write>(
-    w: &mut W,
-    values: impl Iterator<Item = u8>,
-    ck: &mut Checksum,
-    pos: usize,
-) -> std::io::Result<usize> {
-    // Summed a word at a time, as the reader sums them: `CHUNK` is a
-    // multiple of 8, so only the last block can end mid-word.
-    let mut buf = Vec::with_capacity(CHUNK);
-    let mut n = 0;
-    for v in values {
-        buf.push(v);
-        n += 1;
-        if buf.len() >= CHUNK {
-            ck.words(&buf);
-            w.write_all(&buf)?;
-            buf.clear();
-        }
+/// The checksum of a segment's keys, offsets and multiplicities.
+pub(crate) fn index_sum(keys: &[u32], offsets: &[u64], mults: &[u8]) -> u64 {
+    let mut ck = Checksum::new();
+    for &key in keys {
+        ck.word(u64::from(key));
     }
-    ck.words(&buf);
-    w.write_all(&buf)?;
-    Ok(pos + n)
+    for &offset in offsets {
+        ck.word(offset);
+    }
+    ck.words(mults);
+    ck.finish()
+}
+
+/// The checksum of a packed array's bytes.
+fn packed_sum(bytes: &[u8]) -> u64 {
+    let mut ck = Checksum::new();
+    ck.words(bytes);
+    ck.finish()
 }
 
 /// The two header words of a segment's reference range.
@@ -263,7 +304,7 @@ fn grow<T>(out: &mut Vec<T>, take: usize, remaining: usize) {
     }
 }
 
-fn read_u32s<R: Read>(r: &mut R, n: usize, ck: &mut Checksum) -> Result<Vec<u32>, SnapshotError> {
+fn read_u32s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u32>, SnapshotError> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; CHUNK];
     let mut remaining = n;
@@ -271,17 +312,17 @@ fn read_u32s<R: Read>(r: &mut R, n: usize, ck: &mut Checksum) -> Result<Vec<u32>
         let take = remaining.min(CHUNK / 4);
         r.read_exact(&mut buf[..take * 4])?;
         grow(&mut out, take, remaining);
-        for c in buf[..take * 4].chunks_exact(4) {
-            let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            ck.word(u64::from(v));
-            out.push(v);
-        }
+        out.extend(
+            buf[..take * 4]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        );
         remaining -= take;
     }
     Ok(out)
 }
 
-fn read_u64s<R: Read>(r: &mut R, n: usize, ck: &mut Checksum) -> Result<Vec<u64>, SnapshotError> {
+fn read_u64s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u64>, SnapshotError> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; CHUNK];
     let mut remaining = n;
@@ -289,30 +330,48 @@ fn read_u64s<R: Read>(r: &mut R, n: usize, ck: &mut Checksum) -> Result<Vec<u64>
         let take = remaining.min(CHUNK / 8);
         r.read_exact(&mut buf[..take * 8])?;
         grow(&mut out, take, remaining);
-        for c in buf[..take * 8].chunks_exact(8) {
-            let v = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
-            ck.word(v);
-            out.push(v);
-        }
+        out.extend(
+            buf[..take * 8]
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))),
+        );
         remaining -= take;
     }
     Ok(out)
 }
 
-/// Read `n` single bytes, checksummed as [`write_packed`] does (the
-/// multiplicities).
-fn read_u8s<R: Read>(r: &mut R, n: usize, ck: &mut Checksum) -> Result<Vec<u8>, SnapshotError> {
+/// Read `n` single bytes (the multiplicities).
+fn read_u8s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>, SnapshotError> {
     let mut out = Vec::new();
     let mut remaining = n;
     while remaining > 0 {
         let take = remaining.min(CHUNK);
         grow(&mut out, take, remaining);
-        let at = out.len();
         read_into(r, &mut out, take)?;
-        ck.words(&out[at..]);
         remaining -= take;
     }
     Ok(out)
+}
+
+/// A segment's keys, offsets and multiplicities.
+type Index = (Vec<u32>, Vec<u64>, Vec<u8>);
+
+/// Read the keys, the offsets and the multiplicities of a segment of
+/// `n_keys` keys, with the padding of each.
+fn read_index<R: Read>(r: &mut R, n_keys: usize) -> Result<Index, SnapshotError> {
+    let keys = read_u32s(r, n_keys)?;
+    read_pad(r, 4 * n_keys as u64)?;
+    let offsets = read_u64s(r, n_keys + 1)?;
+    let mults = read_u8s(r, n_keys)?;
+    read_pad(r, n_keys as u64)?;
+    Ok((keys, offsets, mults))
+}
+
+/// Bytes of the keys, the offsets and the multiplicities of `n_keys` keys
+/// in a snapshot.
+#[cfg(any(feature = "mmap", test))]
+fn index_len(n_keys: u64) -> u64 {
+    (4 * n_keys).next_multiple_of(8) + 8 * (n_keys + 1) + n_keys.next_multiple_of(8)
 }
 
 /// Append exactly `n` bytes from `r` to `out`, which has room for them:
@@ -344,21 +403,8 @@ fn read_bytes<R: Read>(r: &mut R, n: usize, ck: &mut Checksum) -> Result<Vec<u8>
     Ok(out)
 }
 
-/// Write bytes, checksummed as little-endian 64-bit words (the last one
-/// zero-padded): the packed arrays and the multiplicities.
-fn write_packed<W: Write>(
-    w: &mut W,
-    bytes: &[u8],
-    ck: &mut Checksum,
-    pos: usize,
-) -> std::io::Result<usize> {
-    ck.words(bytes);
-    w.write_all(bytes)?;
-    Ok(pos + bytes.len())
-}
-
-/// Read `n` values of `bits` packed, checksummed as [`write_packed`] does
-/// if `ck` is given.
+/// Read `n` values of `bits` packed, summed as little-endian 64-bit
+/// words (the last one zero-padded) if `ck` is given.
 fn read_packed<R: Read>(
     r: &mut R,
     n: usize,
@@ -397,37 +443,93 @@ fn checksum_of(fields: (u32, u32), a: u64, b: u64) -> Checksum {
     ck
 }
 
-/// Start a segment's checksum: the catalog's header words, then the
-/// segment's reference range.
-pub(crate) fn checksum_of_segment(
-    fields: (u32, u32),
-    n_keys: u64,
-    n_post: u64,
-    range: (u32, u32),
-) -> Checksum {
-    let mut ck = checksum_of(fields, n_keys, n_post);
-    ck.word(range_word(range));
-    ck
+/// What a segment snapshot's header says of the segment.
+#[derive(Clone, Copy)]
+pub(crate) struct Head {
+    /// Bits of a reference and of a time.
+    pub(crate) widths: (u32, u32),
+    pub(crate) keys: u64,
+    pub(crate) postings: u64,
+    /// Smallest and largest reference, both zero without postings.
+    pub(crate) range: (u32, u32),
+}
+
+impl Head {
+    /// The header as it lies in the file.
+    pub(crate) fn bytes(&self) -> [u8; HEADER] {
+        let mut out = [0u8; HEADER];
+        let mut w = out.as_mut_slice();
+        write_header(&mut w, SEGMENT_MAGIC, self.widths, self.keys, self.postings)
+            .and_then(|()| w.write_all(&range_word(self.range).to_le_bytes()))
+            .expect("the header is 40 bytes");
+        out
+    }
+
+    fn read<R: Read>(r: &mut R) -> Result<Self, SnapshotError> {
+        let (widths, keys, postings) = read_header(r, SEGMENT_MAGIC)?;
+        let range = read_range(r)?;
+        Ok(Self {
+            widths,
+            keys,
+            postings,
+            range,
+        })
+    }
+
+    /// The four checksums that close the snapshot, from those of its
+    /// sections: the references', the times' and the index's, then one
+    /// over the header words and those three.
+    pub(crate) fn footer(&self, sums: [u64; 3]) -> [u8; FOOTER] {
+        let mut ck = checksum_of(self.widths, self.keys, self.postings);
+        ck.word(range_word(self.range));
+        let mut out = [0u8; FOOTER];
+        for (sum, bytes) in sums.iter().zip(out.chunks_exact_mut(8)) {
+            ck.word(*sum);
+            bytes.copy_from_slice(&sum.to_le_bytes());
+        }
+        out[24..].copy_from_slice(&ck.finish().to_le_bytes());
+        out
+    }
+}
+
+/// The checksums a snapshot stores for its references and its times, once
+/// the footer is read and found to agree with the header and the index.
+///
+/// Those two are the checks that read no posting, so a trusted load makes
+/// them too.
+fn read_footer<R: Read>(
+    r: &mut R,
+    head: &Head,
+    (keys, offsets, mults): &Index,
+) -> Result<(u64, u64), SnapshotError> {
+    let mut stored = [0u8; FOOTER];
+    r.read_exact(&mut stored)?;
+    let word = |i: usize| u64::from_le_bytes(stored[8 * i..8 * i + 8].try_into().expect("8 bytes"));
+    let (refs, times) = (word(0), word(1));
+    if stored != head.footer([refs, times, index_sum(keys, offsets, mults)]) {
+        return Err(SnapshotError::Checksum);
+    }
+    Ok((refs, times))
 }
 
 fn write_segment<W: Write>(seg: &Segment, w: &mut W) -> std::io::Result<()> {
-    let (n_keys, n_post) = (seg.key_count() as u64, seg.len() as u64);
+    let n_post = seg.len() as u64;
     // One walk of the directory gives what the directory records of every
     // run, in key order: where it starts, which the offsets need, and its
     // multiplicity. Runs are sorted by reference, so the first and the
     // last posting of each run bound the segment's reference range.
-    let mut starts = Vec::with_capacity(seg.key_count());
+    let mut offsets = Vec::with_capacity(seg.key_count() + 1);
     let mut mults = Vec::with_capacity(seg.key_count());
     for (start, mult) in seg.starts_and_mults() {
-        starts.push(start);
+        offsets.push(start);
         mults.push(mult);
     }
+    offsets.push(n_post);
     let refs = seg.refs();
     let mut range = (0u32, 0u32);
     let mut any = false;
-    for (k, &start) in starts.iter().enumerate() {
-        let start = start as usize;
-        let end = (starts.get(k + 1).copied().unwrap_or(n_post)) as usize;
+    for run in offsets.windows(2) {
+        let (start, end) = (run[0] as usize, run[1] as usize);
         if start < end {
             let (lo, hi) = (refs.get(start), refs.get(end - 1));
             range = if any {
@@ -438,21 +540,23 @@ fn write_segment<W: Write>(seg: &Segment, w: &mut W) -> std::io::Result<()> {
             any = true;
         }
     }
-    write_header(w, SEGMENT_MAGIC, seg.widths(), n_keys, n_post)?;
-    w.write_all(&range_word(range).to_le_bytes())?;
-    let mut ck = checksum_of_segment(seg.widths(), n_keys, n_post, range);
-    let mut pos = HEADER;
-    pos = write_u32s(w, seg.keys().iter().copied(), &mut ck, pos)?;
-    pos = write_pad(w, pos)?;
-    let offsets = starts.into_iter().chain(core::iter::once(n_post));
-    pos = write_u64s(w, offsets, &mut ck, pos)?;
-    pos = write_u8s(w, mults.into_iter(), &mut ck, pos)?;
-    pos = write_pad(w, pos)?;
-    pos = write_packed(w, seg.refs().data(), &mut ck, pos)?;
-    pos = write_pad(w, pos)?;
-    pos = write_packed(w, seg.times().data(), &mut ck, pos)?;
-    write_pad(w, pos)?;
-    w.write_all(&ck.finish().to_le_bytes())
+    let head = Head {
+        widths: seg.widths(),
+        keys: seg.key_count() as u64,
+        postings: n_post,
+        range,
+    };
+    w.write_all(&head.bytes())?;
+    let mut sums = [0u64; 3];
+    for (packed, sum) in [seg.refs(), seg.times()].into_iter().zip(&mut sums) {
+        let bytes = packed.data();
+        *sum = packed_sum(bytes);
+        w.write_all(bytes)?;
+        w.write_all(&[0u8; 8][..pad_len(bytes.len() as u64)])?;
+    }
+    sums[2] = index_sum(seg.keys(), &offsets, &mults);
+    write_index(w, seg.keys(), &offsets, &mults)?;
+    w.write_all(&head.footer(sums))
 }
 
 /// The key and posting counts of a segment header as sizes, refused when
@@ -500,35 +604,27 @@ type Ids = Option<(u32, u32)>;
 
 /// Read a segment snapshot and report the range of its references.
 fn read_segment<R: Read>(r: &mut R, check: Check) -> Result<(Segment, Ids), SnapshotError> {
-    let (widths, n_keys, n_post) = read_header(r, SEGMENT_MAGIC)?;
-    let (ref_bits, time_bits) = widths;
-    let stored_range = read_range(r)?;
-    let mut ck = checksum_of_segment(widths, n_keys, n_post, stored_range);
-    let (n_keys, n_post) = segment_counts(n_keys, n_post)?;
-    let mut pos = HEADER as u64;
-    // The keys, offsets and multiplicities are summed either way: next to
-    // the packed arrays they cost nothing.
-    let keys = read_u32s(r, n_keys, &mut ck)?;
-    pos = read_pad(r, pos + n_keys as u64 * 4)?;
-    let offsets = read_u64s(r, n_keys + 1, &mut ck)?;
-    pos += (n_keys as u64 + 1) * 8;
+    let head = Head::read(r)?;
+    let (ref_bits, time_bits) = head.widths;
+    let (n_keys, n_post) = segment_counts(head.keys, head.postings)?;
     let full = check == Check::Full;
-    let mults = read_u8s(r, n_keys, &mut ck)?;
-    pos = read_pad(r, pos + n_keys as u64)?;
-    let refs = read_packed(r, n_post, ref_bits, full.then_some(&mut ck))?;
-    pos = read_pad(r, pos + refs.data().len() as u64)?;
-    let times = read_packed(r, n_post, time_bits, full.then_some(&mut ck))?;
-    read_pad(r, pos + times.data().len() as u64)?;
-    let stored = read_u64(r)?;
-    if full && stored != ck.finish() {
+    let (mut refs_sum, mut times_sum) = (Checksum::new(), Checksum::new());
+    let refs = read_packed(r, n_post, ref_bits, full.then_some(&mut refs_sum))?;
+    read_pad(r, refs.data().len() as u64)?;
+    let times = read_packed(r, n_post, time_bits, full.then_some(&mut times_sum))?;
+    read_pad(r, times.data().len() as u64)?;
+    let index = read_index(r, n_keys)?;
+    let stored = read_footer(r, &head, &index)?;
+    if full && stored != (refs_sum.finish(), times_sum.finish()) {
         return Err(SnapshotError::Checksum);
     }
-    // Checksummed as it was read, if at all.
+    // The packed arrays were summed as they were read, if at all.
+    let (keys, offsets, mults) = index;
     finish_segment(
-        widths,
+        head.widths,
         n_post,
         (keys, &offsets),
-        (mults, stored_range),
+        (mults, head.range),
         (refs, times),
         check,
         |_, _| true,
@@ -549,7 +645,7 @@ const PARALLEL_MIN: usize = 1 << 10;
 /// and assemble it, with each run's multiplicity for its directory slot
 /// and the range of the references.
 ///
-/// Version 3 stores both, so a trusted load takes them as they are and
+/// The file stores both, so a trusted load takes them as they are and
 /// reads no posting: it checks only that the range could describe
 /// references of the segment's width (see [`check_range`]). A full load
 /// walks the runs ([`CheckRuns`]) and refuses a file whose stored
@@ -977,9 +1073,8 @@ mod mapped {
     use memmap2::Mmap;
 
     use super::{
-        Check, HEADER, Ids, SEGMENT_MAGIC, check_id_space, checksum_of_segment, finish_segment,
-        read_catalog_head, read_header, read_pad, read_range, read_u8s, read_u32s, read_u64,
-        read_u64s, segment_counts,
+        Check, FOOTER, HEADER, Head, Ids, check_id_space, finish_segment, index_len, packed_sum,
+        read_catalog_head, read_footer, read_index, read_pad, segment_counts,
     };
     use crate::packed::Packed;
     use crate::{Catalog, Segment, SnapshotError};
@@ -1039,38 +1134,28 @@ mod mapped {
         check: Check,
     ) -> Result<(Segment, Ids, usize), SnapshotError> {
         let mut r: &[u8] = map.get(pos..).ok_or(SnapshotError::Truncated)?;
-        let (widths, n_keys, n_post) = read_header(&mut r, SEGMENT_MAGIC)?;
-        let (ref_bits, time_bits) = widths;
-        let range = read_range(&mut r)?;
-        let mut ck = checksum_of_segment(widths, n_keys, n_post, range);
-        let (n_keys, n_post) = segment_counts(n_keys, n_post)?;
+        let head = Head::read(&mut r)?;
+        let (ref_bits, time_bits) = head.widths;
+        let (n_keys, n_post) = segment_counts(head.keys, head.postings)?;
         let mut rel = HEADER as u64;
-        let keys = read_u32s(&mut r, n_keys, &mut ck)?;
-        rel = read_pad(&mut r, rel + n_keys as u64 * 4)?;
-        let offsets = read_u64s(&mut r, n_keys + 1, &mut ck)?;
-        rel += (n_keys as u64 + 1) * 8;
-        let mults = read_u8s(&mut r, n_keys, &mut ck)?;
-        rel = read_pad(&mut r, rel + n_keys as u64)?;
         let refs = map_packed(map, pos + rel as usize, n_post, ref_bits, &mut r)?;
-        rel = read_pad(&mut r, rel + refs.data().len() as u64)?;
+        rel += read_pad(&mut r, refs.data().len() as u64)?;
         let times = map_packed(map, pos + rel as usize, n_post, time_bits, &mut r)?;
-        rel = read_pad(&mut r, rel + times.data().len() as u64)?;
-        let stored = read_u64(&mut r)?;
-        rel += 8;
+        rel += read_pad(&mut r, times.data().len() as u64)?;
+        let index = read_index(&mut r, n_keys)?;
+        let stored = read_footer(&mut r, &head, &index)?;
+        rel += index_len(n_keys as u64) + FOOTER as u64;
         // The packed arrays are nearly all of the bytes: they are summed
         // on a core of their own while the runs are checked.
         let sum = move |refs: &Packed, times: &Packed| {
-            check == Check::Trusted || {
-                ck.words(refs.data());
-                ck.words(times.data());
-                ck.finish() == stored
-            }
+            check == Check::Trusted || stored == (packed_sum(refs.data()), packed_sum(times.data()))
         };
+        let (keys, offsets, mults) = index;
         let (seg, ids) = finish_segment(
-            widths,
+            head.widths,
             n_post,
             (keys, &offsets),
-            (mults, range),
+            (mults, head.range),
             (refs, times),
             check,
             sum,
@@ -1192,6 +1277,18 @@ pub(crate) fn map_segment(
 mod tests {
     use super::*;
     use crate::Posting;
+
+    /// Write the last checksum of a segment snapshot again, over the header
+    /// as it now stands and the section checksums the file stores: what an
+    /// edit of the header needs to get past the checksum.
+    fn reseal(bytes: &mut [u8]) {
+        let head = Head::read(&mut &bytes[..]).unwrap();
+        let at = bytes.len() - FOOTER;
+        let sum =
+            |i: usize| u64::from_le_bytes(bytes[at + 8 * i..at + 8 * i + 8].try_into().unwrap());
+        let footer = head.footer([sum(0), sum(1), sum(2)]);
+        bytes[at..].copy_from_slice(&footer);
+    }
 
     /// Structural checks sit behind the checksum, so corrupt-but-consistent
     /// snapshots are made by writing invalid arrays through the writer.
@@ -1331,10 +1428,9 @@ mod tests {
             std::env::temp_dir().join(format!("afpindex-parallel-{}.afx", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Segment::map_from(&path).unwrap(), seg);
-        // The last data byte before the checksum's padding: a reference or
-        // time bit, so the arrays still describe a valid segment.
-        let at = bytes.len() - 16;
-        bytes[at] ^= 0x10;
+        // The first byte of the references, so the arrays still describe
+        // a valid segment.
+        bytes[HEADER] ^= 0x10;
         std::fs::write(&path, &bytes).unwrap();
         let got = Segment::map_from(&path);
         std::fs::remove_file(&path).unwrap();
@@ -1405,9 +1501,8 @@ mod tests {
 
         // A range that leaves a reference out: only a file edited behind
         // the writer's back holds one, so the test patching the header
-        // has to patch the checksum too, word for word as the writer sums
-        // it. A full load compares the range with its walk; a trusted
-        // load takes it.
+        // has to patch the checksum over it too. A full load compares the
+        // range with its walk; a trusted load takes it.
         let seg = Segment::from_postings(vec![
             Posting::new(1, 4, 0),
             Posting::new(2, 7, 0),
@@ -1415,23 +1510,9 @@ mod tests {
         ]);
         let mut bytes = Vec::new();
         seg.write_to(&mut bytes).unwrap();
-        let (widths, n_keys, n_post) = (seg.widths(), seg.key_count() as u64, seg.len() as u64);
         let range = (4, 7);
         bytes[32..40].copy_from_slice(&range_word(range).to_le_bytes());
-        let mut ck = checksum_of_segment(widths, n_keys, n_post, range);
-        for &key in seg.keys() {
-            ck.word(u64::from(key));
-        }
-        for offset in seg.offsets() {
-            ck.word(offset);
-        }
-        // The multiplicities are summed as words, the last one padded.
-        let mults: Vec<u8> = seg.starts_and_mults().map(|(_, mult)| mult).collect();
-        ck.words(&mults);
-        ck.words(seg.refs().data());
-        ck.words(seg.times().data());
-        let end = bytes.len() - 8;
-        bytes[end..].copy_from_slice(&ck.finish().to_le_bytes());
+        reseal(&mut bytes);
         assert!(
             matches!(
                 Segment::read_from(bytes.as_slice()),
@@ -1451,6 +1532,12 @@ mod tests {
             .write_to(&mut bytes)
             .unwrap();
         bytes[36..40].copy_from_slice(&3u32.to_le_bytes());
+        // The header is summed, so an edit alone is a checksum error.
+        assert!(matches!(
+            Segment::read_from_trusted(bytes.as_slice()),
+            Err(SnapshotError::Checksum)
+        ));
+        reseal(&mut bytes);
         assert!(matches!(
             Segment::read_from_trusted(bytes.as_slice()),
             Err(SnapshotError::Corrupt(m)) if m.contains("range")
@@ -1458,6 +1545,7 @@ mod tests {
         // And an inverted one.
         bytes[36..40].copy_from_slice(&1u32.to_le_bytes());
         bytes[32..36].copy_from_slice(&2u32.to_le_bytes());
+        reseal(&mut bytes);
         assert!(matches!(
             Segment::read_from_trusted(bytes.as_slice()),
             Err(SnapshotError::Corrupt(m)) if m.contains("inverted")
@@ -1489,10 +1577,9 @@ mod tests {
         let good = Segment::from_postings((0..50).map(|i| Posting::new(i % 7, i, i)).collect());
         let mut bytes = Vec::new();
         good.write_to(&mut bytes).unwrap();
-        // The last data byte before the padding: a time bit.
+        // The first byte of the references.
         let mut flipped = bytes.clone();
-        let at = bytes.len() - 16;
-        flipped[at] ^= 0x10;
+        flipped[HEADER] ^= 0x10;
         assert!(matches!(
             Segment::read_from(flipped.as_slice()),
             Err(SnapshotError::Checksum)
@@ -1500,6 +1587,33 @@ mod tests {
         let loaded = Segment::read_from_trusted(flipped.as_slice()).unwrap();
         assert_eq!(loaded.len(), good.len());
         assert_ne!(loaded, good);
+        // The keys, the offsets and the multiplicities are summed by a
+        // trusted load too: they are read either way. The last word before
+        // the checksums holds the seven multiplicities.
+        let index_at = bytes.len() - FOOTER - index_len(good.key_count() as u64) as usize;
+        for at in [index_at, bytes.len() - FOOTER - 8] {
+            let mut flipped = bytes.clone();
+            flipped[at] ^= 1;
+            assert!(
+                matches!(
+                    Segment::read_from_trusted(flipped.as_slice()),
+                    Err(SnapshotError::Checksum)
+                ),
+                "byte {at}"
+            );
+        }
+        // And so are the checksums themselves.
+        for at in bytes.len() - FOOTER..bytes.len() {
+            let mut flipped = bytes.clone();
+            flipped[at] ^= 1;
+            assert!(
+                matches!(
+                    Segment::read_from_trusted(flipped.as_slice()),
+                    Err(SnapshotError::Checksum)
+                ),
+                "checksum byte {at}"
+            );
+        }
         assert!(matches!(
             Segment::read_from_trusted(&bytes[..bytes.len() - 1]),
             Err(SnapshotError::Truncated)

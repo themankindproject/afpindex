@@ -47,8 +47,9 @@ First release: the engine of the *afpindex* design notes as a library.
   the histogram pass, both detected after the totals pass and before any
   histogram work.
 - `std` feature: `Catalog::write_to` / `read_from` and `Segment::write_to`
-  / `read_from` snapshot files (format version 3), 8-byte aligned with a
-  checksum trailer that covers the header words as well as the arrays;
+  / `read_from` snapshot files (format version 4), 8-byte aligned, the
+  packed postings first and every section with a checksum of its own,
+  closed by one over the header words and the section checksums;
   references and times are stored packed, as in memory. A segment stores
   each run's multiplicity and its reference range next to the arrays,
   what a load would otherwise recompute from every posting. A load reads

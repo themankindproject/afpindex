@@ -929,8 +929,8 @@ anyway).
 
 ### The format
 
-Both formats are version 3: little-endian arrays behind a header, every
-section 8-byte aligned, with a checksum trailer. References and times are
+Both formats are version 4: little-endian arrays behind a header, every
+section 8-byte aligned, closed by checksums. References and times are
 stored packed as they are in memory, so a file is about the size of the
 catalog. A file of an earlier version is refused with
 `SnapshotError::UnsupportedVersion`: there is no reader for it, so write
@@ -938,25 +938,36 @@ the catalog out again with the current version.
 
 ```text
 Segment snapshot
-0   "AFIX"            4   version u32 = 3
+0   "AFIX"            4   version u32 = 4
 8   ref_bits u32      12  time_bits u32
 16  key_count u64     24  posting_count u64
 32  min_ref u32       36  max_ref u32      (both 0 without postings)
-40  keys    u32 × key_count                             (zero-padded to 8)
+40  refs    ceil(posting_count × ref_bits / 8) bytes    (zero-padded to 8)
+    times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
+    keys    u32 × key_count                             (zero-padded to 8)
     offsets u64 × (key_count + 1)
     mults   u8  × key_count                             (zero-padded to 8)
-    refs    ceil(posting_count × ref_bits / 8) bytes    (zero-padded to 8)
-    times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
-    checksum u64
+    checksum u64 of refs
+    checksum u64 of times
+    checksum u64 of keys, offsets and mults
+    checksum u64 of the header and the three checksums before it
 
 Catalog snapshot
-0   "AFCT"            4   version u32 = 3
+0   "AFCT"            4   version u32 = 4
 8   flags u32 = 0     12  reserved u32 = 0
 16  reference_count u64   24  segment_count u64
 32  live bitmap, one bit per id, LSB first              (zero-padded to 8)
     checksum u64
     segment_count segment snapshots, back to back
 ```
+
+The postings come first and each section has its own checksum so that a
+merge can write a segment file in one pass: the two packed arrays grow
+side by side, each summed as it is written, and the counts and the index
+are known, and written, only once the last posting is. A load checks the
+last checksum and the index's on every load, trusted or not, since they
+read no posting; a full load also sums the two packed arrays, on two
+cores of a mapped file.
 
 `mults` is, per key, what the directory records of its run: the most
 postings any one reference has in it, saturating at 255. `min_ref` and

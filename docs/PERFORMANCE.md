@@ -163,7 +163,7 @@ median of each:
 | `map_from_trusted` | 0.16 s | 0.09 s |
 | search, floor 16, one thread | 0.099 ms | 0.095 ms |
 
-The trusted loads move because format 3 stores each run's multiplicity, so
+The trusted loads move because format 3 (and 4) stores each run's multiplicity, so
 they read no posting at all ([Trusted loads](#trusted-loads)). `write_to`
 writes those multiplicities as well: 0.22 s against 0.21 s, for a snapshot
 1.4 % larger. The additions and the heap after them are the sparser
@@ -635,35 +635,35 @@ for a trusted map that reads no posting.
 
 A merge can write its result to a segment snapshot without holding the
 result in memory. The merge is cut into pieces as the in-memory merge on
-every core cuts it; a counting pass over the pieces gives the counts and
-the reference range that fix the header and the offset of every section, and
-a second pass appends each piece to the file in piece order, the two packed
-arrays through handles of their own. The checksum is summed from one
-sequential read of the finished file, since no single pass can sum it while
-two arrays are written side by side.
+every core cuts it, and each piece is appended to the file in piece order
+as soon as the pieces before it are: the references right behind the
+header through one handle, the times through another, each summed as it
+is written. The times start where they belong when the merge drops
+nothing; when it dropped postings they are moved down once at the end.
+The keys, offsets and multiplicities, the checksums and the header follow
+from what the pieces brought. Format 4 puts the packed arrays first and
+gives each section a checksum of its own for exactly this; with format 3
+the merge counted every piece in a first pass to place the sections, and
+read the finished file back to sum it.
 
 Instruction counts from `examples/profile.rs` under callgrind, `simd` build,
 one CPU (`taskset -c 0`), on the synthetic catalog of 60 M postings
 (`build 20000 3000 3600000`) with 20 additions on top, so the compaction
-joins four segments of 60.06 M postings into a file of 272,025,064 bytes:
+joins four segments of 60.06 M postings into a file of 272,025,088 bytes:
 
 | | instructions |
 |---|---|
 | `Catalog::compact`, the result on the heap | 3,947,659,752 |
-| `CatalogStore::compact`, the result written to a segment file and mapped | 9,408,883,295 |
+| `CatalogStore::compact`, format 3: count, write, read back | 9,408,883,295 |
+| `CatalogStore::compact`, format 4: one pass | 5,335,772,190 |
 
 The file is byte for byte the snapshot of the segment the first builds,
-which the mode checks. The store's route costs 2.4 times the instructions
-because it merges every piece twice: once in the counting pass, only for
-the key count, the posting count and the reference range, and once to
-write. `PackedBuilder::extend_bits` is 1.73 G of the first count and 3.45 G
-of the second, `merge_sources` 0.67 G and 1.35 G. The rest of the
-difference is the write, the read that sums the file and the map of the
-result. In exchange the merge never holds a result larger than a piece plus
-the 13 bytes per distinct hash its keys, run starts and multiplicities
-take, and the largest array it allocates is one piece's packed references.
-On four cores of the laptop the two take 0.43–0.53 s and 1.06–1.17 s, the
-second with its file written and synced.
+which the mode checks. What the store's route costs beyond the in-memory
+one is the copy of every piece into the file (`copy_bits_into`, 0.44 G,
+and the writes) and the map of the result; the merge itself is the same
+work. In exchange it never holds a result larger than a piece plus the
+13 bytes per distinct hash its keys, run starts and multiplicities take,
+and the largest array it allocates is one piece's packed references.
 
 The default piece is 2<sup>22</sup> postings of input, so a piece in flight
 is tens of megabytes however large the merge; a thread starts a piece only

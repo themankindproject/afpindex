@@ -4,6 +4,8 @@
 use afpindex::{Catalog, Posting, Query, Scratch, SearchOptions, Segment, SnapshotError};
 
 const HEADER: usize = 40;
+/// Bytes of the four checksums that close a segment snapshot.
+const FOOTER: usize = 32;
 /// Bytes before a catalog snapshot's liveness bitmap.
 const CATALOG_HEADER: usize = 32;
 
@@ -15,22 +17,23 @@ fn sample() -> Segment {
 }
 
 /// Byte offsets of the five arrays, the end of the times data, and the
-/// trailer in a segment snapshot. References and times are packed at the
-/// width of their largest value.
+/// four checksums in a segment snapshot (version 4: the packed arrays
+/// first, then the keys, the offsets and the multiplicities). References
+/// and times are packed at the width of their largest value.
 fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize, usize) {
     let k = seg.key_count();
     let p = seg.len();
     let packed = |max: u32| (p * (32 - max.leading_zeros()) as usize).div_ceil(8);
     let ref_bytes = packed(seg.max_reference().unwrap_or(0));
     let time_bytes = packed(seg.postings().map(|r| r.time).max().unwrap_or(0));
-    let keys = HEADER;
-    let offsets = (keys + 4 * k).next_multiple_of(8);
-    let mults = offsets + 8 * (k + 1);
-    let refs = (mults + k).next_multiple_of(8);
+    let refs = HEADER;
     let times = (refs + ref_bytes).next_multiple_of(8);
     let times_end = times + time_bytes;
-    let trailer = times_end.next_multiple_of(8);
-    (keys, offsets, mults, refs, times, times_end, trailer)
+    let keys = times_end.next_multiple_of(8);
+    let offsets = (keys + 4 * k).next_multiple_of(8);
+    let mults = offsets + 8 * (k + 1);
+    let footer = (mults + k).next_multiple_of(8);
+    (keys, offsets, mults, refs, times, times_end, footer)
 }
 
 fn query() -> Query {
@@ -45,8 +48,8 @@ fn write_then_read_gives_the_same_segment_and_results() {
     let seg = sample();
     let mut bytes = Vec::new();
     seg.write_to(&mut bytes).unwrap();
-    let (.., trailer) = layout(&seg);
-    assert_eq!(bytes.len(), trailer + 8);
+    let (.., footer) = layout(&seg);
+    assert_eq!(bytes.len(), footer + FOOTER);
     let back = Segment::read_from(bytes.as_slice()).unwrap();
     assert_eq!(back, seg);
     let q = query();
@@ -67,7 +70,7 @@ fn corruption_is_reported_not_trusted() {
     let seg = sample();
     let mut good = Vec::new();
     seg.write_to(&mut good).unwrap();
-    let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, trailer_at) = layout(&seg);
+    let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, footer_at) = layout(&seg);
 
     let mut bad = good.clone();
     bad[0] = b'X';
@@ -82,15 +85,17 @@ fn corruption_is_reported_not_trusted() {
         Segment::read_from(bad.as_slice()),
         Err(SnapshotError::UnsupportedVersion(9))
     ));
-    // Version 2 is not read: there is no reader for it.
-    let mut bad = good.clone();
-    bad[4] = 2;
-    assert!(matches!(
-        Segment::read_from(bad.as_slice()),
-        Err(SnapshotError::UnsupportedVersion(2))
-    ));
+    // Earlier versions are not read: there is no reader for them.
+    for version in [2u8, 3] {
+        let mut bad = good.clone();
+        bad[4] = version;
+        assert!(matches!(
+            Segment::read_from(bad.as_slice()),
+            Err(SnapshotError::UnsupportedVersion(v)) if v == u32::from(version)
+        ));
+    }
 
-    for cut in [HEADER - 1, offsets_at + 3, trailer_at, good.len() - 1] {
+    for cut in [HEADER - 1, offsets_at + 3, footer_at, good.len() - 1] {
         let err = Segment::read_from(&good[..cut]).unwrap_err();
         assert!(
             matches!(err, SnapshotError::Truncated),
@@ -124,7 +129,7 @@ fn corruption_is_reported_not_trusted() {
         assert!(matches!(err, SnapshotError::Checksum), "byte {at}: {err}");
     }
     let mut bad = good.clone();
-    bad[trailer_at] ^= 1;
+    bad[footer_at] ^= 1;
     assert!(matches!(
         Segment::read_from(bad.as_slice()),
         Err(SnapshotError::Checksum)
@@ -359,9 +364,9 @@ fn full_width_references_and_times_round_trip() {
 }
 
 /// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
-/// snapshots (format version 3).
-const CATALOG_GOLDEN: (usize, u64) = (96_864, 5_356_885_839_193_813_427);
-const SEGMENT_GOLDEN: (usize, u64) = (32_064, 16_497_302_139_298_787_675);
+/// snapshots (format version 4).
+const CATALOG_GOLDEN: (usize, u64) = (96_936, 876_163_766_861_378_146);
+const SEGMENT_GOLDEN: (usize, u64) = (32_088, 12_768_993_118_344_369_857);
 
 /// FNV-1a over `bytes`.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -372,8 +377,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// The format is a contract with the files already written: a fixed
 /// catalog and a fixed segment must keep producing the same bytes. A
-/// deliberate format change gets a new version number, a reader for this
-/// one, and then new constants here.
+/// deliberate format change gets a new version number and new constants
+/// here.
 #[test]
 fn snapshot_bytes_are_stable() {
     let rows = |seed: u32| {
@@ -515,8 +520,7 @@ mod mapped {
         assert_eq!(back.max_reference(), seg.max_reference());
         drop(back);
         // Every data byte is checksummed in place, as on the read path.
-        let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, trailer_at) =
-            layout(&seg);
+        let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, footer_at) = layout(&seg);
         for at in [
             keys_at,
             offsets_at + 8,
@@ -524,7 +528,7 @@ mod mapped {
             refs_at + 5,
             times_at + 9,
             times_end - 1,
-            trailer_at,
+            footer_at,
         ] {
             let mut bad = good.clone();
             bad[at] ^= 0x40;
