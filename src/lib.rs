@@ -130,3 +130,6 @@ pub use posting::Posting;
 pub use query::Query;
 pub use search::{Bin, Candidate, NoiseStats, Scratch, SearchOptions, Survivor, vote_floor};
 pub use segment::{Postings, Run, Segment};
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub use segment::{Written, merge_in_memory, merge_to_file};

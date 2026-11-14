@@ -23,6 +23,7 @@ by about 10 %, so compare columns within one table only.
 - [A sparser directory for small segments](#a-sparser-directory-for-small-segments)
 - [Parallel merge](#parallel-merge)
 - [Trusted loads](#trusted-loads)
+- [Merging straight into a file](#merging-straight-into-a-file)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -577,6 +578,54 @@ left of the trusted map is faulting in the file's pages, copying the
 keys, offsets and multiplicities, and building the directory: the 0.14 s
 is close to the 0.13 s the "no pass" column of the older table predicted
 for a trusted map that reads no posting.
+
+## Merging straight into a file
+
+A merge can write its result to a segment snapshot without holding the
+result in memory. The merge is cut into pieces as the in-memory merge on
+every core cuts it; a counting pass over the pieces gives the counts and
+the reference range that fix the header and the offset of every section, and
+a second pass appends each piece to the file in piece order, the two packed
+arrays through handles of their own. The checksum is summed from one
+sequential read of the finished file, since no single pass can sum it while
+two arrays are written side by side.
+
+Instruction counts from `examples/profile.rs` under callgrind, `simd` build,
+one CPU (`taskset -c 0`), on the synthetic catalog of 60 M postings
+(`build 20000 3000 3600000`) with 20 additions on top, so the merge joins
+four segments of 60.06 M postings and writes 272,025,064 bytes:
+
+| | instructions |
+|---|---|
+| `merge_all`, then `write_to` on the result | 4,795,496,383 |
+| `merge_to_file` | 5,749,914,603 |
+
+The file the second writes is byte for byte the one the first writes, which
+the mode checks. It costs 20 % more instructions, and that is the price of
+the memory: the counting pass merges every piece a second time only for its
+key count, posting count and reference range, and `PackedBuilder::extend_bits`
+alone is 26 % of the count. In exchange the merge never holds a result
+larger than a piece plus the 13 bytes per distinct hash its keys, run
+starts and multiplicities take, and the largest array it allocates is one
+piece's packed references.
+
+The default piece is 2<sup>22</sup> postings of input, so a piece in flight
+is tens of megabytes however large the merge; a thread starts a piece only
+while fewer than twice the thread count are merged ahead of the one the file
+waits for.
+
+`merge_all` itself costs what it did: 600 calls of `Catalog::add` on the
+same catalog take 5,330,486,224 instructions against 5,341,860,051 before,
+0.2 % fewer. Callgrind counts on this host move by about 6 % between runs
+when the merge's threads are not pinned to one CPU, so counts here are
+comparable only under `taskset -c 0`.
+
+```bash
+cargo build --release --features mmap,simd --example profile
+valgrind --tool=callgrind --toggle-collect='profile::measured_merge_file' \
+  --callgrind-out-file=/tmp/cg.out \
+  target/release/examples/profile spill 20000 3000 3600000 /tmp/s2.afc 20
+```
 
 ## Allocators and huge pages
 

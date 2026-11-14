@@ -51,11 +51,11 @@ use crate::segment::MAX_POSTINGS;
 use crate::simd::{self, Decoder, LANES, Pass};
 use crate::{Catalog, Segment, SnapshotError};
 
-const SEGMENT_MAGIC: [u8; 4] = *b"AFIX";
+pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"AFIX";
 const CATALOG_MAGIC: [u8; 4] = *b"AFCT";
 const VERSION: u32 = 3;
 /// Bytes before the first array of a segment snapshot.
-const HEADER: usize = 40;
+pub(crate) const HEADER: usize = 40;
 /// Bytes before the first array of a catalog snapshot, which has no
 /// reference range.
 const CATALOG_HEADER: usize = 32;
@@ -67,24 +67,24 @@ const MAX_SEGMENTS: u64 = 1 << 16;
 
 /// Order-sensitive 64-bit checksum over words: catches corruption, not
 /// tampering.
-struct Checksum(u64);
+pub(crate) struct Checksum(u64);
 
 impl Checksum {
     const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(0x4146_4958_0000_0001)
     }
 
     #[inline]
-    fn word(&mut self, w: u64) {
+    pub(crate) fn word(&mut self, w: u64) {
         self.0 = (self.0.rotate_left(29) ^ w).wrapping_mul(Self::PRIME);
     }
 
     /// Fold in `bytes` as little-endian 64-bit words, the last one
     /// zero-padded: how the packed arrays are covered. Bytes fed in several
     /// calls must be cut at multiples of 8.
-    fn words(&mut self, bytes: &[u8]) {
+    pub(crate) fn words(&mut self, bytes: &[u8]) {
         let mut state = Self(self.0);
         let mut words = bytes.chunks_exact(8);
         for w in &mut words {
@@ -99,7 +99,7 @@ impl Checksum {
         *self = state;
     }
 
-    fn finish(self) -> u64 {
+    pub(crate) fn finish(self) -> u64 {
         let mut h = self.0;
         h ^= h >> 32;
         h = h.wrapping_mul(Self::PRIME);
@@ -108,7 +108,7 @@ impl Checksum {
 }
 
 /// Zero bytes that bring `pos` to the next multiple of 8.
-fn pad_len(pos: u64) -> usize {
+pub(crate) fn pad_len(pos: u64) -> usize {
     (pos.next_multiple_of(8) - pos) as usize
 }
 
@@ -187,12 +187,12 @@ fn write_u8s<W: Write>(
 }
 
 /// The two header words of a segment's reference range.
-fn range_word((min, max): (u32, u32)) -> u64 {
+pub(crate) fn range_word((min, max): (u32, u32)) -> u64 {
     u64::from(min) | u64::from(max) << 32
 }
 
 /// Write a header: magic, version, two 32-bit fields, two counts.
-fn write_header<W: Write>(
+pub(crate) fn write_header<W: Write>(
     w: &mut W,
     magic: [u8; 4],
     fields: (u32, u32),
@@ -399,7 +399,7 @@ fn checksum_of(fields: (u32, u32), a: u64, b: u64) -> Checksum {
 
 /// Start a segment's checksum: the catalog's header words, then the
 /// segment's reference range.
-fn checksum_of_segment(
+pub(crate) fn checksum_of_segment(
     fields: (u32, u32),
     n_keys: u64,
     n_post: u64,

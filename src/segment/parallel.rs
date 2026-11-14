@@ -123,7 +123,7 @@ fn split<F>(sides: &[(&Segment, Option<&F>)], pieces: usize) -> Vec<u64> {
 /// One piece's merge: its keys, the start of each key's run counted from
 /// the piece's first posting, the multiplicities, and the packed
 /// references and times.
-type Parts = (Vec<u32>, Vec<u64>, Vec<u8>, Packed, Packed);
+pub(super) type Parts = (Vec<u32>, Vec<u64>, Vec<u8>, Packed, Packed);
 
 /// [`Segment::merge_all`] in up to `pieces` pieces on up to `threads`
 /// threads, whatever the size.
@@ -163,11 +163,11 @@ pub(super) fn merge_in_pieces<F: Fn(u32) -> bool + Sync>(
 
 /// A merge cut into pieces: which keys and runs of every source each
 /// piece takes.
-struct Plan<'a, F> {
+pub(super) struct Plan<'a, F> {
     sides: &'a [(&'a Segment, Option<&'a F>)],
     ref_bits: u32,
     time_bits: u32,
-    pieces: usize,
+    pub(super) pieces: usize,
     cuts: Vec<Cuts>,
     /// Stretches of the sources' directories, one per task of the deal:
     /// the source, and the first slot and the end.
@@ -177,7 +177,7 @@ struct Plan<'a, F> {
 }
 
 impl<'a, F: Fn(u32) -> bool + Sync> Plan<'a, F> {
-    fn new(sides: &'a [(&'a Segment, Option<&'a F>)], pieces: usize) -> Self {
+    pub(super) fn new(sides: &'a [(&'a Segment, Option<&'a F>)], pieces: usize) -> Self {
         let (ref_bits, time_bits) = widths(sides);
         let bounds = split(sides, pieces.max(1));
         let cuts = sides
@@ -210,7 +210,7 @@ impl<'a, F: Fn(u32) -> bool + Sync> Plan<'a, F> {
 
     /// The first pass: deal every source's runs out to the pieces, a
     /// stretch of its directory per task.
-    fn deal(&self, threads: usize) {
+    pub(super) fn deal(&self, threads: usize) {
         let pieces = self.pieces;
         run_tasks(threads, self.scans.len(), |task| {
             let (side, lo, hi) = self.scans[task];
@@ -229,7 +229,7 @@ impl<'a, F: Fn(u32) -> bool + Sync> Plan<'a, F> {
     }
 
     /// The second pass, for one piece: merge it on its own.
-    fn merge(&self, piece: usize) -> Parts {
+    pub(super) fn merge(&self, piece: usize) -> Parts {
         let mut sources = Vec::with_capacity(self.sides.len());
         let (mut capacity, mut keys) = (0, 0);
         for (side, &(s, keep)) in self.sides.iter().enumerate() {

@@ -26,10 +26,24 @@
 //!
 //! `load` mode profiles one load of the snapshot, chosen by its last
 //! argument: `map`, `map-trusted`, `read` or `read-trusted`.
+//!
+//! `spill` mode weighs the two ways of writing a merge out: `merge_all` on
+//! the catalog's segments, its result written with `write_to`, against
+//! `merge_to_file` over the same segments, which holds only its pieces.
+//! Both are timed, the files they write are compared byte for byte, and the
+//! mode fails if they differ. A last argument of `memory` or `file` runs
+//! one half alone, so that a peak resident set belongs to that half.
 
 use std::time::Instant;
 
-use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
+use afpindex::{
+    Catalog, Query, Scratch, SearchOptions, Segment, Written, merge_in_memory, merge_to_file,
+    vote_floor,
+};
+
+/// A reference's filter, or none: these merges keep everything, the way a
+/// compaction with nothing removed does.
+type Keep = fn(u32) -> bool;
 
 struct Rng(u64);
 
@@ -114,6 +128,82 @@ fn measured_load(path: &str, bytes: &[u8], load: Load) -> Catalog {
         Load::ReadTrusted => Catalog::read_from_trusted(bytes),
     }
     .unwrap()
+}
+
+/// One merge held in memory and written out, the way a catalog would: the
+/// `--toggle-collect` target of the mode's first half.
+#[inline(never)]
+fn measured_merge_memory(sides: &[(&Segment, Option<&Keep>)], path: &str) -> u64 {
+    let merged = merge_in_memory(sides);
+    let file = std::fs::File::create(path).unwrap();
+    let mut out = std::io::BufWriter::with_capacity(1 << 23, file);
+    merged.write_to(&mut out).unwrap();
+    out.into_inner().unwrap().sync_all().unwrap();
+    std::fs::metadata(path).unwrap().len()
+}
+
+/// One merge written straight to the file: the mode's second target.
+#[inline(never)]
+fn measured_merge_file(sides: &[(&Segment, Option<&Keep>)], path: &str) -> (Written, u64) {
+    let written = merge_to_file(sides, std::path::Path::new(path)).unwrap();
+    let bytes = std::fs::metadata(path).unwrap().len();
+    (written, bytes)
+}
+
+/// The `spill` mode: a merge of the catalog's segments both ways.
+fn run_spill(a: &[String]) {
+    let (refs, per_ref, hashes) = (
+        a[1].parse::<u32>().unwrap(),
+        a[2].parse::<usize>().unwrap(),
+        a[3].parse::<u64>().unwrap(),
+    );
+    let path = &a[4];
+    let adds = a.get(5).map_or(0, |n| n.parse::<usize>().unwrap());
+    // Which half to run: both write a file and compare them, one runs a
+    // half alone, so that a peak resident set belongs to that half.
+    let half = a.get(6).map_or("both", String::as_str);
+    let mut catalog = Catalog::map_from_trusted(path).unwrap();
+    for i in 0..adds {
+        catalog.add(rows_of(refs + i as u32, per_ref, hashes));
+    }
+    // The segments as they stand, merged the way `compact` merges them.
+    let segments: Vec<Segment> = catalog.segments().cloned().collect();
+    let postings = catalog.posting_count();
+    let sides: Vec<(&Segment, Option<&Keep>)> = segments.iter().map(|s| (s, None)).collect();
+    let (memory_file, file_file) = (format!("{path}.memory"), format!("{path}.file"));
+    if half != "file" {
+        let t = Instant::now();
+        let bytes = measured_merge_memory(&sides, &memory_file);
+        println!(
+            "{} segments, {} postings: merge_all + write_to {:.3} s, {} bytes",
+            sides.len(),
+            postings,
+            t.elapsed().as_secs_f64(),
+            bytes
+        );
+    }
+    if half != "memory" {
+        let t = Instant::now();
+        let (written, bytes) = measured_merge_file(&sides, &file_file);
+        assert_eq!(written.postings as usize, postings);
+        println!(
+            "{} segments, {} postings: merge_to_file {:.3} s, {} bytes",
+            sides.len(),
+            postings,
+            t.elapsed().as_secs_f64(),
+            bytes
+        );
+    }
+    if half == "both" {
+        let same = std::fs::read(&memory_file).unwrap() == std::fs::read(&file_file).unwrap();
+        println!("the two files are identical: {same}");
+        assert!(same, "the two files differ");
+    }
+    for file in [&memory_file, &file_file] {
+        if std::path::Path::new(file).exists() {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
 }
 
 /// The `load` mode: time one load, with the mode's name as the argument.
@@ -241,6 +331,8 @@ fn main() {
         }
         // load refs per_ref hashes path map|map-trusted|read|read-trusted
         "load" => run_load(&a),
-        _ => panic!("mode: build, search, adds, batch or load"),
+        // spill refs per_ref hashes path [adds]
+        "spill" => run_spill(&a),
+        _ => panic!("mode: build, search, adds, batch, load or spill"),
     }
 }
