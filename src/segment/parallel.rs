@@ -276,7 +276,7 @@ impl<'a, F: Fn(u32) -> bool + Sync> Plan<'a, F> {
     /// The second pass, for one piece: merge it on its own.
     fn merge(&self, piece: usize) -> Parts {
         let mut sources = Vec::with_capacity(self.sides.len());
-        let mut capacity = 0;
+        let (mut capacity, mut keys) = (0, 0);
         for (side, &(s, keep)) in self.sides.iter().enumerate() {
             let cut = &self.cuts[side];
             let (k0, k1) = (cut.keys[piece], cut.keys[piece + 1]);
@@ -298,9 +298,13 @@ impl<'a, F: Fn(u32) -> bool + Sync> Plan<'a, F> {
             debug_assert_eq!(order.len(), k1 - k0, "a piece gets its keys' runs");
             let end = cut.starts[piece + 1];
             capacity += end - cut.starts[piece];
+            keys += k1 - k0;
             sources.push(s.source_of(keep, &s.keys[k0..k1], order, end));
         }
-        let mut out = Writer::with_capacity(capacity, self.ref_bits, self.time_bits);
+        // `keys` counts a hash in several sources once per source, so it is
+        // an upper bound on the piece's own key count, as a whole merge's
+        // is.
+        let mut out = Writer::with_capacity(capacity, keys, self.ref_bits, self.time_bits);
         merge_sources(&mut out, &mut sources);
         drop(sources);
         out.into_parts()
@@ -636,6 +640,7 @@ fn slots_of_vecs<T>(n: usize) -> Vec<Mutex<Vec<T>>> {
 mod tests {
     use super::*;
     use crate::Posting;
+    use crate::segment::keys;
 
     type Keep<'a> = &'a (dyn Fn(u32) -> bool + Sync);
 
@@ -726,7 +731,8 @@ mod tests {
                 }
                 let want = {
                     let (ref_bits, time_bits) = widths(&sides);
-                    let mut out = Writer::with_capacity(postings(&sides), ref_bits, time_bits);
+                    let mut out =
+                        Writer::with_capacity(postings(&sides), keys(&sides), ref_bits, time_bits);
                     let mut sources: Vec<_> =
                         sides.iter().map(|&(s, keep)| s.source(keep)).collect();
                     merge_sources(&mut out, &mut sources);

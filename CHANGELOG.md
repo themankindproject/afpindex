@@ -86,6 +86,10 @@ First release: the engine of the *afpindex* design notes as a library.
   catalog of six segments a search took 10 % fewer instructions, and
   single-segment catalogs are unchanged. The price is 48 bytes of
   directory per key instead of 20, at most about 50 MB per segment.
+- A merge reserves its writer's key, start and multiplicity arrays at the
+  sum of its sources' key counts rather than growing them by doubling,
+  which took 2.8 % of the instructions off 600 single additions of 3,000
+  rows each; the same goes for a segment built from rows.
 - `no_std + alloc` core with no `unsafe` code by default; `libm` is the
   only dependency. Minimum Rust version 1.87.
 - Examples: `quickstart` (build, search, add, remove), `bench`

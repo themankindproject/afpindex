@@ -279,12 +279,21 @@ pub(crate) struct Writer {
 
 impl Writer {
     /// Room for `postings` rows whose references and times fit `ref_bits`
-    /// and `time_bits`.
-    pub(crate) fn with_capacity(postings: usize, ref_bits: u32, time_bits: u32) -> Self {
+    /// and `time_bits`, and for `keys` distinct hashes. A merge passes the
+    /// sum of its sources' key counts, an upper bound that keeps `keys`,
+    /// `starts` and `mults` from growing by doubling as the runs arrive;
+    /// [`Writer::finish`] cuts what the merge did not need.
+    pub(crate) fn with_capacity(
+        postings: usize,
+        keys: usize,
+        ref_bits: u32,
+        time_bits: u32,
+    ) -> Self {
         Self {
-            keys: Vec::new(),
-            starts: Vec::new(),
-            mults: Vec::new(),
+            keys: Vec::with_capacity(keys),
+            // One past the keys: `finish` records where the last run ends.
+            starts: Vec::with_capacity(keys.saturating_add(1)),
+            mults: Vec::with_capacity(keys),
             refs: PackedBuilder::with_capacity(postings, ref_bits),
             times: PackedBuilder::with_capacity(postings, time_bits),
             union: Vec::new(),
@@ -656,6 +665,7 @@ impl Segment {
             .fold((0, 0), |(r, t), p| (r.max(p.reference), t.max(p.time)));
         let mut out = Writer::with_capacity(
             rows.len(),
+            0,
             Packed::bits_for(max_ref),
             Packed::bits_for(max_time),
         );
@@ -949,7 +959,10 @@ impl Segment {
             return merged;
         }
         let (ref_bits, time_bits) = widths(sides);
-        let mut out = Writer::with_capacity(postings(sides), ref_bits, time_bits);
+        // Every source's keys, an upper bound on the merge's distinct
+        // hashes: one allocation each for the keys, their starts and their
+        // multiplicities instead of a doubling per batch of runs.
+        let mut out = Writer::with_capacity(postings(sides), keys(sides), ref_bits, time_bits);
         let mut sources: Vec<_> = sides
             .iter()
             .map(|&(segment, keep)| segment.source(keep))
@@ -968,7 +981,10 @@ impl Segment {
             "rows not sorted and unique"
         );
         let max_time = rows.iter().fold(0, |max, &row| max.max(row as u32));
+        // Every row could be a hash of its own, so the rows bound the keys:
+        // one allocation for them rather than one per doubling.
         let mut out = Writer::with_capacity(
+            rows.len(),
             rows.len(),
             Packed::bits_for(reference),
             Packed::bits_for(max_time),
@@ -988,6 +1004,14 @@ fn postings<F>(sides: &[(&Segment, Option<&F>)]) -> usize {
     sides
         .iter()
         .fold(0usize, |n, (s, _)| n.saturating_add(s.len()))
+}
+
+/// Distinct hashes across `sides`, saturating: an upper bound on a merge's
+/// key count, since a hash in several of them is one key.
+fn keys<F>(sides: &[(&Segment, Option<&F>)]) -> usize {
+    sides
+        .iter()
+        .fold(0usize, |n, (s, _)| n.saturating_add(s.key_count()))
 }
 
 /// The widest references and times across `sides`: the widths of their

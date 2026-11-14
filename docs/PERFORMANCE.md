@@ -18,6 +18,7 @@ by about 10 %, so compare columns within one table only.
 - [Building, changing and loading](#building-changing-and-loading)
 - [Real data](#real-data)
 - [Run lines, vector decoding and parallel loads](#run-lines-vector-decoding-and-parallel-loads)
+- [Sizing a merge's key arrays once](#sizing-a-merges-key-arrays-once)
 - [Adding a batch](#adding-a-batch)
 - [A sparser directory for small segments](#a-sparser-directory-for-small-segments)
 - [Allocators and huge pages](#allocators-and-huge-pages)
@@ -268,6 +269,33 @@ Measured here and left out:
   lower clock and a vector port given up while they run; this host has
   no counters to confirm it. The kernel also needs Rust 1.89 for the
   AVX-512 intrinsics.
+
+## Sizing a merge's key arrays once
+
+A merge writes its runs into a writer whose key, start and
+multiplicity arrays used to start empty and grow by doubling, one copy
+of them after another; about 3 % of the instructions of an addition went
+under `realloc` and the copies behind it. The writer now takes the number
+of keys up front and reserves the three arrays: a merge passes the sum of
+its sources' key counts, an upper bound, since a hash in several of them
+is one key, and `finish` cuts the arrays the merge did not need.
+`from_postings` and `from_reference` pass what bounds them the same way,
+and `starts` reserves one past that for the count `finish` records.
+
+On the synthetic 60 M-posting catalog, 600 additions of 3,000 rows each
+(`examples/profile.rs`, `adds` mode, one thread so the merge is not
+divided between tasks, callgrind):
+
+| | 600 additions |
+|---|---|
+| before | 5,341,792,947 instructions |
+| after | 5,191,399,029 instructions (−2.8 %) |
+
+The `finish_grow` frame itself falls from 909,994 instructions to 39,418,
+and what is left of it is on the snapshot reader's side and the search's
+bins, not in a merge. A batch of 600 references in one `add_many` is
+unchanged (751.6 M against 751.6 M): it merges once, and one merge was
+not where the copies showed.
 
 ## Adding a batch
 
