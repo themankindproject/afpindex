@@ -47,7 +47,7 @@ Perfect for:
 
 - **Exact Search** - Every posting that should vote does; candidates are deterministic and identical across builds, features and CPUs
 - **Count Before Histogram** - A branch-free first pass totals each reference's votes; only references over a vote floor get a histogram, so chance matches never pay for a sort
-- **Compact Postings** - Sorted by hash in flat arrays, references coded as the gaps inside each run and times packed to the width of the largest: about 3.4 bytes per posting instead of 8, 1.70 GiB for 499 M postings
+- **Compact Postings** - Sorted by hash in flat arrays, references and times packed to the width of the largest: about 4.2 bytes per posting instead of 8, 1.94 GiB for 499 M postings; or, as a choice per catalog, references coded as the gaps inside each run for 1.70 GiB at some search speed
 - **One Read per Hash** - An open-addressing directory finds a hash's run in one read, and every pass loads its next batch of cache lines before working on the current one
 - **Catalogs That Change** - Additions go into small delta segments merged geometrically, on every core for large merges; removals tombstone a reference; ids never change; a clone shares its segments
 - **Checksummed Snapshots** - Versioned little-endian files about the size of the catalog, verified (checksum and structure) before use
@@ -236,11 +236,12 @@ alternating rounds; candidates were identical in every run:
 | searches per second, two threads | 779 | 795 |
 | `read_from` / `map_from` | 2.0 / 0.9 s | 1.5 / 0.9 s |
 
-These were measured with references packed at 17 bits. Coded as gaps
-(snapshot format 6) the catalog takes 1.70 GiB; on a laptop that added
-7–12 % to searches whose runs were not already cached, about half again
-to a clip searched twice in a row, and 10 % fewer searches per second on
-eight threads ([details](docs/PERFORMANCE.md#references-coded-as-gaps)).
+These were measured with references packed at 17 bits, the default.
+Coded as gaps (`RefCoding::Gaps`) the catalog takes 1.70 GiB; on a
+laptop that added 7–12 % to searches whose runs were not already cached,
+about half again to a clip searched twice in a row, and 10 % fewer
+searches per second on eight threads
+([details](docs/PERFORMANCE.md#references-coded-as-gaps)).
 
 On an Intel i5-1135G7 laptop, a synthetic catalog of 60 M postings
 (20,000 references × 3,000 over 3.6 M distinct hashes) takes 0.31 GiB,

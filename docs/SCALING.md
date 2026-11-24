@@ -26,10 +26,10 @@ millisecond range. The times can stay on disk; only survivors read them.
 
 One host stops being enough when either is too much for it:
 
-- **Memory**: the references (coded as gaps, 12.5 bits per posting on the
-  real catalog) plus about 31 bytes per distinct hash per segment for the
-  keys and the directory no longer fit beside the page cache the times
-  need.
+- **Memory**: the references (17 bits per posting packed on the real
+  catalog, 12.5 coded as gaps) plus about 24 bytes per distinct hash per
+  segment for the keys and the directory (31 over gaps) no longer fit
+  beside the page cache the times need.
 - **Latency**: the slowest searches take too long. `SearchOptions::threads`
   takes about a third off searches of 5 ms and more on four idle cores;
   past that, the catalog has to be split.
@@ -136,8 +136,8 @@ way and replayed the same way.
 
 | per | in memory for searches | on disk only |
 |---|---|---|
-| posting | its coded reference (12.5 bits on the real catalog) | its time width (15 on the real catalog) |
-| distinct hash, per segment | 4 bytes of key and about 27 of directory (about 64 below 2<sup>20</sup> keys) | 16 bytes of offsets |
+| posting | its reference (17 bits packed on the real catalog, 12.5 coded as gaps) | its time width (15 on the real catalog) |
+| distinct hash, per segment | 4 bytes of key and about 20 of directory (about 48 below 2<sup>20</sup> keys; 27 and 64 over gaps) | 8 bytes of offsets (16 over gaps) |
 | reference id | 1 byte of liveness table, and 4 bytes per search thread | |
 
 On the real catalog that is 0.78 GB of references and 0.11 GB of keys and

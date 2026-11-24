@@ -24,6 +24,9 @@
 //! them the additions are what leave many segments behind, and a search
 //! then pays for a lookup in every one.
 //!
+//! `build` packs the references, or codes them as gaps when `GAPS` is set
+//! in the environment.
+//!
 //! `load` mode profiles one load of the snapshot, chosen by its last
 //! argument: `map`, `map-trusted`, `read` or `read-trusted`.
 //!
@@ -41,7 +44,7 @@
 
 use std::time::Instant;
 
-use afpindex::{Catalog, CatalogStore, Query, Scratch, SearchOptions, vote_floor};
+use afpindex::{Catalog, CatalogStore, Query, RefCoding, Scratch, SearchOptions, vote_floor};
 
 struct Rng(u64);
 
@@ -298,6 +301,22 @@ fn status_kb(field: &str) -> Option<u64> {
         .ok()
 }
 
+/// The `build` mode: a synthetic catalog, written to `path`.
+fn build(refs: usize, per_ref: usize, hashes: u64, path: &str) {
+    let mut b = Catalog::builder();
+    if std::env::var("GAPS").is_ok() {
+        b.ref_coding(RefCoding::Gaps);
+    }
+    for r in 0..refs as u32 {
+        b.add(rows_of(r, per_ref, hashes));
+    }
+    let c = b.build();
+    let file = std::fs::File::create(path).unwrap();
+    let mut out = std::io::BufWriter::with_capacity(1 << 23, file);
+    c.write_to(&mut out).unwrap();
+    println!("built {} postings", c.posting_count());
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let num = |i: usize| a[i].parse::<usize>().expect("integer");
@@ -305,17 +324,7 @@ fn main() {
     let path = &a[4];
     match a[0].as_str() {
         // build refs per_ref hashes path
-        "build" => {
-            let mut b = Catalog::builder();
-            for r in 0..refs as u32 {
-                b.add(rows_of(r, per_ref, hashes));
-            }
-            let c = b.build();
-            let file = std::fs::File::create(path).unwrap();
-            let mut out = std::io::BufWriter::with_capacity(1 << 23, file);
-            c.write_to(&mut out).unwrap();
-            println!("built {} postings", c.posting_count());
-        }
+        "build" => build(refs, per_ref, hashes, path),
         // search refs per_ref hashes path query_rows floor adds rounds
         "search" => {
             let (qrows, floor, adds, rounds) = (num(5), num(6), num(7), num(8));

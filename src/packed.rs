@@ -4,7 +4,6 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::ops::Range;
 
-#[cfg(test)]
 use crate::simd::{Decoder, LANES, WINDOW};
 
 /// Unsigned integers of one width, `bits` each, packed back to back in
@@ -225,7 +224,6 @@ impl Packed {
         }
     }
 
-    #[cfg(test)]
     /// Call `f` with entries `lo..hi` in order. A streaming decode: one
     /// word load every few entries instead of one per entry, and no
     /// per-entry bounds check.
@@ -255,7 +253,6 @@ impl Packed {
         }
     }
 
-    #[cfg(test)]
     /// A cursor over the entries from `at` on in blocks of [`LANES`], if
     /// `decoder` has a kernel for this width.
     #[inline(always)]
@@ -276,7 +273,6 @@ impl Packed {
         })
     }
 
-    #[cfg(test)]
     /// Call `f` with entries `lo..hi` in blocks of up to [`LANES`], as far
     /// as `decoder` has a kernel for them, and return the entry it stopped
     /// at: `hi`, or an earlier one the caller reads the rest from.
@@ -346,12 +342,10 @@ impl Packed {
         u32::from(acc)
     }
 
-    #[cfg(test)]
     /// Entries a range must have before it is decoded in blocks: below
     /// this, setting a kernel up costs more than the values it decodes.
     pub(crate) const BLOCK_MIN: usize = 4;
 
-    #[cfg(test)]
     /// Call `f` with entries `lo..hi` in order, decoded in blocks where
     /// `decoder` has a kernel and as a stream ([`Packed::for_each`])
     /// otherwise.
@@ -399,6 +393,12 @@ impl Packed {
         self.bits
     }
 
+    /// Bits of data: the values times their width.
+    #[inline]
+    pub(crate) const fn bit_len(&self) -> u64 {
+        self.len as u64 * self.bits as u64
+    }
+
     /// The data bytes and the slack after them: what a reader that loads
     /// a window at a time reads from.
     #[inline]
@@ -430,7 +430,6 @@ impl Packed {
         max
     }
 
-    #[cfg(test)]
     /// First index in `lo..hi` whose value fails `pred`, or `hi`; the
     /// values in the range must be partitioned by `pred`.
     #[inline]
@@ -453,7 +452,6 @@ impl Packed {
     }
 }
 
-#[cfg(test)]
 /// A cursor over a [`Packed`] array in blocks of [`LANES`] values
 /// (see [`Packed::blocks`]).
 pub(crate) struct Blocks<'a, K> {
@@ -465,7 +463,6 @@ pub(crate) struct Blocks<'a, K> {
     step: usize,
 }
 
-#[cfg(test)]
 impl<K: Fn(&[u8; WINDOW]) -> [u32; LANES]> Blocks<'_, K> {
     /// The next [`LANES`] values, or `None` within a window of the end of
     /// the bytes, where the caller reads what is left one value at a

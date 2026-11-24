@@ -2,8 +2,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::packed::Packed;
-use crate::refs::Run as CodedRun;
-use crate::simd::{self, Decoder, Pass};
+use crate::refs::{Coded, Run as CodedRun};
+use crate::simd::{self, Decoder, LANES, Pass};
 use crate::{Catalog, Query, SearchError, Segment};
 
 /// Bounds and statistics parameters for a search.
@@ -273,7 +273,7 @@ impl RunLoc {
     /// The run's coded references.
     #[inline]
     fn refs<'a>(&self, segments: &[&'a Segment]) -> crate::refs::Run<'a> {
-        segments[self.segment as usize].run_refs(self.at, self.hi - self.lo)
+        segments[self.segment as usize].run_refs(self.at, self.lo, self.hi - self.lo)
     }
 }
 
@@ -567,27 +567,18 @@ fn locate(segments: &[&Segment], query: &Query, runs: &mut Vec<RunLoc>) {
         return;
     }
     let hashes = query.hashes();
-    let n = hashes.len();
     for (si, seg) in segments.iter().enumerate() {
-        seg.touch_directory(&hashes[..LOOKUP_BATCH.min(n)]);
-        for k in (0..n).step_by(LOOKUP_BATCH) {
-            let end = (k + LOOKUP_BATCH).min(n);
-            seg.touch_directory(&hashes[end..(end + LOOKUP_BATCH).min(n)]);
-            for (i, &hash) in hashes[k..end].iter().enumerate() {
-                let qi = k + i;
-                if let Some(run) = seg.locate(hash) {
-                    runs.push(RunLoc {
-                        segment: si as u32,
-                        hash: qi as u32,
-                        lo: run.lo,
-                        hi: run.hi,
-                        at: run.at,
-                        mult: run.mult,
-                        weight: u32::try_from(query.times(qi).len()).unwrap_or(u32::MAX),
-                    });
-                }
-            }
-        }
+        seg.locate_each(hashes, LOOKUP_BATCH, |qi, run| {
+            runs.push(RunLoc {
+                segment: si as u32,
+                hash: qi as u32,
+                lo: run.lo,
+                hi: run.hi,
+                at: run.at,
+                mult: run.mult,
+                weight: u32::try_from(query.times(qi).len()).unwrap_or(u32::MAX),
+            });
+        });
     }
 }
 
@@ -905,20 +896,121 @@ impl Pass for FindGroups<'_> {
     }
 }
 
+/// Longest range a search for a reference reads in blocks, where the
+/// decoder has a kernel: a block answers for eight entries without a
+/// branch that depends on them, which beats halving up to three blocks.
+/// Measured on runs of 17, 48 and 136 postings: reading runs of 17 this
+/// way took a tenth off the pass; reading up to 64 entries, or halving a
+/// longer range down to 32 first, cost a sixth to a half more.
+const SCAN: usize = 24;
+
+/// First entry in `lo..hi` whose reference is not below `r`, or `hi`; the
+/// references in the range are ascending.
+#[inline(always)]
+fn first_not_below<D: Decoder>(
+    refs: &Packed,
+    mut lo: usize,
+    hi: usize,
+    r: u32,
+    decoder: D,
+) -> usize {
+    if hi - lo >= Packed::BLOCK_MIN
+        && hi - lo <= SCAN
+        && let Some(mut blocks) = refs.blocks(lo, decoder)
+    {
+        while lo < hi {
+            let Some(block) = blocks.next() else {
+                return refs.partition_point(lo, hi, |x| x < r);
+            };
+            let n = (hi - lo).min(LANES);
+            // Ascending, so the entries below `r` are the block's
+            // first ones and their count is where `r` belongs.
+            let below = block
+                .iter()
+                .enumerate()
+                .filter(|&(lane, &x)| lane < n && x < r)
+                .count();
+            lo += below;
+            if below < n {
+                break;
+            }
+        }
+        return lo;
+    }
+    refs.partition_point(lo, hi, |x| x < r)
+}
+
+/// The groups of [`find_groups`] in a run of references coded as gaps,
+/// at positions from `run_lo`: only the blocks whose span of references
+/// holds a survivor are decoded, and a group ends where the reference
+/// changes or the decoded stretch does.
+#[expect(clippy::too_many_arguments, reason = "the state of `find_groups`")]
+#[inline(always)]
+fn gap_groups<D: Decoder>(
+    coded: &Coded<'_>,
+    run_lo: usize,
+    mult: u8,
+    survivors: &[u32],
+    is_survivor: impl Fn(u32) -> bool,
+    index: &[u32],
+    decoder: D,
+    mut push: impl FnMut(usize, usize, u32),
+) {
+    // The first survivor not below the blocks offered so far.
+    let mut next = 0;
+    let want = |lo: u32, hi: u32| {
+        next += survivors[next..].partition_point(|&s| s < lo);
+        survivors.get(next).is_some_and(|&s| s <= hi)
+    };
+    if mult == 1 {
+        coded.for_each_where(decoder, want, |i, r| {
+            if is_survivor(r) {
+                push(run_lo + i, run_lo + i + 1, index[r as usize] - 1);
+            }
+        });
+        return;
+    }
+    // The group being read (its first position and reference), and the
+    // position after the last one read.
+    let mut open: Option<(usize, u32)> = None;
+    let mut after = 0;
+    coded.for_each_where(decoder, want, |i, r| {
+        match open {
+            Some((_, current)) if i == after && r == current => {}
+            _ => {
+                if let Some((start, current)) = open
+                    && is_survivor(current)
+                {
+                    push(run_lo + start, run_lo + after, index[current as usize] - 1);
+                }
+                open = Some((i, r));
+            }
+        }
+        after = i + 1;
+    });
+    if let Some((start, current)) = open
+        && is_survivor(current)
+    {
+        push(run_lo + start, run_lo + after, index[current as usize] - 1);
+    }
+}
+
 /// First half of the histogram pass: find every survivor's group in every
-/// run, in run order then reference order.
+/// run, in run order then reference order (`index` then holds each
+/// survivor's index plus one, and `survivors` ascend).
 ///
-/// A run is grouped by reference, ascending, and coded in blocks that each
-/// start from a whole reference, so only the blocks whose span of
-/// references holds a survivor (`survivors` ascend) are decoded; the rest
-/// cost a read of their first fields. A group of a survivor never reaches
-/// into a block passed over, which would have held the survivor, so a
-/// group ends where the reference changes or the decoded stretch does,
-/// and a bitmap membership test per group (`index` then holds each
-/// survivor's index plus one) says whether it is a survivor's. A run whose
-/// multiplicity is one has a group per posting and needs no look for the
-/// change. The references are decoded through `decoder` and are still
-/// cached from the totals pass.
+/// A run is grouped by reference, ascending. Packed references are read
+/// where they are: a run with few survivors relative to its length is
+/// searched for each survivor, and a run with many is walked once with a
+/// bitmap membership test per group. References coded as gaps are read in
+/// order, but every block of them starts from a whole reference, so only
+/// the blocks whose span of references holds a survivor are decoded; the
+/// rest cost a read of their first fields. A group of a survivor never
+/// reaches into a block passed over, which would have held the survivor,
+/// so a group ends where the reference changes or the decoded stretch
+/// does. A group is no longer than the run's multiplicity, so its end is
+/// not looked for when that is one. The references are decoded through
+/// `decoder` and are still cached from the totals pass.
 #[expect(clippy::too_many_arguments, reason = "the fields of `FindGroups`")]
 #[inline(always)]
 fn find_groups<D: Decoder>(
@@ -933,57 +1025,92 @@ fn find_groups<D: Decoder>(
 ) {
     groups.clear();
     debug_assert!(survivors.is_sorted(), "survivors ascend");
+    let n_surv = survivors.len();
     let is_survivor = |r: u32| survivor_bits[(r >> 6) as usize] & (1u64 << (r & 63)) != 0;
     for run in runs {
-        let refs = run.refs(segments);
-        let base = run.lo;
+        let (run_lo, run_hi) = (run.lo, run.hi);
+        let len = run_hi - run_lo;
+        // Groups as entries of the segment.
         let mut push = |i: usize, j: usize, survivor: u32| {
             let end = fanout.map_or(j, |f| j.min(i.saturating_add(f)));
             groups.push(Group {
                 segment: run.segment,
                 hash: run.hash,
                 survivor,
-                lo: base + i,
-                hi: base + end,
+                lo: i,
+                hi: end,
             });
         };
-        // The first survivor not below the blocks offered so far.
-        let mut next = 0;
-        let want = |lo: u32, hi: u32| {
-            next += survivors[next..].partition_point(|&s| s < lo);
-            survivors.get(next).is_some_and(|&s| s <= hi)
+        let refs = match run.refs(segments) {
+            CodedRun::Packed { refs, .. } => refs,
+            CodedRun::Gaps(coded) => {
+                gap_groups(
+                    &coded,
+                    run_lo,
+                    run.mult,
+                    survivors,
+                    is_survivor,
+                    index,
+                    decoder,
+                    &mut push,
+                );
+                continue;
+            }
         };
-        if run.mult == 1 {
+        // Probing costs about `survivors × log2(len)`; walking costs `len`.
+        let probe_cost = n_surv.saturating_mul((usize::BITS - len.leading_zeros()) as usize + 1);
+        if probe_cost < len {
+            // The most postings a group can have; a saturated multiplicity
+            // is only a lower bound.
+            let longest = if run.mult == u8::MAX {
+                len
+            } else {
+                usize::from(run.mult)
+            };
+            let mut lo = run_lo;
+            for (sv, &r) in survivors.iter().enumerate() {
+                let i = first_not_below(refs, lo, run_hi, r, decoder);
+                if i == run_hi {
+                    break;
+                }
+                lo = i;
+                if refs.get(i) != r {
+                    continue;
+                }
+                let j = if longest == 1 {
+                    i + 1
+                } else {
+                    let end = run_hi.min(i.saturating_add(longest));
+                    refs.partition_point(i + 1, end, |x| x == r)
+                };
+                push(i, j, sv as u32);
+                lo = j;
+            }
+        } else if run.mult == 1 {
             // Every posting is its own group: a membership test per
-            // posting, no look for the group's end.
-            refs.for_each_where(decoder, want, |i, r| {
+            // posting, no search for the group's end.
+            let mut i = run_lo;
+            refs.for_each_in(run_lo, run_hi, decoder, |r| {
                 if is_survivor(r) {
                     push(i, i + 1, index[r as usize] - 1);
                 }
+                i += 1;
             });
         } else {
-            // The group being read (its first position and reference), and
-            // the position after the last one read.
-            let mut open: Option<(usize, u32)> = None;
-            let mut after = 0;
-            refs.for_each_where(decoder, want, |i, r| {
-                match open {
-                    Some((_, current)) if i == after && r == current => {}
-                    _ => {
-                        if let Some((start, current)) = open
-                            && is_survivor(current)
-                        {
-                            push(start, after, index[current as usize] - 1);
-                        }
-                        open = Some((i, r));
+            // One read of the run: a group ends where the reference
+            // changes.
+            let (mut i, mut start, mut current) = (run_lo, run_lo, refs.get(run_lo));
+            refs.for_each_in(run_lo, run_hi, decoder, |r| {
+                if r != current {
+                    if is_survivor(current) {
+                        push(start, i, index[current as usize] - 1);
                     }
+                    (start, current) = (i, r);
                 }
-                after = i + 1;
+                i += 1;
             });
-            if let Some((start, current)) = open
-                && is_survivor(current)
-            {
-                push(start, after, index[current as usize] - 1);
+            if is_survivor(current) {
+                push(start, run_hi, index[current as usize] - 1);
             }
         }
     }
@@ -2431,6 +2558,7 @@ mod tests {
         let damaged = Catalog::from_parts(
             vec![(Segment::from_postings(rows), Some((0, 9)))],
             vec![true; 10],
+            crate::RefCoding::Packed,
         );
         let mut healthy = Catalog::new();
         for _ in 0..10 {

@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use afpindex::{Candidate, Catalog, Posting, Query, Scratch, SearchError, SearchOptions, Segment};
+use afpindex::{
+    Candidate, Catalog, Posting, Query, RefCoding, Scratch, SearchError, SearchOptions, Segment,
+};
 
 /// What the model predicts for one candidate. The engine's `Candidate` is
 /// `#[non_exhaustive]`, so it is compared field by field.
@@ -275,9 +277,17 @@ fn matches_the_model_on_random_catalogs() {
         let n_rows = 200 + rng.below(3_000) as usize;
         let rows = random_rows(&mut rng, refs, hashes, n_rows, spread);
         // Every construction path must agree with the model.
+        // Every construction path, references packed and coded as gaps,
+        // must agree with the model.
         let from_segment = Catalog::from_segment(Segment::from_postings(rows.clone()));
+        let from_gaps =
+            Catalog::from_segment(Segment::from_postings_coded(rows.clone(), RefCoding::Gaps));
         let mut builder = Catalog::builder();
+        let mut gap_builder = Catalog::builder();
+        gap_builder.ref_coding(RefCoding::Gaps);
         let mut incremental = Catalog::new();
+        let mut gap_incremental = Catalog::new();
+        gap_incremental.set_ref_coding(RefCoding::Gaps);
         for r in 0..refs {
             let mine: Vec<(u32, u32)> = rows
                 .iter()
@@ -285,9 +295,22 @@ fn matches_the_model_on_random_catalogs() {
                 .map(|p| (p.hash, p.time))
                 .collect();
             assert_eq!(builder.add(mine.iter().copied()), r);
+            assert_eq!(gap_builder.add(mine.iter().copied()), r);
+            assert_eq!(gap_incremental.add(mine.iter().copied()), r);
             assert_eq!(incremental.add(mine), r);
         }
         let built = builder.build();
+        let gap_built = gap_builder.build();
+        assert!(
+            gap_built
+                .segments()
+                .all(|s| s.ref_coding() == RefCoding::Gaps)
+        );
+        assert!(
+            gap_incremental
+                .segments()
+                .all(|s| s.ref_coding() == RefCoding::Gaps)
+        );
         let n_query = 1 + rng.below(400) as usize;
         let pairs = random_query(&mut rng, hashes, n_query, spread);
         let cap = [Some(64), None, Some(2)][case % 3];
@@ -300,6 +323,9 @@ fn matches_the_model_on_random_catalogs() {
                 ("from_segment", &from_segment),
                 ("builder", &built),
                 ("incremental", &incremental),
+                ("from_segment, gaps", &from_gaps),
+                ("builder, gaps", &gap_built),
+                ("incremental, gaps", &gap_incremental),
             ] {
                 let got = cat.search(&query, o, &mut scratch).unwrap();
                 assert_same(&got, &want, &format!("case {case} options {oi} {name}"));
@@ -465,6 +491,12 @@ fn random_mutation_sequences_match_the_model() {
     let mut scratch = Scratch::new();
     for seq in 0..6 {
         let mut cat = Catalog::new();
+        // Half the sequences start coding references as gaps, and every
+        // sequence switches now and then, so segments of both codings meet
+        // in its merges.
+        if seq % 2 == 1 {
+            cat.set_ref_coding(RefCoding::Gaps);
+        }
         let mut live: Live = BTreeMap::new();
         let mut ids: Vec<u32> = Vec::new();
         for step in 0..60 {
@@ -478,6 +510,11 @@ fn random_mutation_sequences_match_the_model() {
                 }
                 8 => cat.compact_deltas(),
                 9 => cat.compact(),
+                10 => cat.set_ref_coding(if rng.below(2) == 0 {
+                    RefCoding::Packed
+                } else {
+                    RefCoding::Gaps
+                }),
                 _ => {}
             }
             assert_eq!(cat.live_count(), live.len());
@@ -496,6 +533,7 @@ fn random_mutation_sequences_match_the_model() {
         }
         cat.compact();
         assert!(cat.segment_count() <= 1);
+        assert!(cat.segments().all(|s| s.ref_coding() == cat.ref_coding()));
         assert_eq!(
             cat.posting_count(),
             live.values().map(Vec::len).sum::<usize>()

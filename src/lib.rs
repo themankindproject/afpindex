@@ -139,6 +139,7 @@ pub use error::SnapshotError;
 pub use par::{max_threads, set_max_threads};
 pub use posting::Posting;
 pub use query::Query;
+pub use refs::RefCoding;
 pub use search::{Bin, Candidate, NoiseStats, Scratch, SearchOptions, Survivor, vote_floor};
 pub use segment::{Postings, Run, Segment};
 #[cfg(feature = "mmap")]

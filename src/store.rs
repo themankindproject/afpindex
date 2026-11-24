@@ -12,7 +12,7 @@ use crate::catalog::{MergeParts, NO_FILE, Part};
 use crate::manifest::{self, Entry, LOCK, MANIFEST, Manifest};
 use crate::segment::to_file::{Settings, merge_to_file};
 use crate::snapshot::map_segment;
-use crate::{Catalog, Segment, SnapshotError};
+use crate::{Catalog, RefCoding, Segment, SnapshotError};
 
 mod build;
 pub use build::CatalogStoreBuilder;
@@ -259,6 +259,13 @@ impl CatalogStore {
         self.spill = postings;
     }
 
+    /// Store the references of the segments built and merged from now on
+    /// as `coding` says, as [`Catalog::set_ref_coding`] does. The choice is
+    /// recorded in the manifest at the next [`CatalogStore::save`].
+    pub fn set_ref_coding(&mut self, coding: RefCoding) {
+        self.catalog.set_ref_coding(coding);
+    }
+
     /// Add a reference from its `(hash, time)` rows and return its id, as
     /// [`Catalog::add`] does.
     ///
@@ -447,6 +454,7 @@ impl CatalogStore {
             generation,
             reference_count: self.catalog.reference_count() as u64,
             next_file: self.next_file,
+            ref_coding: self.catalog.ref_coding(),
             live: self.catalog.live_table().to_vec(),
             entries,
         };
@@ -541,7 +549,7 @@ fn load(dir: &Path, trusted: bool) -> Result<(Catalog, Manifest), SnapshotError>
         let bytes = fs::read(dir.join(MANIFEST))?;
         let manifest = manifest::read(&bytes)?;
         if let Some(parts) = map_all(dir, &manifest, trusted)? {
-            let catalog = Catalog::from_files(parts, manifest.live.clone());
+            let catalog = Catalog::from_files(parts, manifest.live.clone(), manifest.ref_coding);
             return Ok((catalog, manifest));
         }
     }
@@ -759,12 +767,13 @@ impl MergeParts for DirMerger<'_> {
         &mut self,
         sides: &[(&Segment, Option<&F>)],
         ids: (u32, u32),
+        coding: RefCoding,
     ) -> io::Result<Option<Part>> {
         let total = sides
             .iter()
             .fold(0usize, |n, (segment, _)| n.saturating_add(segment.len()));
         if total < self.spill {
-            let merged = Segment::merge_all(sides);
+            let merged = Segment::merge_all(sides, coding);
             return Ok((!merged.is_empty()).then(|| Part::new(merged, ids)));
         }
         self.faults.create()?;
@@ -776,7 +785,7 @@ impl MergeParts for DirMerger<'_> {
         let name = self.dir.join(manifest::segment_name(file));
         let temp = self.dir.join(manifest::temp_name(file));
         // A merge that fails removes what it wrote.
-        let written = merge_to_file(sides, &temp, settings)?;
+        let written = merge_to_file(sides, &temp, coding, settings)?;
         if written.ids.is_none() {
             // Every posting was a removed reference's: no part, no file.
             let _ = fs::remove_file(&temp);
@@ -1652,6 +1661,58 @@ mod tests {
         let a = Catalog::map_dir(&dir).expect("the original");
         let b = Catalog::map_dir(&other).expect("the copy");
         assert_same(&a, &b, "the copy");
+    }
+
+    /// The coding of the references outlives a save: a store opened again
+    /// keeps building gap-coded segments, and a switch back to packing
+    /// followed by a compaction rewrites every segment, on disk too.
+    #[test]
+    fn the_reference_coding_is_saved_and_a_compaction_converts() {
+        let mut rng = Rng(0xC0DE_0001);
+        let scratch = TempDir::new("coding");
+        let dir = scratch.dir.join("store");
+        let mut store = CatalogStore::create(&dir).expect("a fresh directory");
+        store.set_spill_postings(0);
+        store.set_ref_coding(RefCoding::Gaps);
+        let mut plain = Catalog::new();
+        for _ in 0..6 {
+            let r = rows(&mut rng, 40);
+            store.add(r.clone()).expect("an addition");
+            plain.add(r);
+        }
+        store.save().expect("the save");
+        drop(store);
+        let mut store = CatalogStore::open(&dir).expect("the directory opens");
+        assert_eq!(store.catalog().ref_coding(), RefCoding::Gaps);
+        assert!(
+            store
+                .catalog()
+                .segments()
+                .all(|s| s.ref_coding() == RefCoding::Gaps)
+        );
+        assert_same(store.catalog(), &plain, "gaps, reopened");
+        let mapped = Catalog::map_dir(&dir).expect("the map");
+        assert_eq!(mapped.ref_coding(), RefCoding::Gaps);
+        assert_same(&mapped, &plain, "gaps, mapped");
+        drop(mapped);
+
+        store.set_ref_coding(RefCoding::Packed);
+        let r = rows(&mut rng, 40);
+        store.add(r.clone()).expect("an addition");
+        plain.add(r);
+        store.compact().expect("the compaction");
+        plain.compact();
+        store.save().expect("the save");
+        drop(store);
+        let store = CatalogStore::open(&dir).expect("the directory opens");
+        assert_eq!(store.catalog().ref_coding(), RefCoding::Packed);
+        assert!(
+            store
+                .catalog()
+                .segments()
+                .all(|s| s.ref_coding() == RefCoding::Packed)
+        );
+        assert_same(store.catalog(), &plain, "packed, reopened");
     }
 
     /// A compaction that a keep empties leaves no part and no file.

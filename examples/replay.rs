@@ -13,16 +13,20 @@
 //! `Catalog::read_from` instead of being built from the arrays, which is
 //! the production load path; `--save <file>` writes that file after a
 //! build from the arrays. `--mmap` maps it instead, and `--trusted` loads
-//! or maps it without the checks that read every posting.
+//! or maps it without the checks that read every posting. `--gaps` codes
+//! the references of a catalog built from the arrays as gaps instead of
+//! packing them.
 //!
-//! usage: `replay <snapshot_dir> <fp_dir> <out_dir> [--save <file>] [--mmap] [--trusted]`
+//! usage: `replay <snapshot_dir> <fp_dir> <out_dir> [--save <file>] [--mmap] [--trusted] [--gaps]`
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use afpindex::{Candidate, Catalog, Posting, Query, Scratch, SearchOptions, Segment, vote_floor};
+use afpindex::{
+    Candidate, Catalog, Posting, Query, RefCoding, Scratch, SearchOptions, Segment, vote_floor,
+};
 
 type Clip = (String, usize, Query, SearchOptions);
 
@@ -222,6 +226,11 @@ fn main() {
     let save = (args.get(4).map(String::as_str) == Some("--save")).then(|| Path::new(&args[5]));
     let mmap = args.iter().any(|a| a == "--mmap");
     let trusted = args.iter().any(|a| a == "--trusted");
+    let coding = if args.iter().any(|a| a == "--gaps") {
+        RefCoding::Gaps
+    } else {
+        RefCoding::Packed
+    };
     let afc = snap.join("catalog.afc");
     let cat = if afc.exists() && save.is_none() {
         let t = Instant::now();
@@ -251,7 +260,7 @@ fn main() {
     } else {
         let rows = load_rows(snap);
         let t = Instant::now();
-        let seg = Segment::from_postings(rows);
+        let seg = Segment::from_postings_coded(rows, coding);
         let (ref_bits, time_bits) = seg.bits();
         eprintln!(
             "segment: {} postings, {} keys, bits per posting {:.2} + {:.2}, heap {:.2} GiB, built in {:.1} s",

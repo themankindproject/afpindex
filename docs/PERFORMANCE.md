@@ -185,7 +185,7 @@ query. On the laptop:
 
 | | this crate | prototype in the notes |
 |---|---|---|
-| memory | 1.94 GiB (17-bit references, 15-bit times; 1.70 GiB since [references are coded as gaps](#references-coded-as-gaps)) | 3.0 GiB packed, 3.8 GiB raw |
+| memory | 1.94 GiB (17-bit references, 15-bit times; 1.70 GiB with [references coded as gaps](#references-coded-as-gaps)) | 3.0 GiB packed, 3.8 GiB raw |
 | build from rows in memory | 8.3 s | 333 s including the export |
 | search, one thread | p50 1.10 ms, p95 8.8 ms, max 14.2 ms | p50 2.9 ms |
 | searches per second, 4 threads | 1,456 | 890 |
@@ -877,19 +877,22 @@ tunable is the recommendation in
 
 ## References coded as gaps
 
-Inside a run the references ascend, so snapshot format 6 stores them as
+Inside a run the references ascend, so `RefCoding::Gaps` stores them as
 the gaps between neighbours instead of packing each at the width of the
-largest id. A run is cut into blocks of 65 references; each block holds
-its first reference whole (at a width shared by the run), a five-bit
-width, and 64 gaps at the width of its widest (`src/refs.rs`). The
-directory slot grew from 12 bytes to 16 to hold where a run's coded
-references start, and the file stores that offset per key.
+largest id, which stays the default (`RefCoding::Packed`). A run is cut
+into blocks of 65 references; each block holds its first reference whole
+(at a width shared by the run), a five-bit width, and 64 gaps at the
+width of its widest (`src/refs.rs`). A segment of gaps has 16-byte
+directory slots instead of 12 to hold where a run's coded references
+start, and its file stores that offset per key; a packed segment needs
+neither, since a run's references start at its first posting times the
+width.
 
 On the real catalog with a laptop (i5-1135G7), against packed references
 at 17 bits; the two builds alternated, five rounds, best time per clip,
 and candidates were byte-identical on all 104 clips:
 
-| | packed (format 5) | gaps (format 6) |
+| | packed | gaps |
 |---|---|---|
 | reference bits per posting | 17 | 12.50 |
 | file | 2.05 GB | 1.79 GB (−12.5 %) |
@@ -927,6 +930,27 @@ taken `read_from` from 0.99 s to 1.74 s.
 
 Elias–Fano coding would take 11.6 bits a reference on the same runs
 (sized, not built), but has no eight-at-a-time decode with these kernels.
+
+### Packed stays the default
+
+Since the costs above fall on every search, the coding is a choice per
+catalog rather than the format. Each segment records its own coding,
+search and merge take both, and a packed segment is what it was before
+gaps existed: the same file size (within 8 bytes),
+the same 1.94 GiB of heap on the real catalog, and byte-identical
+candidates on all 104 clips. A search costs within about 1 % of the
+instructions it did then, the lookups compiled once for each kind of
+directory slot (`profile search … 750 0 0 2`, callgrind):
+
+| synthetic catalog | packed, before the choice | packed | gaps |
+|---|---|---|---|
+| 120,000 references × 500 over 450,000 hashes | 169.2 M | 170.6 M | 298.0 M |
+| 20,000 references × 3,000 over 3.6 M hashes | 72.2 M | 73.0 M | 111.0 M |
+
+On the same two catalogs the files take 245.9 MB and 271.8 MB packed,
+217.0 MB and 283.7 MB coded as gaps: with 17 postings per hash, as in
+the second, the larger directory slots and the stored offsets outweigh
+the bits the gaps save.
 
 ## Reproducing
 

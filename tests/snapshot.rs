@@ -1,7 +1,9 @@
 //! Snapshot round trips and corruption checks (`std` feature).
 #![cfg(feature = "std")]
 
-use afpindex::{Catalog, Posting, Query, Scratch, SearchOptions, Segment, SnapshotError};
+use afpindex::{
+    Catalog, Posting, Query, RefCoding, Scratch, SearchOptions, Segment, SnapshotError,
+};
 
 const HEADER: usize = 48;
 /// Bytes of the four checksums that close a segment snapshot.
@@ -28,7 +30,13 @@ fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize, usize) {
     let refs_end = refs + ref_bits.div_ceil(8) as usize;
     let keys = refs_end.next_multiple_of(8);
     let offsets = (keys + 4 * k).next_multiple_of(8);
-    let mults = offsets + 16 * (k + 1);
+    // Packed references store no reference offsets.
+    let offset_arrays = if seg.ref_coding() == RefCoding::Gaps {
+        2
+    } else {
+        1
+    };
+    let mults = offsets + offset_arrays * 8 * (k + 1);
     let footer = (mults + k).next_multiple_of(8);
     (keys, offsets, mults, refs, times, refs_end, footer)
 }
@@ -42,7 +50,12 @@ fn query() -> Query {
 
 #[test]
 fn write_then_read_gives_the_same_segment_and_results() {
-    let seg = sample();
+    for coding in [RefCoding::Packed, RefCoding::Gaps] {
+        write_then_read(sample().to_ref_coding(coding));
+    }
+}
+
+fn write_then_read(seg: Segment) {
     let mut bytes = Vec::new();
     seg.write_to(&mut bytes).unwrap();
     let (.., footer) = layout(&seg);
@@ -64,10 +77,15 @@ fn write_then_read_gives_the_same_segment_and_results() {
 
 #[test]
 fn corruption_is_reported_not_trusted() {
-    let seg = sample();
+    for coding in [RefCoding::Packed, RefCoding::Gaps] {
+        corruption_of(&sample().to_ref_coding(coding));
+    }
+}
+
+fn corruption_of(seg: &Segment) {
     let mut good = Vec::new();
     seg.write_to(&mut good).unwrap();
-    let (keys_at, offsets_at, mults_at, refs_at, times_at, refs_end, footer_at) = layout(&seg);
+    let (keys_at, offsets_at, mults_at, refs_at, times_at, refs_end, footer_at) = layout(seg);
 
     let mut bad = good.clone();
     bad[0] = b'X';
@@ -220,6 +238,59 @@ fn catalog_snapshot_keeps_ids_liveness_and_segments() {
     assert_eq!(back.segment_count(), 0);
 }
 
+/// A catalog snapshot keeps the reference coding: a loaded gap-coded
+/// catalog goes on building gap-coded segments and finds what the
+/// original finds, and a packed catalog of gap-coded segments compacts
+/// to packed ones.
+#[test]
+fn catalog_snapshot_keeps_the_reference_coding() {
+    let mut cat = Catalog::new();
+    cat.set_ref_coding(RefCoding::Gaps);
+    for i in 0..20u32 {
+        cat.add((0..80u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j * 5) % 3_000, j)));
+    }
+    cat.remove(3);
+    let q = Query::from_pairs(
+        (0..80u32).map(|j| {
+            (
+                11u32.wrapping_mul(2_654_435_761).wrapping_add(j * 5) % 3_000,
+                j,
+            )
+        }),
+        Some(64),
+    );
+    let o = SearchOptions::default();
+    let mut s = Scratch::new();
+    let before = cat.search(&q, &o, &mut s).unwrap();
+    assert!(before.iter().any(|c| c.reference == 11 && c.delta == 0));
+
+    let mut bytes = Vec::new();
+    cat.write_to(&mut bytes).unwrap();
+    let mut back = Catalog::read_from(bytes.as_slice()).unwrap();
+    assert_eq!(back.ref_coding(), RefCoding::Gaps);
+    assert!(
+        back.segments()
+            .all(|seg| seg.ref_coding() == RefCoding::Gaps)
+    );
+    assert_eq!(back.search(&q, &o, &mut s).unwrap(), before);
+    back.add([(1, 1)]);
+    assert!(
+        back.segments()
+            .all(|seg| seg.ref_coding() == RefCoding::Gaps)
+    );
+
+    let mut packed = Catalog::read_from(bytes.as_slice()).unwrap();
+    packed.set_ref_coding(RefCoding::Packed);
+    packed.compact();
+    assert_eq!(packed.segment_count(), 1);
+    assert!(
+        packed
+            .segments()
+            .all(|seg| seg.ref_coding() == RefCoding::Packed)
+    );
+    assert_eq!(packed.search(&q, &o, &mut s).unwrap(), before);
+}
+
 /// A trusted load gives the catalog a full one gives: ids, liveness,
 /// segments, search results, and which segments hold removed references.
 #[test]
@@ -360,10 +431,23 @@ fn full_width_references_and_times_round_trip() {
     assert_eq!(back.postings().map(|p| p.time).max(), Some(u32::MAX));
 }
 
+/// The length and FNV-1a hash of a snapshot.
+type Fingerprint = (usize, u64);
+
 /// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
-/// snapshots (format version 5).
-const CATALOG_GOLDEN: (usize, u64) = (141_368, 2_899_748_872_935_442_005);
-const SEGMENT_GOLDEN: (usize, u64) = (48_912, 17_202_788_408_228_145_483);
+/// snapshots (format version 6), references packed and coded as gaps.
+const GOLDEN: [(RefCoding, Fingerprint, Fingerprint); 2] = [
+    (
+        RefCoding::Packed,
+        (96_960, 14_242_011_734_919_917_638),
+        (32_096, 9_762_890_450_843_162_370),
+    ),
+    (
+        RefCoding::Gaps,
+        (141_368, 5_637_219_941_371_129_125),
+        (48_912, 1_996_736_645_012_667_181),
+    ),
+];
 
 /// FNV-1a over `bytes`.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -378,6 +462,16 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// here.
 #[test]
 fn snapshot_bytes_are_stable() {
+    for (coding, catalog, segment) in GOLDEN {
+        let (got_catalog, got_segment) = fixed_snapshots(coding);
+        assert_eq!(got_catalog, catalog, "{coding:?}: the catalog");
+        assert_eq!(got_segment, segment, "{coding:?}: the segment");
+    }
+}
+
+/// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
+/// snapshots, references stored as `coding` says.
+fn fixed_snapshots(coding: RefCoding) -> (Fingerprint, Fingerprint) {
     let rows = |seed: u32| {
         (0..300u32).map(move |j| {
             (
@@ -387,6 +481,7 @@ fn snapshot_bytes_are_stable() {
         })
     };
     let mut builder = Catalog::builder();
+    builder.ref_coding(coding);
     for seed in 0..40 {
         builder.add(rows(seed));
     }
@@ -398,16 +493,17 @@ fn snapshot_bytes_are_stable() {
     assert!(cat.segment_count() > 1, "a base and at least one delta");
     let mut bytes = Vec::new();
     cat.write_to(&mut bytes).unwrap();
-    assert_eq!((bytes.len(), fnv1a(&bytes)), CATALOG_GOLDEN);
+    let catalog = (bytes.len(), fnv1a(&bytes));
 
-    let seg = Segment::from_postings(
+    let seg = Segment::from_postings_coded(
         (0..2_000u32)
             .map(|i| Posting::new(i.wrapping_mul(0x9E37_79B1) >> 20, i % 300, i * 11 % 70_000))
             .collect(),
+        coding,
     );
     let mut bytes = Vec::new();
     seg.write_to(&mut bytes).unwrap();
-    assert_eq!((bytes.len(), fnv1a(&bytes)), SEGMENT_GOLDEN);
+    (catalog, (bytes.len(), fnv1a(&bytes)))
 }
 
 /// Memory-mapped snapshots (`mmap` feature).
@@ -507,17 +603,22 @@ mod mapped {
 
     #[test]
     fn mapped_segment_round_trips_and_checks_every_data_byte() {
-        let seg = sample();
+        for coding in [RefCoding::Packed, RefCoding::Gaps] {
+            mapped_round_trip(&sample().to_ref_coding(coding));
+        }
+    }
+
+    fn mapped_round_trip(seg: &Segment) {
         let mut good = Vec::new();
         seg.write_to(&mut good).unwrap();
         let path = temp("segment.afx");
         std::fs::write(&path, &good).unwrap();
         let back = Segment::map_from(&path).unwrap();
-        assert_eq!(back, seg);
+        assert_eq!(&back, seg);
         assert_eq!(back.max_reference(), seg.max_reference());
         drop(back);
         // Every data byte is checksummed in place, as on the read path.
-        let (keys_at, offsets_at, mults_at, refs_at, times_at, refs_end, footer_at) = layout(&seg);
+        let (keys_at, offsets_at, mults_at, refs_at, times_at, refs_end, footer_at) = layout(seg);
         for at in [
             keys_at,
             offsets_at + 8,

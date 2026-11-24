@@ -10,7 +10,7 @@ use crate::catalog::Part;
 use crate::manifest::{self, MANIFEST};
 use crate::segment::to_file::{Settings, merge_to_file};
 use crate::snapshot::map_segment;
-use crate::{Catalog, Posting, Segment, SnapshotError};
+use crate::{Catalog, Posting, RefCoding, Segment, SnapshotError};
 
 /// Rows a builder holds before it sorts them into a chunk file: 16 M, a
 /// few hundred megabytes while they are sorted.
@@ -56,6 +56,8 @@ pub struct CatalogStoreBuilder {
     /// The files of the chunks written so far, in order.
     chunks: Vec<u32>,
     next_file: u32,
+    /// How the chunks and their merges store the references.
+    coding: RefCoding,
     settings: Settings,
     faults: Faults,
     /// The directory's lock, handed to the store `finish` returns.
@@ -89,6 +91,7 @@ impl CatalogStore {
             next: 0,
             chunks: Vec::new(),
             next_file: 0,
+            coding: RefCoding::default(),
             settings: Settings::default(),
             faults: Faults::default(),
             lock: Some(lock),
@@ -102,6 +105,14 @@ impl CatalogStoreBuilder {
     /// chunk, so a chunk can hold more.
     pub fn chunk_postings(&mut self, postings: usize) -> &mut Self {
         self.chunk = postings.max(1);
+        self
+    }
+
+    /// Store the references as `coding` says (see [`RefCoding`]), in the
+    /// segment the build makes and in the catalog's later merges; packed
+    /// unless set.
+    pub fn ref_coding(&mut self, coding: RefCoding) -> &mut Self {
+        self.coding = coding;
         self
     }
 
@@ -139,7 +150,7 @@ impl CatalogStoreBuilder {
 
     /// Sort the rows held into a segment and write it to a chunk file.
     fn write_chunk(&mut self) -> io::Result<()> {
-        let segment = Segment::from_postings(core::mem::take(&mut self.rows));
+        let segment = Segment::from_postings_in(core::mem::take(&mut self.rows), self.coding);
         if segment.is_empty() {
             return Ok(());
         }
@@ -195,7 +206,7 @@ impl CatalogStoreBuilder {
                 parts.push(Part::new(segment, ids).with_file(file));
             }
         }
-        let catalog = Catalog::from_files(parts, alloc::vec![true; n]);
+        let catalog = Catalog::from_files(parts, alloc::vec![true; n], self.coding);
         let mut store =
             CatalogStore::new(&self.dir, catalog, None, self.next_file, self.lock.take());
         store.settings = self.settings;
@@ -234,7 +245,7 @@ impl CatalogStoreBuilder {
             ..self.settings
         };
         let file = self.take_file();
-        merge_to_file(&sides, &self.temp(file), settings)?;
+        merge_to_file(&sides, &self.temp(file), self.coding, settings)?;
         drop(sides);
         drop(segments);
         for &input in group {

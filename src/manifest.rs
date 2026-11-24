@@ -8,10 +8,10 @@
 //! lets the old ones go.
 //!
 //! ```text
-//! 0   "AFCM"            4   version u32 = 1
+//! 0   "AFCM"            4   version u32 = 2
 //! 8   generation u64    16  reference_count u64
 //! 24  segment_count u64 32  next_file u32
-//! 36  reserved u32 = 0
+//! 36  flags u32         (bit 0: the catalog stores references as gaps)
 //! 40  live bitmap, one bit per id, LSB first, ceil(n / 8) bytes
 //!     (zero-padded to 8)
 //!     segment_count entries of 40 bytes, in catalog order (largest first)
@@ -23,7 +23,8 @@
 //! its reference range (`min u32`, `max u32`, both zero without postings):
 //! what a load checks the file against before it trusts a mapping of it.
 //!
-//! The checksum folds the header words, the bitmap bytes as little-endian
+//! A flag this version does not know is refused. The checksum folds the
+//! header words (the flags with `next_file`), the bitmap bytes as little-endian
 //! 64-bit words (the last one zero-padded) and then each entry's five
 //! words, as [`Checksum`] does elsewhere.
 //!
@@ -38,8 +39,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use std::io::Write;
 
-use crate::SnapshotError;
 use crate::snapshot::{Checksum, pad_len};
+use crate::{RefCoding, SnapshotError};
 
 /// The first bytes of a manifest.
 const MAGIC: &[u8; 4] = b"AFCM";
@@ -49,7 +50,9 @@ const HEADER: usize = 40;
 /// Bytes of one segment entry.
 const ENTRY: usize = 40;
 /// Version of the manifest format.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+/// The flag of a catalog that stores its references as gaps.
+const GAPS: u32 = 1;
 /// Name of the file that names the catalog.
 pub(super) const MANIFEST: &str = "MANIFEST";
 /// Name of a manifest being written.
@@ -83,6 +86,9 @@ pub(super) struct Manifest {
     pub(super) reference_count: u64,
     /// The id the next segment file gets; ids are never reused.
     pub(super) next_file: u32,
+    /// How the catalog stores the references of the segments it builds
+    /// and merges.
+    pub(super) ref_coding: RefCoding,
     pub(super) live: Vec<bool>,
     pub(super) entries: Vec<Entry>,
 }
@@ -102,9 +108,10 @@ impl Manifest {
             ck.word(word);
             w.write_all(&word.to_le_bytes())?;
         }
-        ck.word(u64::from(self.next_file));
+        let flags = flags_of(self.ref_coding);
+        ck.word(u64::from(self.next_file) | u64::from(flags) << 32);
         w.write_all(&self.next_file.to_le_bytes())?;
-        w.write_all(&0u32.to_le_bytes())?;
+        w.write_all(&flags.to_le_bytes())?;
         let mut bitmap = alloc::vec![0u8; self.live.len().div_ceil(8)];
         for (i, &live) in self.live.iter().enumerate() {
             if live {
@@ -130,6 +137,14 @@ impl Manifest {
         }
         w.write_all(&ck.finish().to_le_bytes())?;
         w.flush()
+    }
+}
+
+/// The flags that record `coding`.
+fn flags_of(coding: RefCoding) -> u32 {
+    match coding {
+        RefCoding::Packed => 0,
+        RefCoding::Gaps => GAPS,
     }
 }
 
@@ -191,6 +206,18 @@ fn check_files(entries: &[Entry], next_file: u32) -> Result<(), SnapshotError> {
     Ok(())
 }
 
+/// The coding the flags of a manifest name; a flag this version does not
+/// know is refused.
+fn coding_of(flags: u32) -> Result<RefCoding, SnapshotError> {
+    match flags {
+        0 => Ok(RefCoding::Packed),
+        GAPS => Ok(RefCoding::Gaps),
+        _ => Err(SnapshotError::Corrupt(
+            "a manifest flag this version does not know",
+        )),
+    }
+}
+
 pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
     let head = bytes.get(..HEADER).ok_or(SnapshotError::Truncated)?;
     if head[..4] != *MAGIC {
@@ -206,6 +233,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
     let reference_count = next_word().ok_or(SnapshotError::Truncated)?;
     let n_segments = next_word().ok_or(SnapshotError::Truncated)?;
     let next_file = u32::from_le_bytes(head[32..36].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(head[36..40].try_into().expect("4 bytes"));
+    let ref_coding = coding_of(flags)?;
     if n_segments > MAX_SEGMENTS {
         return Err(SnapshotError::Corrupt("implausible segment count"));
     }
@@ -218,7 +247,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
         generation,
         reference_count,
         n_segments,
-        u64::from(next_file),
+        u64::from(next_file) | u64::from(flags) << 32,
     ] {
         ck.word(word);
     }
@@ -283,6 +312,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
         generation,
         reference_count,
         next_file,
+        ref_coding,
         live,
         entries,
     })
@@ -299,6 +329,7 @@ mod tests {
             generation: 7,
             reference_count: 5,
             next_file: 9,
+            ref_coding: RefCoding::Gaps,
             live,
             entries: alloc::vec![
                 Entry {
@@ -344,11 +375,19 @@ mod tests {
         bad_magic[0] = b'X';
         assert!(matches!(read(&bad_magic), Err(SnapshotError::BadMagic)));
         let mut later = bytes;
-        later[4] = 2;
+        later[4] = 3;
         assert!(matches!(
             read(&later),
-            Err(SnapshotError::UnsupportedVersion(2))
+            Err(SnapshotError::UnsupportedVersion(3))
         ));
+        // A flag this version does not know.
+        let mut flagged = sample();
+        flagged.ref_coding = RefCoding::Packed;
+        let mut bytes = Vec::new();
+        flagged.write(&mut bytes).unwrap();
+        assert_eq!(read(&bytes).unwrap().ref_coding, RefCoding::Packed);
+        bytes[36] |= 2;
+        assert!(matches!(read(&bytes), Err(SnapshotError::Corrupt(_))));
     }
 
     #[test]

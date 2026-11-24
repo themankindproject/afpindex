@@ -27,7 +27,7 @@
 //! a few references steps from base to base and decodes only the blocks
 //! that can hold them.
 
-use crate::packed::{Packed, PackedBuilder};
+use crate::packed::{Packed, PackedBuilder, View};
 use crate::simd::{Decoder, LANES, Scalar, WINDOW};
 
 /// References per block: a base and up to 64 gaps, eight kernel blocks.
@@ -100,35 +100,116 @@ fn window(bytes: &[u8], bit: u64) -> u64 {
     w >> (bit & 7)
 }
 
-/// The coded references of a segment: every run, back to back in key
-/// order, as one array of single bits.
+/// How a segment stores its reference ids: the choice between the
+/// fastest searches and the smallest catalog. A catalog applies its choice
+/// to every segment it builds or merges; see `Catalog::set_ref_coding`.
+///
+/// [`Catalog::set_ref_coding`]: crate::Catalog::set_ref_coding
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RefCoding {
+    /// Every reference at the width of the segment's largest id: 17 bits
+    /// for the 120,329 ids of the real catalog. A search decodes eight at
+    /// a time with no arithmetic between them, and finds a reference in a
+    /// run by halving it.
+    #[default]
+    Packed,
+    /// The gaps between neighbouring references inside each run, in
+    /// blocks that each start from a whole reference: 12.5 bits a
+    /// reference on the real catalog, about a quarter fewer than packed and
+    /// 12.5 % off the catalog. A search adds the gaps up as it decodes,
+    /// which costs 7–12 % on runs that are not yet cached and about half
+    /// again on runs that are.
+    Gaps,
+}
+
+/// How the references of one segment lie in its stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layout {
+    /// Packed at this width: posting `i`'s reference is value `i`, and
+    /// the stream is an array of that width.
+    Packed(u32),
+    /// Coded run by run as gaps (see the module docs), in an array of
+    /// single bits.
+    Gaps,
+}
+
+impl Layout {
+    /// The layout `coding` gives references up to `max_ref`.
+    pub(crate) const fn new(coding: RefCoding, max_ref: u32) -> Self {
+        match coding {
+            RefCoding::Packed => Self::Packed(Packed::bits_for(max_ref)),
+            RefCoding::Gaps => Self::Gaps,
+        }
+    }
+
+    /// The coding this layout is a form of.
+    pub(crate) const fn coding(self) -> RefCoding {
+        match self {
+            Self::Packed(_) => RefCoding::Packed,
+            Self::Gaps => RefCoding::Gaps,
+        }
+    }
+
+    /// The width of the array the stream is held in.
+    pub(crate) const fn array_width(self) -> u32 {
+        match self {
+            Self::Packed(width) => width,
+            Self::Gaps => 1,
+        }
+    }
+
+    /// Whether a run of a stream laid out as `from` can be appended to one
+    /// laid out as this without being decoded and coded again: packed
+    /// values change width as they are copied, gaps are copied as bits.
+    pub(crate) const fn copies(self, from: Layout) -> bool {
+        matches!(
+            (self, from),
+            (Self::Packed(_), Self::Packed(_)) | (Self::Gaps, Self::Gaps)
+        )
+    }
+}
+
+/// The references of a segment, packed or coded run by run (see
+/// [`Layout`]), as one array.
 #[derive(Clone)]
 pub(crate) struct Refs {
     bits: Packed,
+    layout: Layout,
 }
 
 impl Default for Refs {
     fn default() -> Self {
-        Self {
-            bits: PackedBuilder::with_capacity(0, 1).finish(),
-        }
+        Self::new(Packed::default(), Layout::Packed(0))
     }
 }
 
 impl Refs {
-    /// Wrap a stream of bits (an array of width 1, or an empty one).
-    pub(crate) fn from_bits(bits: Packed) -> Self {
-        assert!(
-            bits.bits() == 1 || bits.is_empty(),
-            "coded references are an array of single bits"
-        );
+    /// Wrap `bits`, an array of the width `layout` holds its stream in (or
+    /// an empty one).
+    pub(crate) fn new(bits: Packed, layout: Layout) -> Self {
+        let width = layout.array_width();
         if bits.is_empty() {
-            return Self::default();
+            return Self {
+                bits: PackedBuilder::with_capacity(0, width).finish(),
+                layout,
+            };
         }
-        Self { bits }
+        assert_eq!(
+            bits.bits(),
+            width,
+            "the references are an array of their layout's width"
+        );
+        Self { bits, layout }
     }
 
-    /// The stream as an array of single bits, for a caller that copies
+    /// How the references lie in the stream.
+    #[inline]
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// The stream as the array it is held in, for a caller that copies
     /// stretches of it.
     #[inline]
     pub(crate) fn bits(&self) -> &Packed {
@@ -138,7 +219,7 @@ impl Refs {
     /// Bits in the stream.
     #[inline]
     pub(crate) fn bit_len(&self) -> u64 {
-        self.bits.len() as u64
+        self.bits.bit_len()
     }
 
     /// The bytes of the stream, without the slack.
@@ -152,15 +233,22 @@ impl Refs {
         self.bits.heap_bytes()
     }
 
-    /// The run of `n` references (at least one) whose coding starts at bit
-    /// `at`.
+    /// The run of `n` references (at least one) of postings `lo..lo + n`,
+    /// whose stream starts at bit `at`.
     #[inline]
-    pub(crate) fn run(&self, at: u64, n: usize) -> Run<'_> {
+    pub(crate) fn run(&self, at: u64, lo: usize, n: usize) -> Run<'_> {
         debug_assert!(n > 0, "a run is never empty");
-        Run {
-            bytes: self.bits.raw(),
-            at,
-            n,
+        match self.layout {
+            Layout::Packed(_) => Run::Packed {
+                refs: &self.bits,
+                lo,
+                hi: lo + n,
+            },
+            Layout::Gaps => Run::Gaps(Coded {
+                bytes: self.bits.raw(),
+                at,
+                n,
+            }),
         }
     }
 
@@ -189,9 +277,11 @@ impl Refs {
 }
 
 impl PartialEq for Refs {
-    /// The same bits: the coding is canonical, so the same runs.
+    /// The same layout and the same bits: the coding is canonical, so the
+    /// same runs.
     fn eq(&self, other: &Self) -> bool {
-        self.bits.len() == other.bits.len()
+        self.layout == other.layout
+            && self.bits.len() == other.bits.len()
             && self.bits.raw()[..data_len(&self.bits)] == other.bits.raw()[..data_len(&other.bits)]
     }
 }
@@ -206,14 +296,139 @@ fn data_len(bits: &Packed) -> usize {
 impl core::fmt::Debug for Refs {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Refs")
-            .field("bits", &self.bits.len())
+            .field("layout", &self.layout)
+            .field("bits", &self.bit_len())
             .finish_non_exhaustive()
     }
 }
 
-/// One run's coded references: `n` of them from bit `at` of a stream.
+/// One run's references, as its segment holds them.
 #[derive(Clone, Copy)]
-pub(crate) struct Run<'a> {
+pub(crate) enum Run<'a> {
+    /// Values `lo..hi` of a packed array.
+    Packed {
+        refs: &'a Packed,
+        lo: usize,
+        hi: usize,
+    },
+    /// A run coded as gaps.
+    Gaps(Coded<'a>),
+}
+
+impl<'a> Run<'a> {
+    /// The first (smallest) reference.
+    #[inline]
+    pub(crate) fn first(&self) -> u32 {
+        match self {
+            Self::Packed { refs, lo, .. } => refs.get(*lo),
+            Self::Gaps(run) => run.first(),
+        }
+    }
+
+    /// The references in order, one at a time.
+    #[inline]
+    pub(crate) fn cursor(&self) -> Cursor<'a> {
+        match *self {
+            Self::Packed { refs, lo, hi } => Cursor::Packed {
+                values: refs.view(),
+                next: lo,
+                end: hi,
+            },
+            Self::Gaps(run) => Cursor::Gaps(run.cursor()),
+        }
+    }
+
+    /// Call `f` with every reference in order, decoded one at a time.
+    #[inline]
+    pub(crate) fn for_each(&self, f: impl FnMut(u32)) {
+        match self {
+            Self::Packed { refs, lo, hi } => refs.for_each(*lo, *hi, f),
+            Self::Gaps(run) => run.for_each(f),
+        }
+    }
+
+    /// Call `f` with every reference in order and its position in the
+    /// run, decoded eight at a time where `decoder` has a kernel.
+    #[inline(always)]
+    pub(crate) fn for_each_in<D: Decoder>(&self, decoder: D, mut f: impl FnMut(usize, u32)) {
+        match self {
+            Self::Packed { refs, lo, hi } => {
+                let mut i = 0;
+                refs.for_each_in(
+                    *lo,
+                    *hi,
+                    decoder,
+                    #[inline(always)]
+                    |r| {
+                        f(i, r);
+                        i += 1;
+                    },
+                );
+            }
+            Self::Gaps(run) => run.for_each_in(decoder, f),
+        }
+    }
+
+    /// Decode the run, refusing a gap coding that is not canonical or does
+    /// not end exactly at bit `end` (see [`Coded::check`]). A packed run
+    /// is the values its offsets say, which its caller has checked.
+    #[cfg(any(feature = "std", test))]
+    #[inline(always)]
+    pub(crate) fn check<D: Decoder>(
+        &self,
+        decoder: D,
+        end: u64,
+        mut f: impl FnMut(u32),
+    ) -> Result<(), &'static str> {
+        match self {
+            Self::Packed { refs, lo, hi } => {
+                refs.for_each_in(*lo, *hi, decoder, &mut f);
+                Ok(())
+            }
+            Self::Gaps(run) => run.check(decoder, end, f),
+        }
+    }
+}
+
+/// The references of a run, one at a time (see [`Run::cursor`]).
+#[derive(Clone)]
+pub(crate) enum Cursor<'a> {
+    Packed {
+        values: View<'a>,
+        next: usize,
+        end: usize,
+    },
+    Gaps(GapCursor<'a>),
+}
+
+impl Iterator for Cursor<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        match self {
+            Self::Packed { values, next, end } => (*next < *end).then(|| {
+                *next += 1;
+                values.get(*next - 1)
+            }),
+            Self::Gaps(cursor) => cursor.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Packed { next, end, .. } => (end - next, Some(end - next)),
+            Self::Gaps(cursor) => cursor.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for Cursor<'_> {}
+
+/// One run's references coded as gaps: `n` of them from bit `at` of a
+/// stream.
+#[derive(Clone, Copy)]
+pub(crate) struct Coded<'a> {
     bytes: &'a [u8],
     at: u64,
     n: usize,
@@ -301,7 +516,7 @@ fn gaps<D: Decoder>(
     }
 }
 
-impl<'a> Run<'a> {
+impl<'a> Coded<'a> {
     /// The width of the run's bases and the bit its first block starts at.
     #[inline(always)]
     fn base_width(&self) -> (u32, u64) {
@@ -334,9 +549,9 @@ impl<'a> Run<'a> {
 
     /// The references in order, one at a time.
     #[inline]
-    pub(crate) fn cursor(&self) -> Cursor<'a> {
+    pub(crate) fn cursor(&self) -> GapCursor<'a> {
         let (base_width, bit) = self.base_width();
-        Cursor {
+        GapCursor {
             bytes: self.bytes,
             bit,
             base_width,
@@ -362,7 +577,7 @@ impl<'a> Run<'a> {
         self.for_each_where(decoder, |_, _| true, f);
     }
 
-    /// As [`Run::for_each_in`], for the blocks `want` accepts only. It is
+    /// As [`Coded::for_each_in`], for the blocks `want` accepts only. It is
     /// offered each block in order as `(base, bound)`: every reference of
     /// the block lies in `base..=bound` (the bound is the next block's
     /// base, or `u32::MAX` for the last block). A block passed over costs
@@ -408,7 +623,7 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Decode the run as [`Run::for_each_in`] does, refusing a coding that
+    /// Decode the run as [`Coded::for_each_in`] does, refusing a coding that
     /// is not the canonical one, references that descend or pass the
     /// largest id, or a coding that does not end exactly at bit `end`.
     /// Nothing is read past `end` but the window of a field that starts
@@ -476,9 +691,10 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The references of a run, one at a time (see [`Run::cursor`]).
+/// The references of a run coded as gaps, one at a time (see
+/// [`Coded::cursor`]).
 #[derive(Clone)]
-pub(crate) struct Cursor<'a> {
+pub(crate) struct GapCursor<'a> {
     bytes: &'a [u8],
     /// The next field.
     bit: u64,
@@ -494,7 +710,7 @@ pub(crate) struct Cursor<'a> {
     value: u32,
 }
 
-impl Iterator for Cursor<'_> {
+impl Iterator for GapCursor<'_> {
     type Item = u32;
 
     #[inline]
@@ -522,7 +738,7 @@ impl Iterator for Cursor<'_> {
     }
 }
 
-impl ExactSizeIterator for Cursor<'_> {}
+impl ExactSizeIterator for GapCursor<'_> {}
 
 /// Code the run `refs` (ascending, at least one) onto the end of `out`,
 /// an array of single bits.
@@ -561,6 +777,14 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    /// The run of `n` references coded from bit `at` of `refs`.
+    fn gap_run(refs: &Refs, at: u64, n: usize) -> Coded<'_> {
+        match refs.run(at, 0, n) {
+            Run::Gaps(run) => run,
+            Run::Packed { .. } => unreachable!("coded as gaps"),
+        }
+    }
 
     struct Rng(u64);
 
@@ -613,7 +837,7 @@ mod tests {
             push_run(&mut out, run);
         }
         starts.push(out.len() as u64);
-        (Refs::from_bits(out.finish()), starts)
+        (Refs::new(out.finish(), Layout::Gaps), starts)
     }
 
     #[test]
@@ -621,7 +845,7 @@ mod tests {
         let runs = runs();
         let (refs, starts) = coded(&runs);
         for (k, want) in runs.iter().enumerate() {
-            let run = refs.run(starts[k], want.len());
+            let run = gap_run(&refs, starts[k], want.len());
             assert_eq!(run.first(), want[0]);
             assert_eq!(run.end(), starts[k + 1], "run {k}");
             assert_eq!(run_bits(want), starts[k + 1] - starts[k]);
@@ -651,7 +875,7 @@ mod tests {
 
     /// Reads a run through whatever decoder it is given.
     struct Collect<'a, 'b> {
-        run: Run<'a>,
+        run: Coded<'a>,
         out: &'b mut Vec<u32>,
     }
 
@@ -669,7 +893,7 @@ mod tests {
 
     /// Checks a run through whatever decoder it is given.
     struct Checked<'a, 'b> {
-        run: Run<'a>,
+        run: Coded<'a>,
         end: u64,
         out: &'b mut Vec<u32>,
     }
@@ -706,31 +930,31 @@ mod tests {
         let mut out = PackedBuilder::with_capacity(0, 1);
         out.push_bits(code_of(8), WIDTH_BITS);
         out.push_bits(3, 8);
-        let refs = Refs::from_bits(out.finish());
-        assert!(refs.run(0, 1).check(Scalar, 13, |_| {}).is_err());
+        let refs = Refs::new(out.finish(), Layout::Gaps);
+        assert!(gap_run(&refs, 0, 1).check(Scalar, 13, |_| {}).is_err());
         // A block wider than its widest gap.
         let mut out = PackedBuilder::with_capacity(0, 1);
         out.push_bits(code_of(2), WIDTH_BITS);
         out.push_bits(3, 2);
         out.push_bits(code_of(4), WIDTH_BITS);
         out.push_bits(1, 4);
-        let refs = Refs::from_bits(out.finish());
-        assert!(refs.run(0, 2).check(Scalar, 16, |_| {}).is_err());
+        let refs = Refs::new(out.finish(), Layout::Gaps);
+        assert!(gap_run(&refs, 0, 2).check(Scalar, 16, |_| {}).is_err());
         // The canonical coding of the same run passes, at its own end only.
         let mut out = PackedBuilder::with_capacity(0, 1);
         push_run(&mut out, &[3, 4]);
-        let refs = Refs::from_bits(out.finish());
-        assert!(refs.run(0, 2).check(Scalar, 13, |_| {}).is_ok());
-        assert!(refs.run(0, 2).check(Scalar, 14, |_| {}).is_err());
+        let refs = Refs::new(out.finish(), Layout::Gaps);
+        assert!(gap_run(&refs, 0, 2).check(Scalar, 13, |_| {}).is_ok());
+        assert!(gap_run(&refs, 0, 2).check(Scalar, 14, |_| {}).is_err());
         // A gap width that would read past the run's end and the stream's.
         let mut out = PackedBuilder::with_capacity(0, 1);
         out.push_bits(code_of(4), WIDTH_BITS);
         out.push_bits(3, 4);
         out.push_bits(code_of(32), WIDTH_BITS);
         let end = out.len() as u64;
-        let refs = Refs::from_bits(out.finish());
+        let refs = Refs::new(out.finish(), Layout::Gaps);
         assert_eq!(
-            refs.run(0, BLOCK).check(Scalar, end, |_| {}),
+            gap_run(&refs, 0, BLOCK).check(Scalar, end, |_| {}),
             Err("a run runs past its end")
         );
         // A gap past the largest id.
@@ -738,9 +962,9 @@ mod tests {
         push_run(&mut out, &[u32::MAX - 1]);
         out.push_bits(code_of(2), WIDTH_BITS);
         out.push_bits(2, 2);
-        let refs = Refs::from_bits(out.finish());
+        let refs = Refs::new(out.finish(), Layout::Gaps);
         let end = refs.bit_len();
-        assert!(refs.run(0, 2).check(Scalar, end, |_| {}).is_err());
+        assert!(gap_run(&refs, 0, 2).check(Scalar, end, |_| {}).is_err());
     }
 
     #[test]
@@ -752,9 +976,9 @@ mod tests {
         out.push_bits(code_of(0), WIDTH_BITS);
         out.push_bits(3, 4);
         let end = out.len() as u64;
-        let refs = Refs::from_bits(out.finish());
+        let refs = Refs::new(out.finish(), Layout::Gaps);
         assert_eq!(
-            refs.run(0, BLOCK + 1).check(Scalar, end, |_| {}),
+            gap_run(&refs, 0, BLOCK + 1).check(Scalar, end, |_| {}),
             Err("a run's references descend")
         );
     }
@@ -764,7 +988,7 @@ mod tests {
     #[test]
     fn blocks_are_offered_with_bounds_and_skipped() {
         struct Where<'a, 'b> {
-            run: Run<'a>,
+            run: Coded<'a>,
             keep: u32,
             offered: &'b mut Vec<(u32, u32)>,
             out: &'b mut Vec<(usize, u32)>,
@@ -787,7 +1011,7 @@ mod tests {
         let runs = runs();
         let (refs, starts) = coded(&runs);
         for (k, want) in runs.iter().enumerate() {
-            let run = refs.run(starts[k], want.len());
+            let run = gap_run(&refs, starts[k], want.len());
             for keep in [want[0], want[want.len() / 2], want[want.len() - 1]] {
                 let (mut offered, mut out) = (Vec::new(), Vec::new());
                 crate::simd::run(Where {

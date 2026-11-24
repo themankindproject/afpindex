@@ -39,10 +39,11 @@ use std::path::Path;
 use std::sync::{Condvar, Mutex, PoisonError};
 
 use super::parallel::Plan;
-use super::{MAX_POSTINGS, Parts, Segment, copied_ids, postings, time_bits, union_ids};
+use super::{MAX_POSTINGS, Parts, Segment, copied_ids, layout_of, postings, time_bits, union_ids};
 use crate::packed::Packed;
 use crate::par::{lock, run_tasks, slots};
-use crate::snapshot::{ByteSum, HEADER, Head, index_sum, pad_len, write_index};
+use crate::refs::{Layout, RefCoding};
+use crate::snapshot::{ByteSum, HEADER, Head, index_sum, pad_len, stored_ref_offsets, write_index};
 
 /// Postings of input a piece holds at most: a piece in flight is tens of
 /// megabytes however large the merge is.
@@ -100,8 +101,9 @@ impl Default for Settings {
     }
 }
 
-/// Merge `sides` as [`Segment::merge_all`] does and write the result to
-/// `path` as a segment snapshot, holding no array of the result in memory.
+/// Merge `sides` as [`Segment::merge_all`] does, the references stored as
+/// `coding` says, and write the result to `path` as a segment snapshot,
+/// holding no array of the result in memory.
 ///
 /// The file is removed again if anything fails, so a caller never finds a
 /// half-written snapshot where it asked for one. `settings` says how the
@@ -116,17 +118,25 @@ impl Default for Settings {
 pub(crate) fn merge_to_file<F: Fn(u32) -> bool + Sync>(
     sides: &[(&Segment, Option<&F>)],
     path: &Path,
+    coding: RefCoding,
     settings: Settings,
 ) -> std::io::Result<Written> {
     // The result holds at most the postings of its sources.
     let most = postings(sides);
     let pieces = most.div_ceil(settings.piece.max(1)).max(1);
-    let plan = Plan::new(sides, pieces);
+    let layout = layout_of(sides, coding);
+    let plan = Plan::new(sides, pieces, layout);
     let guard = RemoveOnFailure::new(path);
     // Runs of a source without a `keep` are copied unread; every posting of
     // such a source is in the merge, and so its range.
     let copied = copied_ids(sides);
-    let written = write_pieces(&plan, path, (time_bits(sides), copied), most, settings)?;
+    let written = write_pieces(
+        &plan,
+        path,
+        (time_bits(sides), layout, copied),
+        most,
+        settings,
+    )?;
     guard.keep();
     Ok(written)
 }
@@ -168,7 +178,7 @@ impl Drop for RemoveOnFailure<'_> {
 fn write_pieces<F: Fn(u32) -> bool + Sync>(
     plan: &Plan<'_, F>,
     path: &Path,
-    (time_bits, copied): (u32, Option<(u32, u32)>),
+    (time_bits, layout, copied): (u32, Layout, Option<(u32, u32)>),
     most: usize,
     settings: Settings,
 ) -> std::io::Result<Written> {
@@ -189,8 +199,8 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
         ref_starts: Vec::new(),
         mults: Vec::new(),
         ids: copied,
-        refs: Sink::new(refs, 1),
-        times: Sink::new(times, time_bits),
+        refs: Sink::new(refs),
+        times: Sink::new(times),
         held: 0,
         high: 0,
         stop: false,
@@ -237,15 +247,17 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
         head.move_down(room, refs_at, index_at - refs_at)?;
     }
     head.seek_to(index_at)?;
-    write_index(&mut head, &keys, (&starts, &ref_starts), &mults)?;
+    let stored = stored_ref_offsets(layout, &ref_starts);
+    write_index(&mut head, &keys, (&starts, stored), &mults)?;
     let header = Head {
         time_bits,
+        refs: layout,
         keys: keys.len() as u64,
         postings,
         range: ids.unwrap_or((0, 0)),
         ref_bits,
     };
-    let index = index_sum(&keys, (&starts, &ref_starts), &mults);
+    let index = index_sum(&keys, (&starts, stored), &mults);
     head.put(&header.footer([times_sum, refs_sum, index]))?;
     // References that moved down left their old bytes past the end.
     head.end_here()?;
@@ -297,7 +309,7 @@ impl Writer {
         self.times.append(&parts.times)?;
         self.refs.append(&parts.refs)?;
         self.postings += parts.times.len() as u64;
-        self.ref_bits += parts.refs.len() as u64;
+        self.ref_bits += parts.refs.bit_len();
         self.next += 1;
         Ok(())
     }
@@ -502,7 +514,6 @@ impl Write for Handle {
 struct Sink {
     out: Handle,
     sum: ByteSum,
-    width: u32,
     /// Bits appended so far.
     at: u64,
     /// The placed bits of the byte `at` falls in, below `at % 8`.
@@ -512,11 +523,10 @@ struct Sink {
 }
 
 impl Sink {
-    fn new(out: Handle, width: u32) -> Self {
+    fn new(out: Handle) -> Self {
         Self {
             out,
             sum: ByteSum::new(),
-            width,
             at: 0,
             pending: 0,
             buf: Vec::new(),
@@ -531,7 +541,7 @@ impl Sink {
 
     /// Append `piece`'s values after the values appended so far.
     fn append(&mut self, piece: &Packed) -> std::io::Result<()> {
-        let total = piece.len() as u64 * u64::from(self.width);
+        let total = piece.bit_len();
         if total == 0 {
             return Ok(());
         }
@@ -654,30 +664,38 @@ mod tests {
 
     /// What `Segment::merge_all` gives, written by `Segment::write_to`:
     /// the bytes every merge to a file must match.
-    fn expected<F: Fn(u32) -> bool + Sync>(sides: &[(&Segment, Option<&F>)]) -> (Vec<u8>, Segment) {
-        let merged = Segment::merge_all(sides);
+    fn expected<F: Fn(u32) -> bool + Sync>(
+        sides: &[(&Segment, Option<&F>)],
+        coding: RefCoding,
+    ) -> (Vec<u8>, Segment) {
+        let merged = Segment::merge_all(sides, coding);
         let mut bytes = Vec::new();
         merged.write_to(&mut bytes).expect("writing to memory");
         (bytes, merged)
     }
 
-    /// Merge to a file and check it against the bytes of the same merge in
-    /// memory.
+    /// Merge to a file, references packed and coded as gaps, and check it
+    /// against the bytes of the same merge in memory; return the packed
+    /// merge.
     fn check<F: Fn(u32) -> bool + Sync>(
         sides: &[(&Segment, Option<&F>)],
         settings: Settings,
         what: &str,
     ) -> Segment {
-        let (want, merged) = expected(sides);
-        let scratch = Scratch::new(what);
-        let path = scratch.path("out.afs");
-        let written = merge_to_file(sides, &path, settings).expect("the merge writes");
-        let got = std::fs::read(&path).expect("the file it wrote");
-        assert_eq!(got, want, "{what}: bytes");
-        assert_eq!(written.ids, merged_refs(&merged), "{what}: the range");
-        let back = Segment::read_from(got.as_slice()).expect("a valid snapshot");
-        assert_eq!(back, merged, "{what}: the file reads back");
-        merged
+        let mut packed = None;
+        for coding in [RefCoding::Gaps, RefCoding::Packed] {
+            let (want, merged) = expected(sides, coding);
+            let scratch = Scratch::new(what);
+            let path = scratch.path("out.afs");
+            let written = merge_to_file(sides, &path, coding, settings).expect("the merge writes");
+            let got = std::fs::read(&path).expect("the file it wrote");
+            assert_eq!(got, want, "{what}, {coding:?}: bytes");
+            assert_eq!(written.ids, merged_refs(&merged), "{what}: the range");
+            let back = Segment::read_from(got.as_slice()).expect("a valid snapshot");
+            assert_eq!(back, merged, "{what}: the file reads back");
+            packed = Some(merged);
+        }
+        packed.expect("a merge of each coding")
     }
 
     /// The smallest and the largest reference of a segment, if any.
@@ -846,8 +864,8 @@ mod tests {
             (&[(&Segment::default(), None)][..], "an empty source"),
         ] {
             let path = scratch.path("empty.afs");
-            let written =
-                merge_to_file(sides, &path, Settings::default()).expect("the merge writes");
+            let written = merge_to_file(sides, &path, RefCoding::Packed, Settings::default())
+                .expect("the merge writes");
             assert_eq!(written.ids, None, "{what}");
             let mut want = Vec::new();
             Segment::default()
@@ -892,10 +910,10 @@ mod tests {
         for (threads, piece) in [(1, 500), (3, 900), (4, 7_000)] {
             let sides: Vec<(&Segment, Option<&Keep<'_>>)> =
                 vec![(&mapped, Some(&keep)), (&other, None)];
-            let (want, merged) = expected(&sides);
+            let (want, merged) = expected(&sides, RefCoding::Gaps);
             let path = scratch.path("merged-by-pieces.afs");
             let settings = settings(threads, piece);
-            merge_to_file(&sides, &path, settings).expect("the merge writes");
+            merge_to_file(&sides, &path, RefCoding::Gaps, settings).expect("the merge writes");
             assert_eq!(
                 std::fs::read(&path).expect("the file it wrote"),
                 want,
@@ -916,12 +934,13 @@ mod tests {
         // A source that is itself a file a merge wrote.
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&mapped, None)];
         let path = scratch.path("twice.afs");
-        merge_to_file(&sides, &path, settings(2, 300)).expect("the merge writes");
+        merge_to_file(&sides, &path, RefCoding::Gaps, settings(2, 300)).expect("the merge writes");
         let once = Segment::map_from(&path).expect("a valid snapshot");
         let again = scratch.path("thrice.afs");
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&once, None)];
-        merge_to_file(&sides, &again, settings(3, 400)).expect("the second merge writes");
-        let (want, _) = expected(&sides);
+        merge_to_file(&sides, &again, RefCoding::Gaps, settings(3, 400))
+            .expect("the second merge writes");
+        let (want, _) = expected(&sides, RefCoding::Gaps);
         assert_eq!(std::fs::read(&again).expect("the second file"), want);
     }
 
@@ -937,8 +956,13 @@ mod tests {
         for threads in [1usize, 2, 4] {
             // Pieces of 32 postings: 875 of them, so threads run well
             // ahead of the file if the merge lets them.
-            let written = merge_to_file(&sides, &scratch.path("window.afs"), settings(threads, 32))
-                .expect("the merge writes");
+            let written = merge_to_file(
+                &sides,
+                &scratch.path("window.afs"),
+                RefCoding::Gaps,
+                settings(threads, 32),
+            )
+            .expect("the merge writes");
             assert!(
                 written.held <= WINDOW * threads + threads,
                 "{threads} threads held {} pieces",
@@ -956,8 +980,8 @@ mod tests {
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&a, None)];
         let scratch = Scratch::new("failed-merge");
         let missing = scratch.path("no-such-directory").join("out.afs");
-        let err =
-            merge_to_file(&sides, &missing, Settings::default()).expect_err("no such directory");
+        let err = merge_to_file(&sides, &missing, RefCoding::Gaps, Settings::default())
+            .expect_err("no such directory");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(
             !missing.exists(),
@@ -977,13 +1001,15 @@ mod tests {
                 fail_after: Some(limit),
                 sync: true,
             };
-            let err = merge_to_file(&sides, &path, settings).expect_err("the write fails");
+            let err = merge_to_file(&sides, &path, RefCoding::Gaps, settings)
+                .expect_err("the write fails");
             assert_eq!(err.kind(), std::io::ErrorKind::Other, "{limit}");
             assert!(!path.exists(), "the file went with the error at {limit}");
         }
         // And the next merge without the limit writes the file.
         let path = scratch.path("fine.afs");
-        merge_to_file(&sides, &path, Settings::default()).expect("the merge writes");
+        merge_to_file(&sides, &path, RefCoding::Gaps, Settings::default())
+            .expect("the merge writes");
         assert!(path.exists());
     }
 
@@ -1016,7 +1042,7 @@ mod tests {
                 let keep: Keep<'_> = &failing;
                 let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&a, Some(&keep))];
                 let merged = catch_unwind(AssertUnwindSafe(|| {
-                    merge_to_file(&sides, &worker_path, settings(threads, 32))
+                    merge_to_file(&sides, &worker_path, RefCoding::Gaps, settings(threads, 32))
                 }));
                 let _ = done.send(merged.is_err());
             });

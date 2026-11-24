@@ -11,13 +11,21 @@ First release: the engine of the *afpindex* design notes as a library.
 ### Added
 
 - `Segment`: postings sorted by `(hash, reference, time)` in flat arrays,
-  times bit-packed to the width of the largest and references coded as
-  the gaps inside each run, in blocks of 65 that each start from a whole
-  reference (`Segment::bits`; 12.5 bits a reference on the real catalog
-  instead of 17, 1.70 GiB instead of 1.94), with an open-addressing directory from hash to run
+  times bit-packed to the width of the largest and references either
+  packed the same way (the default) or coded as the gaps inside each run,
+  in blocks of 65 that each start from a whole reference (`RefCoding`,
+  `Segment::bits`; 12.5 bits a reference on the real catalog instead of
+  17, 1.70 GiB instead of 1.94, for 7–48 % on a search), with an
+  open-addressing directory from hash to run
   that also records each run's multiplicity (the most postings any one
   reference has in it) and no offsets array; build from rows, look a
   hash's run up, iterate, `merge` two segments, `filter` by reference.
+- `RefCoding`, chosen per catalog (`Catalog::set_ref_coding`,
+  `CatalogBuilder::ref_coding`, `CatalogStore::set_ref_coding`,
+  `CatalogStoreBuilder::ref_coding`) or per segment
+  (`Segment::from_postings_coded`, `Segment::to_ref_coding`): segments of
+  both codings search and merge together, `compact` converts a catalog,
+  and snapshots and manifests keep the choice.
 - `Catalog` and `CatalogBuilder`: dense reference ids, bulk build with one
   sort, incremental `add` into geometrically merged delta segments,
   `add_many` to add a batch of references with one sort and one merge,
@@ -160,7 +168,7 @@ First release: the engine of the *afpindex* design notes as a library.
 On an AWS `m7i-flex.large` (two hardware threads) with the 499 M-posting
 catalog of the design notes (120,329 references) and its 104 real clips,
 `simd` build, references packed at 17 bits: 1.94 GiB in memory (1.70 GiB
-coded as gaps, format 6), a search takes 0.65 ms at the median and
+coded as gaps), a search takes 0.65 ms at the median and
 4.5 ms at p95 on one thread, two threads answer 779 searches per second,
 and the snapshot loads in 2.0 s (`read_from`) or 0.9 s (`map_from`).
 Candidates are identical to the design notes' prototype on all 104 clips.

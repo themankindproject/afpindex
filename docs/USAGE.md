@@ -761,41 +761,63 @@ segments are freed when the last search lets go.
 
 | What | Cost |
 |---|---|
-| A posting | Its coded reference (12.5 bits on the real catalog) plus its time width, in bits (`Segment::bits`, `Segment::time_bits`) |
-| A distinct hash, per segment | 4 bytes of key plus about 27 of directory, or plus about 64 in a segment of fewer than 2<sup>20</sup> keys |
+| A posting | Its reference (17 bits packed on the real catalog, 12.5 coded as gaps) plus its time width, in bits (`Segment::bits`, `Segment::time_bits`) |
+| A distinct hash, per segment | 4 bytes of key plus about 20 of directory (27 over references coded as gaps), or plus about 48 (64) in a segment of fewer than 2<sup>20</sup> keys |
 | An id | 1 byte of liveness table |
 | A `Scratch`, per thread | 4 bytes and a bit per id of the largest catalog it searched, plus buffers that grow with the queries; a search on several threads adds 4 bytes per id for each thread beyond the first |
 | A search's histogram | 16 bytes per survivor vote and 32 bytes per survivor group, while it runs |
 | Building with `CatalogBuilder` | 12 bytes per collected posting, about 20 while `build` runs |
 
-**References and times.** Inside a run the references ascend, so a
-segment codes them as the gaps between neighbours, in blocks of 65 that
-each start from a whole reference and take the width of their widest
-gap ([The format](#the-format)). On the real catalog that is 12.5 bits a
-reference, where packing them at the width of the largest of 120,329
-ids took 17. Times are packed at the bits of the largest time: up to
-32,767 frames (8.7 minutes at 62.5 frames per second) take 15. The real
-catalog: 499.4 M postings × 27.5 bits = 1.60 GiB, plus 3.66 M hashes ×
-31 bytes = 0.10 GiB, is the 1.70 GiB it measures, 57 % less than 32-bit
-arrays. Decoding the gaps costs a search 7–12 % when its runs are not
-already in the cache, and about half again when they are
-([PERFORMANCE.md](PERFORMANCE.md#references-coded-as-gaps)).
+**References and times.** A segment holds its references in one of two
+ways, a trade of memory for search time that `RefCoding` names:
+
+- `RefCoding::Packed`, the default: each at the width of the largest id,
+  17 bits for the 120,329 ids of the real catalog. A search reads a run's
+  references where they are, and searches inside a long run for the few
+  references still in the running.
+- `RefCoding::Gaps`: inside a run the references ascend, so they are
+  coded as the gaps between neighbours, in blocks of 65 that each start
+  from a whole reference and take the width of their widest gap
+  ([The format](#the-format)): 12.5 bits a reference on the real
+  catalog. Where a run's references start no longer follows from where
+  its postings do, so the directory's slots take 16 bytes instead of 12.
+  Decoding costs a search 7–12 % when its runs are not already in the
+  cache, about half again when they are, and eight threads answer 10 %
+  fewer searches
+  ([PERFORMANCE.md](PERFORMANCE.md#references-coded-as-gaps)).
+
+`Catalog::set_ref_coding`, `CatalogBuilder::ref_coding`,
+`CatalogStore::set_ref_coding` and `CatalogStoreBuilder::ref_coding` choose it;
+`Segment::from_postings_coded` and `Segment::to_ref_coding` do for a
+bare segment. A catalog builds and merges its segments in its coding from
+then on, segments of either coding search together, and `compact`
+rewrites every segment in the catalog's coding. A snapshot and a store's
+manifest keep the choice. Code as gaps when memory, the page cache or the
+disk is what limits a host; keep the default when latency or throughput
+is.
+
+Times are packed at the bits of the largest time: up to 32,767 frames
+(8.7 minutes at 62.5 frames per second) take 15. The real catalog,
+packed: 499.4 M postings × 32 bits = 1.86 GiB, plus 3.66 M hashes × 24
+bytes = 0.08 GiB, is the 1.94 GiB it measures, 51 % less than 32-bit
+arrays; coded as gaps, 27.5 bits = 1.60 GiB plus 31 bytes a hash = 0.10
+GiB is 1.70 GiB, 12 % less again.
 
 **The directory** is an open-addressing table rebuilt from the keys
 whenever a segment is built or loaded (never stored). A slot holds the
-run's start and length, where its coded references start, and the most
-postings any one reference has in it, which is what lets the search skip
-the fanout test on most runs.
+run's start and length and the most postings any one reference has in
+it, which is what lets the search skip the fanout test on most runs, and
+over references coded as gaps where its coded references start.
 A directory of fewer than 2<sup>20</sup> keys leaves four slots per key
 instead of the 1.7 of a larger one: a lookup that misses then reaches an
 empty slot in under two probes instead of five, which is what most
-lookups in a delta segment are, at 64 bytes per key instead of 27 (at
-most about 67 MB for a segment that small). There is no offsets array:
+lookups in a delta segment are, at 48 bytes per key instead of 20 (64
+instead of 27 over gaps; at most about 67 MB for a segment that small). There is no offsets array:
 iteration in key order looks each key up in the directory, and a merge
 recovers the order of the runs from one scan of the directory and a sort
 of what it finds (16 bytes per distinct hash while the merge runs). A
 directory too large for the cache is filled a region at a time from a
-copy of its entries sorted by region, another 12 bytes per hash until it
+copy of its entries sorted by region, another slot per hash until it
 is built.
 
 **Measuring.** `Catalog::heap_bytes()` (segments and liveness table),
@@ -949,14 +971,14 @@ anyway).
 Both formats are version 6: little-endian arrays behind a header, every
 section 8-byte aligned, closed by checksums. References and times are
 stored as they are in memory, so a file is about the size of the
-catalog. A file of an earlier version is refused with
+catalog, references packed or coded as gaps as the catalog holds them. A file of an earlier version is refused with
 `SnapshotError::UnsupportedVersion`: there is no reader for it, so write
 the catalog out again with the current version.
 
 ```text
 Segment snapshot
 0   "AFIX"            4   version u32 = 6
-8   time_bits u32     12  reserved u32 = 0
+8   time_bits u32     12  layout u32  (the reference width 0–32, or u32::MAX: gaps)
 16  key_count u64     24  posting_count u64
 32  min_ref u32       36  max_ref u32      (both 0 without postings)
 40  ref_bits u64                           (bits of the coded references)
@@ -964,7 +986,7 @@ Segment snapshot
     refs    ceil(ref_bits / 8) bytes                    (zero-padded to 8)
     keys    u32 × key_count                             (zero-padded to 8)
     offsets u64 × (key_count + 1)
-    ref_offsets u64 × (key_count + 1)
+    ref_offsets u64 × (key_count + 1)                   (gaps only)
     mults   u8  × key_count                             (zero-padded to 8)
     checksum u64 of times, in four lanes
     checksum u64 of refs, in four lanes
@@ -973,14 +995,17 @@ Segment snapshot
 
 Catalog snapshot
 0   "AFCT"            4   version u32 = 6
-8   flags u32 = 0     12  reserved u32 = 0
+8   flags u32         12  reserved u32 = 0   (flags bit 0: the catalog codes references as gaps)
 16  reference_count u64   24  segment_count u64
 32  live bitmap, one bit per id, LSB first              (zero-padded to 8)
     checksum u64
     segment_count segment snapshots, back to back
 ```
 
-The references of a run are coded in blocks of up to 65, in one stream
+Packed references are one array at the width the layout word gives, a
+posting's reference at its index, so a run's start among the postings
+is where its references are and no `ref_offsets` are stored. References
+coded as gaps are coded run by run in blocks of up to 65, in one stream
 of bits for the whole segment, little-endian bit order:
 
 ```text
@@ -1020,8 +1045,9 @@ and of its coded references, which the two offsets hold, and its
 multiplicity. Each run is sorted by
 reference, so its first and last posting bound the segment's range.
 
-The catalog's flags and reserved field are written as zero and ignored
-on read; the segment's reserved field must be zero. The directory is not stored; it is rebuilt from the keys and the
+A flag or a layout word this version does not know is refused as
+`Corrupt`; the catalog's reserved field is written as zero and ignored
+on read. The directory is not stored; it is rebuilt from the keys and the
 multiplicities on load (0.05 s on the real catalog).
 
 ### A catalog in a directory
@@ -1074,10 +1100,10 @@ pub fn directory_tour(dir: &Path) -> usize {
 The layout:
 
 ```text
-0   "AFCM"            4   version u32 = 1
+0   "AFCM"            4   version u32 = 2
 8   generation u64    16  reference_count u64
 24  segment_count u64 32  next_file u32
-36  reserved u32 = 0
+36  flags u32         (bit 0: the catalog codes references as gaps)
 40  live bitmap, one bit per id, LSB first, ceil(n / 8) bytes
     (zero-padded to 8)
     segment_count entries of 40 bytes, in catalog order (largest first)
@@ -1199,7 +1225,7 @@ own: for an offline batch job that builds once and serves many times, for
 ids you assign yourself, or to inspect what the index holds.
 
 ```rust
-use afpindex::{Catalog, Posting, Segment};
+use afpindex::{Catalog, Posting, RefCoding, Segment};
 
 /// Build, inspect, filter and merge segments, then serve one as a catalog.
 pub fn segment_tour() -> Catalog {
@@ -1218,12 +1244,16 @@ pub fn segment_tour() -> Catalog {
     assert_eq!(run.iter().collect::<Vec<_>>(), [(0, 10), (1, 3)]);
     assert!(segment.run(8).is_none());
 
-    // Bits in all: each run codes its first reference and the gaps after
-    // it (hash 7: a 5-bit width, reference 0 in no bits, a 5-bit width and
-    // a 1-bit gap; hash 9: a width and reference 0), and the times are
-    // packed at the width of the largest, 4 bits for 10.
-    assert_eq!(segment.bits(), (16, 12));
+    // Bits in all: the references are packed at the width of the largest,
+    // 1 bit for 1, and the times at that of theirs, 4 bits for 10.
+    assert_eq!(segment.bits(), (3, 12));
     assert_eq!(segment.time_bits(), 4);
+    // Coded as gaps, each run codes its first reference and the gaps after
+    // it (hash 7: a 5-bit width, reference 0 in no bits, a 5-bit width and
+    // a 1-bit gap; hash 9: a width and reference 0).
+    let gaps = segment.to_ref_coding(RefCoding::Gaps);
+    assert_eq!(gaps.bits(), (16, 12));
+    assert_eq!(gaps.ref_coding(), RefCoding::Gaps);
 
     // Every posting in (hash, reference, time) order.
     let all: Vec<Posting> = segment.postings().collect();

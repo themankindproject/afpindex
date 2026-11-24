@@ -4,7 +4,7 @@ use core::iter::FusedIterator;
 
 use crate::Posting;
 use crate::packed::{Packed, PackedBuilder, View};
-use crate::refs::{self, Refs};
+use crate::refs::{self, Layout, RefCoding, Refs};
 
 #[cfg(feature = "std")]
 mod parallel;
@@ -13,7 +13,7 @@ mod parallel;
 #[cfg(feature = "mmap")]
 pub(crate) mod to_file;
 
-/// One directory slot, 16 bytes: `key`'s run starts at `start` (40 bits),
+/// One directory slot, as a lookup reads it: `key`'s run starts at `start` (40 bits),
 /// holds `len` postings (16 bits), no reference has more than `mult`
 /// postings in it (8 bits, saturating), and its coded references start
 /// `refs` bits after the first run of its page (see [`PAGE_BITS`]).
@@ -86,6 +86,177 @@ impl Slot {
     }
 }
 
+/// A directory slot as a segment stores it: whole, 16 bytes, for
+/// references coded as gaps, or [`Short`], 12, for packed references,
+/// where a run's references start at its first posting times the width.
+trait Stored: Copy + Send + Sync {
+    const EMPTY: Self;
+    /// Whether the slot keeps [`Slot::refs`].
+    const REFS: bool;
+    fn of(slot: Slot) -> Self;
+    fn slot(self) -> Slot;
+    fn key(self) -> u32;
+    /// The run's length, 0 in an empty slot.
+    fn len(self) -> u32;
+}
+
+impl Stored for Slot {
+    const EMPTY: Self = Slot::EMPTY;
+    const REFS: bool = true;
+
+    #[inline]
+    fn of(slot: Slot) -> Self {
+        slot
+    }
+
+    #[inline]
+    fn slot(self) -> Slot {
+        self
+    }
+
+    #[inline]
+    fn key(self) -> u32 {
+        self.key
+    }
+
+    #[inline]
+    fn len(self) -> u32 {
+        Slot::len(self)
+    }
+}
+
+/// A [`Slot`] without its reference offset: 12 bytes.
+#[derive(Clone, Copy, Debug)]
+struct Short {
+    key: u32,
+    start_lo: u32,
+    len_mult_hi: u32,
+}
+
+impl Stored for Short {
+    const EMPTY: Self = Short {
+        key: 0,
+        start_lo: 0,
+        len_mult_hi: 0,
+    };
+    const REFS: bool = false;
+
+    #[inline]
+    fn of(slot: Slot) -> Self {
+        Short {
+            key: slot.key,
+            start_lo: slot.start_lo,
+            len_mult_hi: slot.len_mult_hi,
+        }
+    }
+
+    #[inline]
+    fn slot(self) -> Slot {
+        Slot {
+            key: self.key,
+            start_lo: self.start_lo,
+            len_mult_hi: self.len_mult_hi,
+            refs: 0,
+        }
+    }
+
+    #[inline]
+    fn key(self) -> u32 {
+        self.key
+    }
+
+    #[inline]
+    fn len(self) -> u32 {
+        self.len_mult_hi >> 16
+    }
+}
+
+/// A segment's directory: short slots over packed references, whole ones
+/// over references coded as gaps.
+#[derive(Clone)]
+enum Table {
+    Short(Vec<Short>),
+    Whole(Vec<Slot>),
+}
+
+impl Table {
+    /// The directory over `index` in a table of `slots`, for references
+    /// held as `layout` says (`pages` as [`pages_of`] gives them for
+    /// gaps; packed references need none).
+    fn build(index: Index<'_>, pages: &[u64], slots: usize, layout: Layout) -> Self {
+        match layout {
+            Layout::Packed(_) => Self::Short(build_table_with(index, pages, slots)),
+            Layout::Gaps => Self::Whole(build_table_with(index, pages, slots)),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Short(t) => t.len(),
+            Self::Whole(t) => t.len(),
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Short(t) => t.capacity() * size_of::<Short>(),
+            Self::Whole(t) => t.capacity() * size_of::<Slot>(),
+        }
+    }
+
+    /// The slot of `hash`, if the table holds the hash.
+    #[inline]
+    fn find(&self, hash: u32) -> Option<Slot> {
+        match self {
+            Self::Short(t) => find_in(t, hash),
+            Self::Whole(t) => find_in(t, hash),
+        }
+    }
+
+    /// Load the home slots of `keys` and discard them.
+    #[inline]
+    fn touch(&self, keys: &[u32]) {
+        match self {
+            Self::Short(t) => touch_slots(t, keys),
+            Self::Whole(t) => touch_slots(t, keys),
+        }
+    }
+
+    /// Every taken slot of `lo..hi`, in table order.
+    #[inline]
+    fn for_each_in(&self, lo: usize, hi: usize, mut f: impl FnMut(Slot)) {
+        fn each<T: Stored>(t: &[T], f: &mut impl FnMut(Slot)) {
+            for &slot in t.iter().filter(|s| s.len() != 0) {
+                f(slot.slot());
+            }
+        }
+        match self {
+            Self::Short(t) => each(&t[lo..hi], &mut f),
+            Self::Whole(t) => each(&t[lo..hi], &mut f),
+        }
+    }
+}
+
+/// The slot of `hash` in `table`, if the table holds the hash.
+#[inline]
+fn find_in<T: Stored>(table: &[T], hash: u32) -> Option<Slot> {
+    if table.is_empty() {
+        return None;
+    }
+    let (before, from) = table.split_at(slot_of(hash, table.len()));
+    for &slot in from.iter().chain(before) {
+        if slot.len() == 0 {
+            return None;
+        }
+        if slot.key() == hash {
+            return Some(slot.slot());
+        }
+    }
+    // The load bound leaves empty slots, so the probe above always ends.
+    None
+}
+
 /// Keys per batch when the directory is built or walked in key order. A
 /// key's slot is a cache miss of its own in a directory larger than the
 /// cache, so the slots of the batch after the current one are loaded first
@@ -95,14 +266,14 @@ const AHEAD: usize = 32;
 
 /// Load the home slots of `keys` in `table` and discard them.
 #[inline]
-fn touch_slots(table: &[Slot], keys: &[u32]) {
+fn touch_slots<T: Stored>(table: &[T], keys: &[u32]) {
     let slots = table.len();
     if slots == 0 {
         return;
     }
-    let acc = keys.iter().fold(0u32, |acc, &key| {
-        acc ^ table[slot_of(key, slots)].len_mult_hi
-    });
+    let acc = keys
+        .iter()
+        .fold(0u32, |acc, &key| acc ^ table[slot_of(key, slots)].len());
     core::hint::black_box(acc);
 }
 
@@ -121,10 +292,9 @@ fn slot_of(key: u32, slots: usize) -> usize {
 ///
 /// Every hash owns one contiguous run; inside a run each reference's
 /// postings sit together with times ascending. The segment holds its
-/// sorted distinct `keys`, the `refs` of every run coded as the gaps
-/// between neighbours, in blocks that each start from a whole reference
-/// (12.5 bits a reference on the real catalog of
-/// 120,329 references), the `times`
+/// sorted distinct `keys`, the `refs` of every run (packed at the width
+/// of the largest, or coded as the gaps between neighbours: see
+/// [`RefCoding`]), the `times`
 /// packed to the width of the largest, and an open-addressing directory
 /// from hash to run. A lookup costs one directory read: a hash's slot depends
 /// only on the hash, so the lookups of a query are independent and overlap
@@ -141,9 +311,10 @@ pub struct Segment {
     times: Packed,
     /// Linear-probing directory: at most three keys per five slots, or one
     /// per four below [`SPARSE_KEYS`] keys (see [`build_table`]).
-    table: Vec<Slot>,
+    table: Table,
     /// Per page of `2^PAGE_BITS` postings, the bit the coded references
-    /// of its first run start at (see [`Slot`]).
+    /// of its first run start at (see [`Slot`]); empty for packed
+    /// references, which need none.
     pages: Vec<u64>,
     /// The smallest and the largest reference, if there is a posting.
     ids: Option<(u32, u32)>,
@@ -184,7 +355,7 @@ impl<'a> Run<'a> {
     /// times ascending.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, u32)> + 'a {
         let times = self.segment.times.view();
-        let refs = self.segment.refs.run(self.at, self.len()).cursor();
+        let refs = self.segment.refs.run(self.at, self.lo, self.len()).cursor();
         refs.zip(self.lo..self.hi)
             .map(move |(reference, i)| (reference, times.get(i)))
     }
@@ -279,7 +450,7 @@ fn pages_of(index: Index<'_>) -> Vec<u64> {
 
 /// Directory over `index`, in a table of `slots`: [`slots_for`] at the
 /// load a segment's size picks.
-fn build_table_with(index: Index<'_>, pages: &[u64], slots: usize) -> Vec<Slot> {
+fn build_table_with<T: Stored>(index: Index<'_>, pages: &[u64], slots: usize) -> Vec<T> {
     let Index {
         keys,
         offsets,
@@ -292,15 +463,19 @@ fn build_table_with(index: Index<'_>, pages: &[u64], slots: usize) -> Vec<Slot> 
     }
     debug_assert!(slots > keys.len(), "a key needs a free slot");
     let n = keys.len();
-    let mut table = alloc::vec![Slot::EMPTY; slots];
+    let mut table = alloc::vec![T::EMPTY; slots];
     // A key without postings (only arrays a reader has yet to reject) gets
     // no slot, which reads as "absent".
     let slot_of_key = |k: usize| {
         let (start, end) = (offsets[k], offsets[k + 1]);
         (end > start).then(|| {
-            let refs = ref_starts[k] - pages[(start >> PAGE_BITS) as usize];
-            let refs = u32::try_from(refs).expect("a page's references span less than 2^32 bits");
-            Slot::new(keys[k], start, end - start, mults[k], refs)
+            let refs = if T::REFS {
+                let refs = ref_starts[k] - pages[(start >> PAGE_BITS) as usize];
+                u32::try_from(refs).expect("a page's references span less than 2^32 bits")
+            } else {
+                0
+            };
+            T::of(Slot::new(keys[k], start, end - start, mults[k], refs))
         })
     };
     if slots <= DIRECT_SLOTS {
@@ -317,16 +492,16 @@ fn build_table_with(index: Index<'_>, pages: &[u64], slots: usize) -> Vec<Slot> 
     let regions = slots.div_ceil(REGION_SLOTS);
     let mut next = alloc::vec![0usize; regions + 1];
     for slot in (0..n).filter_map(slot_of_key) {
-        next[region_of(slot.key) + 1] += 1;
+        next[region_of(slot.key()) + 1] += 1;
     }
     for region in 0..regions {
         next[region + 1] += next[region];
     }
-    let mut by_region = alloc::vec![Slot::EMPTY; next[regions]];
+    let mut by_region = alloc::vec![T::EMPTY; next[regions]];
     #[cfg(feature = "std")]
     let region_starts = next.clone();
     for slot in (0..n).filter_map(slot_of_key) {
-        let at = &mut next[region_of(slot.key)];
+        let at = &mut next[region_of(slot.key())];
         by_region[*at] = slot;
         *at += 1;
     }
@@ -341,17 +516,21 @@ fn build_table_with(index: Index<'_>, pages: &[u64], slots: usize) -> Vec<Slot> 
 }
 
 /// Directory over `index` in the table size [`slots_for`] gives its
-/// keys, and the start of each page's references the slots count from.
-fn build_table(index: Index<'_>) -> (Vec<Slot>, Vec<u64>) {
-    let pages = pages_of(index);
+/// keys, for references held as `layout` says, and the start of each
+/// page's references the slots count from (none for packed references).
+fn build_table(index: Index<'_>, layout: Layout) -> (Table, Vec<u64>) {
+    let pages = match layout {
+        Layout::Packed(_) => Vec::new(),
+        Layout::Gaps => pages_of(index),
+    };
     let slots = slots_for(index.keys.len());
-    (build_table_with(index, &pages, slots), pages)
+    (Table::build(index, &pages, slots, layout), pages)
 }
 
 /// Put `slot` in the first free slot from its key's home.
 #[inline]
-fn place(table: &mut [Slot], slot: Slot) {
-    let mut i = slot_of(slot.key, table.len());
+fn place<T: Stored>(table: &mut [T], slot: T) {
+    let mut i = slot_of(slot.key(), table.len());
     while table[i].len() != 0 {
         i += 1;
         if i == table.len() {
@@ -370,9 +549,10 @@ pub(crate) struct Writer {
     ref_starts: Vec<u64>,
     /// Per key, the most postings any one reference has in its run.
     mults: Vec<u8>,
-    /// The coded references (see [`crate::refs`]), an array of single
-    /// bits.
+    /// The references, packed or coded as gaps as `layout` says (see
+    /// [`crate::refs`]).
     refs: PackedBuilder,
+    layout: Layout,
     times: PackedBuilder,
     /// The smallest and the largest reference coded here. A run copied
     /// as it is adds nothing: a merge adds its source's whole range
@@ -395,9 +575,9 @@ pub(crate) fn union_ids(a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> Option<
 }
 
 impl Writer {
-    /// Room for `postings` rows whose coded references take about
-    /// `ref_bits` bits and whose times fit `time_bits`, and for `keys`
-    /// distinct hashes. A merge passes the sum of its sources' key counts,
+    /// Room for `postings` rows whose references are laid out as `layout`
+    /// says, in about `ref_bits` bits when they are coded as gaps, and
+    /// whose times fit `time_bits`, and for `keys` distinct hashes. A merge passes the sum of its sources' key counts,
     /// an upper bound that keeps `keys`, `starts` and `mults` from
     /// growing by doubling as the runs arrive; [`Writer::finish`] cuts
     /// what the merge did not need.
@@ -406,14 +586,20 @@ impl Writer {
         keys: usize,
         ref_bits: u64,
         time_bits: u32,
+        layout: Layout,
     ) -> Self {
+        let refs = match layout {
+            Layout::Packed(width) => PackedBuilder::with_capacity(postings, width),
+            Layout::Gaps => PackedBuilder::with_capacity(usize::try_from(ref_bits).unwrap_or(0), 1),
+        };
         Self {
             keys: Vec::with_capacity(keys),
             // One past the keys: `finish` records where the last run ends.
             starts: Vec::with_capacity(keys.saturating_add(1)),
             ref_starts: Vec::with_capacity(keys.saturating_add(1)),
             mults: Vec::with_capacity(keys),
-            refs: PackedBuilder::with_capacity(usize::try_from(ref_bits).unwrap_or(0), 1),
+            refs,
+            layout,
             times: PackedBuilder::with_capacity(postings, time_bits),
             ids: None,
             run: Vec::new(),
@@ -427,10 +613,10 @@ impl Writer {
         self.times.len()
     }
 
-    /// Bits of coded references appended so far.
+    /// Bits of references appended so far.
     #[inline]
     fn ref_len(&self) -> u64 {
-        self.refs.len() as u64
+        self.refs.len() as u64 * u64::from(self.layout.array_width())
     }
 
     /// Append the run of `hash`, which must be greater than the hash of
@@ -456,7 +642,10 @@ impl Writer {
         let (Some(&first), Some(&last)) = (self.run.first(), self.run.last()) else {
             return;
         };
-        refs::push_run(&mut self.refs, &self.run);
+        match self.layout {
+            Layout::Packed(_) => self.refs.extend(self.run.iter().copied()),
+            Layout::Gaps => refs::push_run(&mut self.refs, &self.run),
+        }
         self.include(Some((first, last)));
     }
 
@@ -483,11 +672,22 @@ impl Writer {
         }
     }
 
-    /// Copy the coded references of `run` of `source` as bits.
+    /// Copy the references of `run` of `source`, whose layout this
+    /// writer's [copies](Layout::copies): packed values from width to
+    /// width, gaps as bits.
     #[inline]
     fn copy_refs<F>(&mut self, source: &Source<'_, '_, F>, run: Span) {
-        self.refs
-            .extend_from(source.refs.bits().view(), run.at as usize, run.end as usize);
+        debug_assert!(
+            self.layout.copies(source.refs.layout()),
+            "a run to code again"
+        );
+        let view = source.refs.bits().view();
+        match self.layout {
+            Layout::Packed(_) => self.refs.extend_from(view, run.lo, run.hi),
+            Layout::Gaps => self
+                .refs
+                .extend_from(view, run.at as usize, run.end as usize),
+        }
     }
 
     /// Gather the postings of `run` that its source's `keep` accepts
@@ -498,7 +698,7 @@ impl Writer {
     fn gather<F: Fn(u32) -> bool>(&mut self, source: &Source<'_, '_, F>, run: Span) -> (u32, bool) {
         let mut streaks = Streaks::default();
         let (mut from, mut i, mut whole) = (run.lo, run.lo, true);
-        for reference in source.refs.run(run.at, run.hi - run.lo).cursor() {
+        for reference in source.refs.run(run.at, run.lo, run.hi - run.lo).cursor() {
             if source.keep.is_none_or(|keep| keep(reference)) {
                 streaks.see(reference);
                 self.run.push(reference);
@@ -517,10 +717,11 @@ impl Writer {
     /// index of its source (a posting in several of them once), filtered
     /// by its source's `keep` if it has one.
     ///
-    /// A run that is the only one of its hash keeps its coding: copied
-    /// as bits without a look at its references when its source has no
-    /// `keep`, and also when a `keep` rejects none of them. Otherwise the
-    /// references are decoded and the run is coded again.
+    /// A run that is the only one of its hash, from a source of a layout
+    /// this writer copies, is copied without a look at its references when
+    /// its source has no `keep`, and also when a `keep` rejects none of
+    /// them. Otherwise the references are decoded and the run is coded
+    /// again.
     fn merge_runs<F: Fn(u32) -> bool>(
         &mut self,
         hash: u32,
@@ -531,13 +732,14 @@ impl Writer {
         self.run.clear();
         let mult = if let &mut [(source, run)] = runs {
             let source = &sources[source];
-            if source.keep.is_none() {
+            let copies = self.layout.copies(source.refs.layout());
+            if source.keep.is_none() && copies {
                 self.copy_refs(source, run);
                 self.times.extend_from(source.times, run.lo, run.hi);
                 u32::from(run.mult)
             } else {
                 let (mult, whole) = self.gather(source, run);
-                if whole {
+                if whole && copies {
                     self.copy_refs(source, run);
                     let ids = Some((self.run[0], self.run[self.run.len() - 1]));
                     self.include(ids);
@@ -567,14 +769,17 @@ impl Writer {
         // hash rarely interleave: ordered by their first reference, they
         // are mostly the union already.
         runs.sort_unstable_by_key(|&(source, run)| {
-            sources[source].refs.run(run.at, run.hi - run.lo).first()
+            sources[source]
+                .refs
+                .run(run.at, run.lo, run.hi - run.lo)
+                .first()
         });
         for &(source, run) in &*runs {
             let source = &sources[source];
             let times = source.times;
             let pairs = source
                 .refs
-                .run(run.at, run.hi - run.lo)
+                .run(run.at, run.lo, run.hi - run.lo)
                 .cursor()
                 .zip(run.lo..run.hi)
                 .map(|(reference, i)| (reference, times.get(i)));
@@ -622,17 +827,20 @@ impl Writer {
         );
         self.starts.push(postings);
         self.ref_starts.push(self.ref_len());
-        let (table, pages) = build_table(Index {
-            keys: &self.keys,
-            offsets: &self.starts,
-            ref_starts: &self.ref_starts,
-            mults: &self.mults,
-        });
+        let (table, pages) = build_table(
+            Index {
+                keys: &self.keys,
+                offsets: &self.starts,
+                ref_starts: &self.ref_starts,
+                mults: &self.mults,
+            },
+            self.layout,
+        );
         let mut keys = self.keys;
         keys.shrink_to_fit();
         Segment::assemble(
             keys,
-            Refs::from_bits(self.refs.finish()),
+            Refs::new(self.refs.finish(), self.layout),
             self.times.finish(),
             (table, pages),
             self.ids,
@@ -642,9 +850,9 @@ impl Writer {
 
 /// One piece of a merge: its keys, the start of each key's run counted
 /// from the piece's first posting and of its references counted from the
-/// piece's first bit, the multiplicities, the coded references (an array
-/// of single bits), the packed times, and the range of the references it
-/// coded.
+/// piece's first bit, the multiplicities, the references (the array the
+/// merge's layout holds them in), the packed times, and the range of the
+/// references it coded.
 #[cfg(feature = "std")]
 pub(crate) struct Parts {
     pub(crate) keys: Vec<u32>,
@@ -751,8 +959,54 @@ impl Segment {
     /// Load the directory slots of `hashes` and discard them, so their
     /// cache misses overlap instead of waiting one lookup at a time.
     #[inline]
-    pub(crate) fn touch_directory(&self, hashes: &[u32]) {
-        touch_slots(&self.table, hashes);
+    fn touch_directory(&self, hashes: &[u32]) {
+        self.table.touch(hashes);
+    }
+
+    /// Locate each of `hashes` in turn, calling `f` with its index and
+    /// its run for those the segment holds. The slots of each batch of
+    /// `batch` hashes are loaded while the batch before it resolves, so the
+    /// lookups' cache misses overlap; the loop is compiled for the kind of
+    /// slot the directory holds, which a lookup then does not test.
+    #[inline]
+    pub(crate) fn locate_each(
+        &self,
+        hashes: &[u32],
+        batch: usize,
+        mut f: impl FnMut(usize, Located),
+    ) {
+        match &self.table {
+            Table::Short(t) => self.locate_in(t, hashes, batch, &mut f),
+            Table::Whole(t) => self.locate_in(t, hashes, batch, &mut f),
+        }
+    }
+
+    #[inline(always)]
+    fn locate_in<T: Stored>(
+        &self,
+        table: &[T],
+        hashes: &[u32],
+        batch: usize,
+        f: &mut impl FnMut(usize, Located),
+    ) {
+        let width = u64::from(self.refs.layout().array_width());
+        let n = hashes.len();
+        touch_slots(table, &hashes[..batch.min(n)]);
+        for k in (0..n).step_by(batch) {
+            let end = (k + batch).min(n);
+            touch_slots(table, &hashes[end..(end + batch).min(n)]);
+            for (i, &hash) in hashes[k..end].iter().enumerate() {
+                let Some(slot) = find_in(table, hash) else {
+                    continue;
+                };
+                let at = if T::REFS {
+                    self.pages[(slot.start() >> PAGE_BITS) as usize] + u64::from(slot.refs)
+                } else {
+                    slot.start() * width
+                };
+                f(k + i, self.located(&slot, hash, at));
+            }
+        }
     }
 
     /// Start a walk of the directory in key order: load the slots of the
@@ -786,12 +1040,9 @@ impl Segment {
     /// released when the merge ends.
     fn source<'k, F>(&self, keep: Option<&'k F>) -> Source<'_, 'k, F> {
         let mut order: Vec<(u64, u64)> = Vec::with_capacity(self.keys.len());
-        order.extend(
-            self.table
-                .iter()
-                .filter(|slot| slot.len() != 0)
-                .map(|slot| self.walk_entry(slot)),
-        );
+        self.table.for_each_in(0, self.table.len(), |slot| {
+            order.push(self.walk_entry(&slot));
+        });
         debug_assert_eq!(order.len(), self.keys.len(), "every key has a run");
         self.source_of(keep, &self.keys, order, (self.len(), self.refs.bit_len()))
     }
@@ -806,7 +1057,10 @@ impl Segment {
     /// Where the coded references of `slot`'s run start.
     #[inline]
     fn ref_at(&self, slot: &Slot) -> u64 {
-        self.pages[(slot.start() >> PAGE_BITS) as usize] + u64::from(slot.refs)
+        match self.refs.layout() {
+            Layout::Packed(width) => slot.start() * u64::from(width),
+            Layout::Gaps => self.pages[(slot.start() >> PAGE_BITS) as usize] + u64::from(slot.refs),
+        }
     }
 
     /// A walk over `keys`, a stretch of this segment's keys whose runs
@@ -848,10 +1102,11 @@ impl Segment {
             .touch(at, n as u64 * u64::from(self.density), reach)
     }
 
-    /// The coded references of the run of `n` postings from bit `at`.
+    /// The references of the run of postings `lo..lo + n`, whose stream
+    /// starts at bit `at`.
     #[inline]
-    pub(crate) fn run_refs(&self, at: u64, n: usize) -> refs::Run<'_> {
-        self.refs.run(at, n)
+    pub(crate) fn run_refs(&self, at: u64, lo: usize, n: usize) -> refs::Run<'_> {
+        self.refs.run(at, lo, n)
     }
 
     /// Load the time at entry `i` (the caller discards it the same way).
@@ -863,12 +1118,13 @@ impl Segment {
 
 impl Default for Segment {
     fn default() -> Self {
-        Writer::with_capacity(0, 0, 0, 0).finish()
+        Writer::with_capacity(0, 0, 0, 0, Layout::Packed(0)).finish()
     }
 }
 
 impl Segment {
-    /// Build a segment from postings in any order.
+    /// Build a segment from postings in any order, its references packed
+    /// ([`RefCoding::Packed`]).
     ///
     /// Sorts the rows in place (a radix sort on the hash, so close to linear
     /// time), drops exact duplicates, and copies them into the segment's
@@ -878,12 +1134,24 @@ impl Segment {
     /// built. With `std`, a million rows or more are sorted and packed on
     /// every core.
     #[must_use]
-    pub fn from_postings(mut rows: Vec<Posting>) -> Self {
+    pub fn from_postings(rows: Vec<Posting>) -> Self {
+        Self::from_postings_in(rows, RefCoding::Packed)
+    }
+
+    /// [`Segment::from_postings`], with the references stored as `coding`
+    /// says.
+    #[must_use]
+    pub fn from_postings_coded(rows: Vec<Posting>, coding: RefCoding) -> Self {
+        Self::from_postings_in(rows, coding)
+    }
+
+    /// [`Segment::from_postings_coded`].
+    pub(crate) fn from_postings_in(mut rows: Vec<Posting>, coding: RefCoding) -> Self {
         crate::sort::sort_postings(&mut rows);
         // A large input is packed on every core, in pieces cut at hash
         // boundaries; the result is the same segment.
         #[cfg(feature = "std")]
-        let mut rows = match parallel::pack_sorted(rows) {
+        let mut rows = match parallel::pack_sorted(rows, coding) {
             Ok(segment) => return segment,
             Err(rows) => rows,
         };
@@ -905,6 +1173,7 @@ impl Segment {
             keys,
             ref_room(rows.len(), keys, max_ref),
             Packed::bits_for(max_time),
+            Layout::new(coding, max_ref),
         );
         for run in rows.chunk_by(|a, b| a.hash == b.hash) {
             out.push_run(run[0].hash, run.iter().map(|p| (p.reference, p.time)));
@@ -940,12 +1209,15 @@ impl Segment {
             (times.len() as u64) < MAX_POSTINGS,
             "a segment holds fewer than 2^40 postings"
         );
-        let directory = build_table(Index {
-            keys: &keys,
-            offsets,
-            ref_starts,
-            mults,
-        });
+        let directory = build_table(
+            Index {
+                keys: &keys,
+                offsets,
+                ref_starts,
+                mults,
+            },
+            refs.layout(),
+        );
         Self::assemble(keys, refs, times, directory, ids)
     }
 
@@ -954,7 +1226,7 @@ impl Segment {
         keys: Vec<u32>,
         refs: Refs,
         times: Packed,
-        (table, pages): (Vec<Slot>, Vec<u64>),
+        (table, pages): (Table, Vec<u64>),
         ids: Option<(u32, u32)>,
     ) -> Self {
         let postings = times.len().max(1) as u64;
@@ -1010,7 +1282,7 @@ impl Segment {
         self.keys.iter().enumerate().map(|(k, &key)| {
             self.touch_ahead(k);
             self.slot(key)
-                .map_or((0, 0, 0), |s| (s.start(), self.ref_at(s), s.mult()))
+                .map_or((0, 0, 0), |s| (s.start(), self.ref_at(&s), s.mult()))
         })
     }
 
@@ -1021,9 +1293,24 @@ impl Segment {
         self.ids
     }
 
-    /// Plain arrays packed at the width of their largest value (tests).
+    /// Plain arrays, the references packed at the width of the largest, in
+    /// any order (tests).
     #[cfg(all(test, feature = "std"))]
     pub(crate) fn from_arrays(keys: &[u32], offsets: &[u64], refs: &[u32], times: &[u32]) -> Self {
+        Self::from_arrays_coded(keys, offsets, refs, times, RefCoding::Packed)
+    }
+
+    /// Plain arrays, the references stored as `coding` says (ascending in
+    /// each run when coded as gaps) and the times packed at the width of
+    /// the largest (tests).
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn from_arrays_coded(
+        keys: &[u32],
+        offsets: &[u64],
+        refs: &[u32],
+        times: &[u32],
+        coding: RefCoding,
+    ) -> Self {
         let mults: Vec<u8> = offsets
             .windows(2)
             .map(|w| {
@@ -1040,22 +1327,28 @@ impl Segment {
                 u8::try_from(best).unwrap_or(u8::MAX)
             })
             .collect();
-        let mut coded = PackedBuilder::with_capacity(0, 1);
+        let layout = Layout::new(coding, refs.iter().copied().max().unwrap_or(0));
+        let width = u64::from(layout.array_width());
+        let mut coded = PackedBuilder::with_capacity(0, layout.array_width());
         let mut ref_starts = Vec::with_capacity(offsets.len());
-        let mut ids = None;
         for w in offsets.windows(2) {
-            ref_starts.push(coded.len() as u64);
+            ref_starts.push(coded.len() as u64 * width);
             let run = &refs[w[0] as usize..w[1] as usize];
-            if let (Some(&first), Some(&last)) = (run.first(), run.last()) {
-                refs::push_run(&mut coded, run);
-                ids = union_ids(ids, Some((first, last)));
+            if !run.is_empty() {
+                match layout {
+                    Layout::Packed(_) => coded.extend(run.iter().copied()),
+                    Layout::Gaps => refs::push_run(&mut coded, run),
+                }
             }
         }
-        ref_starts.push(coded.len() as u64);
+        ref_starts.push(coded.len() as u64 * width);
+        let ids = refs
+            .iter()
+            .fold(None, |ids, &r| union_ids(ids, Some((r, r))));
         Self::from_parts(
             keys.to_vec(),
             (offsets, &ref_starts, &mults),
-            Refs::from_bits(coded.finish()),
+            Refs::new(coded.finish(), layout),
             Packed::from_values(times),
             ids,
         )
@@ -1065,13 +1358,25 @@ impl Segment {
     /// sorted-keys path (tests).
     #[cfg(test)]
     fn mark_long(&mut self, hash: u32) {
-        let slots = self.table.len();
-        let mut i = slot_of(hash, slots);
-        while self.table[i].key != hash {
-            i = (i + 1) % slots;
+        fn mark<T: Stored>(table: &mut [T], hash: u32) {
+            let slots = table.len();
+            let mut i = slot_of(hash, slots);
+            while table[i].key() != hash {
+                i = (i + 1) % slots;
+            }
+            let slot = table[i].slot();
+            table[i] = T::of(Slot::new(
+                hash,
+                slot.start(),
+                u64::from(LONG),
+                slot.mult(),
+                slot.refs,
+            ));
         }
-        let slot = self.table[i];
-        self.table[i] = Slot::new(hash, slot.start(), u64::from(LONG), slot.mult(), slot.refs);
+        match &mut self.table {
+            Table::Short(t) => mark(t, hash),
+            Table::Whole(t) => mark(t, hash),
+        }
     }
 
     /// Rebuild the directory in a table of `slots`, the size a test picks
@@ -1092,7 +1397,7 @@ impl Segment {
             ref_starts: &ref_starts,
             mults: &mults,
         };
-        self.table = build_table_with(index, &self.pages, slots);
+        self.table = Table::build(index, &self.pages, slots, self.refs.layout());
     }
 
     #[cfg(any(feature = "std", test))]
@@ -1108,21 +1413,8 @@ impl Segment {
 
     /// The directory slot of `hash`, if the segment holds the hash.
     #[inline]
-    fn slot(&self, hash: u32) -> Option<&Slot> {
-        if self.table.is_empty() {
-            return None;
-        }
-        let (before, from) = self.table.split_at(slot_of(hash, self.table.len()));
-        for slot in from.iter().chain(before) {
-            if slot.len() == 0 {
-                return None;
-            }
-            if slot.key == hash {
-                return Some(slot);
-            }
-        }
-        // The load bound leaves empty slots, so the probe above always ends.
-        None
+    fn slot(&self, hash: u32) -> Option<Slot> {
+        self.table.find(hash)
     }
 
     /// Entry range of `hash`'s run, if the segment holds the hash.
@@ -1143,18 +1435,25 @@ impl Segment {
     #[inline]
     pub(crate) fn locate(&self, hash: u32) -> Option<Located> {
         let slot = self.slot(hash)?;
+        Some(self.located(&slot, hash, self.ref_at(&slot)))
+    }
+
+    /// The run of `hash`, whose slot is `slot` and whose references start
+    /// at bit `at`.
+    #[inline]
+    fn located(&self, slot: &Slot, hash: u32, at: u64) -> Located {
         let lo = slot.start() as usize;
         let hi = if slot.len() == LONG {
             self.end_by_search(hash)
         } else {
             lo + slot.len() as usize
         };
-        Some(Located {
+        Located {
             lo,
             hi,
             mult: slot.mult(),
-            at: self.ref_at(slot),
-        })
+            at,
+        }
     }
 
     /// End of `hash`'s run through the sorted keys (the start of the next
@@ -1174,14 +1473,20 @@ impl Segment {
     /// Probes a lookup of `hash` makes before it resolves.
     #[cfg(test)]
     fn probes(&self, hash: u32) -> usize {
-        let slots = self.table.len();
-        let mut i = slot_of(hash, slots);
-        let mut n = 1;
-        while self.table[i].len() != 0 && self.table[i].key != hash {
-            i = (i + 1) % slots;
-            n += 1;
+        fn probes_in<T: Stored>(table: &[T], hash: u32) -> usize {
+            let slots = table.len();
+            let mut i = slot_of(hash, slots);
+            let mut n = 1;
+            while table[i].len() != 0 && table[i].key() != hash {
+                i = (i + 1) % slots;
+                n += 1;
+            }
+            n
         }
-        n
+        match &self.table {
+            Table::Short(t) => probes_in(t, hash),
+            Table::Whole(t) => probes_in(t, hash),
+        }
     }
 
     /// The postings of `hash`, if the segment holds it.
@@ -1208,7 +1513,7 @@ impl Segment {
             key: 0,
             index: first.map_or(0, |run| run.lo),
             end: first.map_or(0, |run| run.hi),
-            refs: first.map(|run| self.refs.run(run.at, run.hi - run.lo).cursor()),
+            refs: first.map(|run| self.refs.run(run.at, run.lo, run.hi - run.lo).cursor()),
         }
     }
 
@@ -1218,10 +1523,10 @@ impl Segment {
         self.ids.map(|(_, max)| max)
     }
 
-    /// Bits the coded references and the packed times take, in total. The
-    /// times are packed at the width of the largest; the references take
-    /// about the bits of the gap between neighbours in a run (see
-    /// [`Segment`]).
+    /// Bits the references and the packed times take, in total. The times
+    /// are packed at the width of the largest; the references take the
+    /// width of the largest each when packed, and about the bits of the gap
+    /// between neighbours in a run when coded as gaps (see [`RefCoding`]).
     #[must_use]
     pub fn bits(&self) -> (u64, u64) {
         (
@@ -1247,12 +1552,13 @@ impl Segment {
         self.keys.capacity() * size_of::<u32>()
             + self.refs.heap_bytes()
             + self.times.heap_bytes()
-            + self.table.capacity() * size_of::<Slot>()
+            + self.table.heap_bytes()
             + self.pages.capacity() * size_of::<u64>()
     }
 
     /// Merge two segments, keeping only postings whose reference `keep`
-    /// accepts. Linear in the two sizes; a posting present in both is kept
+    /// accepts, into a segment that stores its references as `left`
+    /// does. Linear in the two sizes; a posting present in both is kept
     /// once. With `std`, a large merge runs on every core, so `keep` is
     /// called from several threads.
     ///
@@ -1261,19 +1567,41 @@ impl Segment {
     /// Panics if the result would hold 2<sup>40</sup> postings or more.
     #[must_use]
     pub fn merge(left: &Segment, right: &Segment, keep: impl Fn(u32) -> bool + Sync) -> Segment {
-        Self::merge_all(&[(left, Some(&keep)), (right, Some(&keep))])
+        Self::merge_all(
+            &[(left, Some(&keep)), (right, Some(&keep))],
+            left.ref_coding(),
+        )
     }
 
-    /// A copy without the postings of references `keep` rejects. With
-    /// `std`, a large segment is filtered on every core, so `keep` is
-    /// called from several threads.
+    /// A copy without the postings of references `keep` rejects, its
+    /// references stored as this segment's are. With `std`, a large
+    /// segment is filtered on every core, so `keep` is called from several
+    /// threads.
     #[must_use]
     pub fn filter(&self, keep: impl Fn(u32) -> bool + Sync) -> Segment {
-        Self::merge_all(&[(self, Some(&keep))])
+        Self::merge_all(&[(self, Some(&keep))], self.ref_coding())
+    }
+
+    /// How this segment stores its references.
+    #[must_use]
+    pub fn ref_coding(&self) -> RefCoding {
+        self.refs.layout().coding()
+    }
+
+    /// The same postings with the references stored as `coding` says: a
+    /// copy that decodes and codes every run again, or a plain copy when
+    /// the segment already stores them that way.
+    #[must_use]
+    pub fn to_ref_coding(&self, coding: RefCoding) -> Segment {
+        if coding == self.ref_coding() {
+            return self.clone();
+        }
+        Self::merge_all::<fn(u32) -> bool>(&[(self, None)], coding)
     }
 
     /// Merge any number of segments in one pass, each filtered by its
-    /// `keep` if it has one; a posting present in several is kept once.
+    /// `keep` if it has one, into a segment whose references are stored as
+    /// `coding` says; a posting present in several is kept once.
     ///
     /// A segment without a `keep` must hold nothing another's `keep`
     /// rejects; its runs are then copied without a look at their
@@ -1286,9 +1614,11 @@ impl Segment {
     /// posting.
     pub(crate) fn merge_all<F: Fn(u32) -> bool + Sync>(
         sides: &[(&Segment, Option<&F>)],
+        coding: RefCoding,
     ) -> Segment {
+        let layout = layout_of(sides, coding);
         #[cfg(feature = "std")]
-        if let Some(merged) = parallel::merge_all(sides) {
+        if let Some(merged) = parallel::merge_all(sides, layout) {
             return merged;
         }
         // Every source's keys, an upper bound on the merge's distinct
@@ -1299,6 +1629,7 @@ impl Segment {
             keys(sides),
             ref_bits(sides),
             time_bits(sides),
+            layout,
         );
         let mut sources: Vec<_> = sides
             .iter()
@@ -1311,9 +1642,9 @@ impl Segment {
         out.finish()
     }
 
-    /// The segment of one reference: `rows` are its `hash << 32 | time`
-    /// values, ascending and distinct.
-    pub(crate) fn from_reference(reference: u32, rows: &[u64]) -> Segment {
+    /// The segment of one reference, stored as `coding` says: `rows` are
+    /// its `hash << 32 | time` values, ascending and distinct.
+    pub(crate) fn from_reference(reference: u32, rows: &[u64], coding: RefCoding) -> Segment {
         debug_assert!(
             rows.windows(2).all(|w| w[0] < w[1]),
             "rows not sorted and unique"
@@ -1326,6 +1657,7 @@ impl Segment {
             rows.len(),
             ref_room(rows.len(), rows.len(), reference),
             Packed::bits_for(max_time),
+            Layout::new(coding, reference),
         );
         for run in rows.chunk_by(|a, b| a >> 32 == b >> 32) {
             out.push_run(
@@ -1367,6 +1699,18 @@ fn ref_bits<F>(sides: &[(&Segment, Option<&F>)]) -> u64 {
     sides
         .iter()
         .fold(0u64, |n, (s, _)| n.saturating_add(s.refs.bit_len()))
+}
+
+/// The layout of a merge of `sides` stored as `coding` says: packed, at
+/// the width of the largest reference any side holds.
+pub(crate) fn layout_of<F>(sides: &[(&Segment, Option<&F>)], coding: RefCoding) -> Layout {
+    let max_ref = sides
+        .iter()
+        .filter_map(|(s, _)| s.ids)
+        .map(|(_, max)| max)
+        .max()
+        .unwrap_or(0);
+    Layout::new(coding, max_ref)
 }
 
 /// The range of the references of the sides without a `keep`, whose
@@ -1425,13 +1769,19 @@ fn merge_sources<F: Fn(u32) -> bool>(out: &mut Writer, sources: &mut [Source<'_,
 }
 
 impl PartialEq for Segment {
-    /// Same postings, whatever the widths.
+    /// Same postings, whatever the widths and however the references are
+    /// stored.
     fn eq(&self, other: &Self) -> bool {
+        let same_refs = match (self.refs.layout(), other.refs.layout()) {
+            // Canonical, so the same bits.
+            (Layout::Gaps, Layout::Gaps) => self.refs == other.refs,
+            _ => self.postings().eq(other.postings()),
+        };
         self.keys == other.keys
-            && self.refs == other.refs
             && self.times == other.times
             && self.offsets().eq(other.offsets())
             && self.ids == other.ids
+            && same_refs
     }
 }
 
@@ -1450,6 +1800,7 @@ impl fmt::Debug for Segment {
             .field("postings", &self.len())
             .field("keys", &self.keys.len())
             .field("slots", &self.table.len())
+            .field("refs", &self.refs.layout())
             .field("ref_bits", &self.refs.bit_len())
             .field("time_bits", &self.times.bits())
             .finish_non_exhaustive()
@@ -1485,7 +1836,7 @@ impl Iterator for Postings<'_> {
             s.touch_ahead(self.key);
             let run = s.locate(key).expect("every key has a run");
             self.end = run.hi;
-            self.refs = Some(s.refs.run(run.at, run.hi - run.lo).cursor());
+            self.refs = Some(s.refs.run(run.at, run.lo, run.hi - run.lo).cursor());
         }
         let reference = self
             .refs
@@ -1522,6 +1873,14 @@ impl FusedIterator for Postings<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every way two segments of a merge can store their references.
+    const CODING_PAIRS: [(RefCoding, RefCoding); 4] = [
+        (RefCoding::Packed, RefCoding::Packed),
+        (RefCoding::Gaps, RefCoding::Gaps),
+        (RefCoding::Packed, RefCoding::Gaps),
+        (RefCoding::Gaps, RefCoding::Packed),
+    ];
     use alloc::vec;
 
     fn p(h: u32, r: u32, t: u32) -> Posting {
@@ -1694,6 +2053,10 @@ mod tests {
         );
         assert_eq!(Slot::new(1, 0, 1 << 20, 0, 0).len(), LONG);
         assert_eq!(size_of::<Slot>(), 16);
+        assert_eq!(size_of::<Short>(), 12);
+        let short = Short::of(s);
+        assert_eq!((short.key(), short.len()), (7, LONG - 1));
+        assert_eq!(short.slot().order(), s.order());
         assert_eq!(Slot::EMPTY.len(), 0);
     }
 
@@ -1795,67 +2158,78 @@ mod tests {
             };
             let a_rows = rows(0..40, &left, 3_000);
             let b_rows = rows(20..60, &right, 1_500);
-            let a = Segment::from_postings(a_rows.clone());
-            let b = Segment::from_postings(b_rows.clone());
-            for keep in keeps {
-                let sorted = |rows: &mut dyn Iterator<Item = Posting>| {
-                    let mut v: Vec<Posting> = rows.collect();
-                    v.sort_unstable();
-                    v.dedup();
-                    v
-                };
-                let kept = |p: &Posting| keep(p.reference);
-                let union = sorted(&mut a_rows.iter().chain(&b_rows).copied().filter(kept));
-                // A reference only the left side holds: rejecting it (and
-                // what `keep` rejects there) leaves the right side with
-                // nothing to filter, so it may go without a `keep`.
-                let only_left = |r: u32| left.contains(&r) && !right.contains(&r);
-                let keep_left = |r: u32| !only_left(r) || (keep(r) && r.is_multiple_of(2));
-                let one_sided = sorted(
-                    &mut a_rows
-                        .iter()
-                        .copied()
-                        .filter(|p| keep_left(p.reference))
-                        .chain(b_rows.iter().copied()),
-                );
-                let unfiltered = sorted(&mut a_rows.iter().chain(&b_rows).copied());
-                for (got, want) in [
-                    (Segment::merge(&a, &b, keep), union.clone()),
-                    (Segment::merge(&b, &a, keep), union),
-                    (
-                        a.filter(keep),
-                        sorted(&mut a_rows.iter().copied().filter(kept)),
-                    ),
-                    (
-                        Segment::merge_all(&[(&a, Some(&keep_left)), (&b, None)]),
-                        one_sided.clone(),
-                    ),
-                    (
-                        Segment::merge_all(&[(&b, None), (&a, Some(&keep_left))]),
-                        one_sided,
-                    ),
-                    (
-                        Segment::merge_all::<fn(u32) -> bool>(&[(&a, None), (&b, None)]),
-                        unfiltered.clone(),
-                    ),
-                    // Four ways at once, two of them the same segment.
-                    (
-                        Segment::merge_all::<fn(u32) -> bool>(&[
-                            (&b, None),
-                            (&a, None),
-                            (&Segment::default(), None),
-                            (&b, None),
-                        ]),
-                        unfiltered,
-                    ),
-                ] {
-                    assert_eq!(got.postings().collect::<Vec<_>>(), want);
-                    // The directory agrees with a segment built from rows,
-                    // multiplicities included.
-                    let fresh = Segment::from_postings(want);
-                    assert_eq!(got, fresh);
-                    for h in 0..60 {
-                        assert_eq!(got.range_mult(h), fresh.range_mult(h), "hash {h}");
+            // Every pair of codings: merged into the left one's, so runs of
+            // the other are decoded and coded again.
+            for (ca, cb) in CODING_PAIRS {
+                let a = Segment::from_postings_coded(a_rows.clone(), ca);
+                let b = Segment::from_postings_coded(b_rows.clone(), cb);
+                for keep in keeps {
+                    let sorted = |rows: &mut dyn Iterator<Item = Posting>| {
+                        let mut v: Vec<Posting> = rows.collect();
+                        v.sort_unstable();
+                        v.dedup();
+                        v
+                    };
+                    let kept = |p: &Posting| keep(p.reference);
+                    let union = sorted(&mut a_rows.iter().chain(&b_rows).copied().filter(kept));
+                    // A reference only the left side holds: rejecting it (and
+                    // what `keep` rejects there) leaves the right side with
+                    // nothing to filter, so it may go without a `keep`.
+                    let only_left = |r: u32| left.contains(&r) && !right.contains(&r);
+                    let keep_left = |r: u32| !only_left(r) || (keep(r) && r.is_multiple_of(2));
+                    let one_sided = sorted(
+                        &mut a_rows
+                            .iter()
+                            .copied()
+                            .filter(|p| keep_left(p.reference))
+                            .chain(b_rows.iter().copied()),
+                    );
+                    let unfiltered = sorted(&mut a_rows.iter().chain(&b_rows).copied());
+                    for (got, want) in [
+                        (Segment::merge(&a, &b, keep), union.clone()),
+                        (Segment::merge(&b, &a, keep).to_ref_coding(ca), union),
+                        (
+                            a.filter(keep),
+                            sorted(&mut a_rows.iter().copied().filter(kept)),
+                        ),
+                        (
+                            Segment::merge_all(&[(&a, Some(&keep_left)), (&b, None)], ca),
+                            one_sided.clone(),
+                        ),
+                        (
+                            Segment::merge_all(&[(&b, None), (&a, Some(&keep_left))], ca),
+                            one_sided,
+                        ),
+                        (
+                            Segment::merge_all::<fn(u32) -> bool>(&[(&a, None), (&b, None)], ca),
+                            unfiltered.clone(),
+                        ),
+                        // Four ways at once, two of them the same segment.
+                        (
+                            Segment::merge_all::<fn(u32) -> bool>(
+                                &[
+                                    (&b, None),
+                                    (&a, None),
+                                    (&Segment::default(), None),
+                                    (&b, None),
+                                ],
+                                ca,
+                            ),
+                            unfiltered,
+                        ),
+                    ] {
+                        assert_eq!(got.postings().collect::<Vec<_>>(), want);
+                        assert_eq!(got.ref_coding(), ca);
+                        // The directory agrees with a segment built from rows,
+                        // multiplicities included, and so do the bits.
+                        let fresh = Segment::from_postings_coded(want, ca);
+                        assert_eq!(got, fresh);
+                        if ca == RefCoding::Gaps {
+                            assert!(got.refs == fresh.refs, "the canonical coding");
+                        }
+                        for h in 0..60 {
+                            assert_eq!(got.range_mult(h), fresh.range_mult(h), "hash {h}");
+                        }
                     }
                 }
             }
@@ -1944,19 +2318,30 @@ mod tests {
 
     #[test]
     fn heap_bytes_counts_every_array_and_finish_trims_capacity() {
-        let s = Segment::from_postings(vec![p(1, 0, 0), p(2, 0, 0)]);
-        // Two keys get a nine-slot directory of 16-byte slots, the sparse
-        // load of a small segment; the times are all zero, so they pack to
-        // no data bytes plus slack, and each run codes its one reference in
-        // a width field of 5 bits.
-        assert_eq!(s.bits(), (10, 0));
-        assert!(s.heap_bytes() >= 2 * 4 + 2 + 8 + 8 + 9 * 16);
+        let rows = vec![p(1, 0, 0), p(2, 0, 0)];
+        let s = Segment::from_postings(rows.clone());
+        // Two keys get a nine-slot directory, the sparse load of a small
+        // segment, of 12-byte slots over packed references; the references
+        // and the times are all zero, so they pack to no data bytes plus
+        // slack.
+        assert_eq!(s.bits(), (0, 0));
+        assert!(s.heap_bytes() >= 2 * 4 + 8 + 8 + 9 * 12);
+        // Coded as gaps, each run codes its one reference in a width field
+        // of 5 bits, and the directory's slots are 16 bytes and count from
+        // a page start of 8.
+        let gaps = Segment::from_postings_coded(rows, RefCoding::Gaps);
+        assert_eq!(gaps.bits(), (10, 0));
+        assert_eq!(gaps.heap_bytes() - s.heap_bytes(), 9 * 4 + 8 + 2);
         // Ten duplicates of one posting: the hint was 10, the segment holds 1
-        // reference, a width field and one bit.
+        // reference, of one bit packed, and a width field and one bit as
+        // gaps.
         let s = Segment::from_postings(vec![p(1, 1, 0); 10]);
         assert_eq!(s.len(), 1);
-        assert_eq!(s.bits(), (6, 0));
+        assert_eq!(s.bits(), (1, 0));
         assert_eq!(s.refs.heap_bytes(), 1 + Packed::SLACK);
+        let gaps = Segment::from_postings_coded(vec![p(1, 1, 0); 10], RefCoding::Gaps);
+        assert_eq!(gaps.bits(), (6, 0));
+        assert_eq!(gaps.refs.heap_bytes(), 1 + Packed::SLACK);
         assert!(alloc::format!("{s:?}").starts_with("Segment { postings: 1"));
     }
 }

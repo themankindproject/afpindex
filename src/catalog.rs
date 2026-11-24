@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::{Posting, Segment};
+use crate::{Posting, RefCoding, Segment};
 
 /// Reference-counted segment handle: `Arc` where the target has atomics,
 /// `Rc` otherwise (a catalog is then not `Send`).
@@ -21,11 +21,12 @@ pub(crate) trait MergeParts {
     type Error;
 
     /// Merge `sides`, each filtered by its `keep` if it has one, into one
-    /// part whose references lie in `ids`.
+    /// part whose references lie in `ids`, stored as `coding` says.
     fn merge<F: Fn(u32) -> bool + Sync>(
         &mut self,
         sides: &[(&Segment, Option<&F>)],
         ids: (u32, u32),
+        coding: RefCoding,
     ) -> Result<Option<Part>, Self::Error>;
 }
 
@@ -44,8 +45,9 @@ impl MergeParts for InMemory {
         &mut self,
         sides: &[(&Segment, Option<&F>)],
         ids: (u32, u32),
+        coding: RefCoding,
     ) -> Result<Option<Part>, Self::Error> {
-        let merged = Segment::merge_all(sides);
+        let merged = Segment::merge_all(sides, coding);
         Ok((!merged.is_empty()).then(|| Part::new(merged, ids)))
     }
 }
@@ -84,6 +86,15 @@ pub(crate) fn never<T>(result: Result<T, core::convert::Infallible>) -> T {
 /// keeps the postings alive: a server can clone, compact the clone, and
 /// swap it in without blocking searches on the original.
 ///
+/// # Storing the references
+///
+/// [`Catalog::set_ref_coding`] chooses how the segments the catalog builds
+/// and merges store their reference ids: packed, for the fastest searches
+/// (the default), or as gaps, for a catalog 12.5 % smaller (see
+/// [`RefCoding`]). A segment keeps its coding until a merge rewrites it, so
+/// a catalog may hold both for a while; [`Catalog::compact`] rewrites
+/// every segment at once. A catalog snapshot records the choice.
+///
 /// # Memory
 ///
 /// The liveness table costs one byte per id, and a [`Scratch`](crate::Scratch)
@@ -98,6 +109,9 @@ pub struct Catalog {
     parts: Vec<Part>,
     live: Vec<bool>,
     live_count: usize,
+    /// How the segments built and merged from now on store their
+    /// references.
+    coding: RefCoding,
 }
 
 /// A segment of a catalog and what the catalog knows of its references.
@@ -179,7 +193,8 @@ impl Catalog {
         CatalogBuilder::default()
     }
 
-    /// Wrap a segment whose reference ids the caller assigned.
+    /// Wrap a segment whose reference ids the caller assigned. The catalog
+    /// stores references as the segment does.
     ///
     /// Every id from `0` to the largest id in the segment is live, including
     /// ids with no postings, and [`Catalog::add`] continues after the
@@ -193,6 +208,7 @@ impl Catalog {
     #[must_use]
     pub fn from_segment(segment: Segment) -> Self {
         let max = segment.max_reference();
+        let coding = segment.ref_coding();
         let n = max.map_or(0, |m| {
             usize::try_from(m)
                 .ok()
@@ -206,6 +222,7 @@ impl Catalog {
                 .collect(),
             live: alloc::vec![true; n],
             live_count: n,
+            coding,
         }
     }
 
@@ -215,6 +232,7 @@ impl Catalog {
     pub(crate) fn from_parts(
         segments: Vec<(Segment, Option<(u32, u32)>)>,
         live: Vec<bool>,
+        coding: RefCoding,
     ) -> Self {
         let live_count = live.iter().filter(|&&l| l).count();
         let parts = segments
@@ -236,19 +254,36 @@ impl Catalog {
             parts,
             live,
             live_count,
+            coding,
         }
     }
 
     /// Assemble from parts a manifest validated: segments already placed
     /// with the file they came from, and the liveness table they share.
     #[cfg(feature = "mmap")]
-    pub(crate) fn from_files(parts: Vec<Part>, live: Vec<bool>) -> Self {
+    pub(crate) fn from_files(parts: Vec<Part>, live: Vec<bool>, coding: RefCoding) -> Self {
         let live_count = live.iter().filter(|&&l| l).count();
         Self {
             parts,
             live,
             live_count,
+            coding,
         }
+    }
+
+    /// How the segments this catalog builds and merges store their
+    /// references.
+    #[must_use]
+    pub fn ref_coding(&self) -> RefCoding {
+        self.coding
+    }
+
+    /// Store the references of the segments built and merged from now on
+    /// as `coding` says (see [`RefCoding`]). The segments already here keep
+    /// theirs until a merge rewrites them: [`Catalog::compact`] rewrites
+    /// them all, [`Catalog::compact_deltas`] all but the largest.
+    pub fn set_ref_coding(&mut self, coding: RefCoding) {
+        self.coding = coding;
     }
 
     #[cfg(feature = "std")]
@@ -305,7 +340,7 @@ impl Catalog {
         if rows.is_empty() {
             return Ok(id);
         }
-        let part = Part::new(Segment::from_reference(id, &rows), (id, id));
+        let part = Part::new(Segment::from_reference(id, &rows, self.coding), (id, id));
         match self.merge_in(part, merges) {
             Ok(()) => Ok(id),
             Err(e) => {
@@ -323,7 +358,7 @@ impl Catalog {
     fn merge_in<M: MergeParts>(&mut self, part: Part, merges: &mut M) -> Result<(), M::Error> {
         self.parts.push(part);
         let added = self.parts.len() - 1;
-        match merge_tail_in(&mut self.parts, &self.live, merges) {
+        match merge_tail_in(&mut self.parts, &self.live, self.coding, merges) {
             Ok(()) => Ok(()),
             Err(e) => {
                 // The merge left the parts it joined where they were, so
@@ -400,7 +435,7 @@ impl Catalog {
         self.live.resize(start + count, true);
         self.live_count += count;
         if !rows.is_empty() {
-            let part = Part::new(Segment::from_postings(rows), (first, last));
+            let part = Part::new(Segment::from_postings_in(rows, self.coding), (first, last));
             if let Err(e) = self.merge_in(part, merges) {
                 self.take_back(count);
                 return Err(e);
@@ -537,7 +572,7 @@ impl Catalog {
     ) -> Result<(), M::Error> {
         // The parts are read in place and changed only once the merge
         // has succeeded, so a merge that fails or panics leaves them whole.
-        let only = merged_from(&self.parts, 1, &self.live, merges)?;
+        let only = merged_from(&self.parts, 1, &self.live, self.coding, merges)?;
         self.parts.truncate(1);
         self.parts.extend(only);
         Ok(())
@@ -555,7 +590,7 @@ impl Catalog {
     /// merge that fails leaves the catalog as it was.
     pub(crate) fn compact_of<M: MergeParts>(&mut self, merges: &mut M) -> Result<(), M::Error> {
         // As in `compact_deltas_of`: nothing changes until the merge is done.
-        let only = merged_from(&self.parts, 0, &self.live, merges)?;
+        let only = merged_from(&self.parts, 0, &self.live, self.coding, merges)?;
         self.parts.clear();
         self.parts.extend(only);
         Ok(())
@@ -569,13 +604,15 @@ impl fmt::Debug for Catalog {
             .field("live", &self.live_count)
             .field("postings", &self.posting_count())
             .field("segments", &self.parts.len())
+            .field("ref_coding", &self.coding)
             .finish_non_exhaustive()
     }
 }
 
 /// Segments `first..` of `parts` as one part without the postings `live`
-/// rejects, or `None` if no posting is left. A lone segment with nothing to
-/// drop is shared rather than copied.
+/// rejects, its references stored as `coding` says, or `None` if no
+/// posting is left. A lone segment with nothing to drop, already stored
+/// that way, is shared rather than copied.
 ///
 /// One pass over all of them, so a posting is rewritten once however many
 /// segments are merged. Only segments that may hold postings of removed
@@ -585,12 +622,15 @@ fn merged_from<M: MergeParts>(
     parts: &[Part],
     first: usize,
     live: &[bool],
+    coding: RefCoding,
     merges: &mut M,
 ) -> Result<Option<Part>, M::Error> {
     let tail = parts.get(first..).unwrap_or_default();
     match tail {
         [] => return Ok(None),
-        [only] if !only.stale => return Ok(Some(only.clone())),
+        [only] if !only.stale && only.segment.ref_coding() == coding => {
+            return Ok(Some(only.clone()));
+        }
         _ => {}
     }
     let keep = |reference: u32| live[reference as usize];
@@ -601,7 +641,7 @@ fn merged_from<M: MergeParts>(
     let ids = tail.iter().fold((u32::MAX, 0), |(lo, hi), part| {
         (lo.min(part.ids.0), hi.max(part.ids.1))
     });
-    merges.merge(&sides, ids)
+    merges.merge(&sides, ids, coding)
 }
 
 /// Restore the size invariant from the tail of `parts`: the last segment
@@ -617,12 +657,13 @@ fn merged_from<M: MergeParts>(
 fn merge_tail_in<M: MergeParts>(
     parts: &mut Vec<Part>,
     live: &[bool],
+    coding: RefCoding,
     merges: &mut M,
 ) -> Result<(), M::Error> {
     let Some(first) = tail_start(parts) else {
         return Ok(());
     };
-    let only = merged_from(parts, first, live, merges)?;
+    let only = merged_from(parts, first, live, coding, merges)?;
     parts.truncate(first);
     parts.extend(only);
     debug_assert!(
@@ -664,6 +705,7 @@ fn tail_start(parts: &[Part]) -> Option<usize> {
 pub struct CatalogBuilder {
     rows: Vec<Posting>,
     next: u32,
+    coding: RefCoding,
 }
 
 impl CatalogBuilder {
@@ -691,6 +733,13 @@ impl CatalogBuilder {
         self.rows.len()
     }
 
+    /// Store the references as `coding` says (see [`RefCoding`]), in the
+    /// segment the build makes and in the catalog's later merges.
+    pub fn ref_coding(&mut self, coding: RefCoding) -> &mut Self {
+        self.coding = coding;
+        self
+    }
+
     /// Sort everything once and build the catalog.
     #[must_use]
     pub fn build(self) -> Catalog {
@@ -699,8 +748,9 @@ impl CatalogBuilder {
             parts: Vec::new(),
             live: alloc::vec![true; n],
             live_count: n,
+            coding: self.coding,
         };
-        let segment = Segment::from_postings(self.rows);
+        let segment = Segment::from_postings_in(self.rows, self.coding);
         // A posting implies a reference, so `next` is at least one here.
         if !segment.is_empty() {
             cat.parts.push(Part::new(segment, (0, self.next - 1)));
@@ -967,6 +1017,7 @@ mod tests {
                 .collect(),
             live: alloc::vec![true; 3],
             live_count: 3,
+            coding: RefCoding::Packed,
         };
         cat.compact_deltas();
         assert_eq!(cat.segment_count(), 2);
@@ -998,6 +1049,7 @@ mod tests {
         let mut catalog = Catalog::from_parts(
             alloc::vec![(Segment::from_postings(rows), Some((0, 9)))],
             live,
+            RefCoding::Packed,
         );
         let postings = catalog.posting_count();
         for compaction in [Catalog::compact, Catalog::compact_deltas] {
