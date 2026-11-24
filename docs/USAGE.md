@@ -1424,7 +1424,8 @@ about 54,000 postings and 100,000 such tracks about 5.4 G postings, or
 over 120,329) and holds them in 1.94 GiB. Searches are bound by memory
 latency: more memory channels and cores scale throughput, and the target
 is a host whose catalog fits in RAM with room for the page cache (for
-`map_from`).
+`map_from`). Past one host, shard by reference and serve replicas from
+the segment files ([SCALING.md](SCALING.md)).
 
 ---
 

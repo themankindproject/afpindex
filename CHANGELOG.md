@@ -151,7 +151,9 @@ First release: the engine of the *afpindex* design notes as a library.
   (real clips against a catalog dumped as raw arrays) and `audiofp`
   (audio fingerprinted by the `audiofp` crate, indexed and searched;
   `audiofp` is a dev-dependency only and needs Rust 1.93).
-- Documentation: the README, `docs/USAGE.md` and `docs/PERFORMANCE.md`.
+- Documentation: the README, `docs/USAGE.md`, `docs/PERFORMANCE.md`, and
+  `docs/SCALING.md` on sharding by reference and serving replicas from
+  segment files.
 
 On an AWS `m7i-flex.large` (two hardware threads) with the 499 M-posting
 catalog of the design notes (120,329 references) and its 104 real clips,

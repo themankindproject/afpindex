@@ -30,6 +30,7 @@ by about 10 %, so compare columns within one table only.
 - [Packing a build on every core](#packing-a-build-on-every-core)
 - [Warming the references of a mapped catalog](#warming-the-references-of-a-mapped-catalog)
 - [One search on several threads](#one-search-on-several-threads)
+- [Skipping runs that cannot reach the floor (left out)](#skipping-runs-that-cannot-reach-the-floor-left-out)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -824,6 +825,19 @@ slower; with it taken from 2,097,152 postings on:
 The gain stops well short of the thread count: the histogram pass stays
 on one thread, and the totals pass waits on memory, which the threads
 share.
+
+## Skipping runs that cannot reach the floor (left out)
+
+MaxScore-style pruning was simulated on the real catalog before building
+it: take a query's runs in order of their weight, and once the runs left
+could not lift a reference with no votes yet to the floor, stop counting
+whole runs and only look up, in each remaining run, the references that
+already have votes. On the 102 clips with production options, the counted
+postings were 1.44 % fewer, and the lookups that replaced them cost
+another 0.24 %, for a net 1.2 % (candidates identical). The floor is a
+few dozen votes against thousands of runs per query, so almost every run
+has to be counted before the remaining ones can no longer matter. Not
+worth the code.
 
 ## Allocators and huge pages
 

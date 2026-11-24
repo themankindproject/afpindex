@@ -218,6 +218,7 @@ everything before a catalog exists
 
 - [docs/USAGE.md](docs/USAGE.md) - the full guide: concepts, feeding the index, reference ids, building, queries, searching and every option, reading candidates, custom scoring, changing a catalog while it serves, threads, memory, snapshots, segments, errors, features, production and troubleshooting
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) - every measurement, how the passes are arranged, and what was tried and left out
+- [docs/SCALING.md](docs/SCALING.md) - past one host: sharding by reference, replicas from segment files, a writer that fails, sizing a shard
 - [API reference](https://docs.rs/afpindex) on docs.rs
 - [CHANGELOG.md](CHANGELOG.md)
 
