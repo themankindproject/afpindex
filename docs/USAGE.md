@@ -999,7 +999,7 @@ load reads no posting: it is the checksum and the run check that it
 skips, and on the real catalog that is most of a load. A trusted map of
 the real catalog takes 0.14 s against 0.91 s for a full map, and a trusted
 read 0.71 s against 1.62 s for a full read. The instruction counts are in
-[PERFORMANCE.md](PERFORMANCE.md#format-3-what-a-trusted-load-recomputes).
+[PERFORMANCE.md](PERFORMANCE.md#what-a-trusted-load-recomputes).
 
 ### Mapping: `map_from`
 

@@ -46,10 +46,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 lto           = "fat"
 codegen-units = 1
 
-[profile.bench]
-lto           = "fat"
-codegen-units = 1
-
 [lints.rust]
 missing_docs = "deny"
 unsafe_code  = "deny"

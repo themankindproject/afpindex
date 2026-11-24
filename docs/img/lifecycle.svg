@@ -49,14 +49,14 @@
 <text x="44" y="591" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">no change are copied as packed bits, without decoding.</text>
 <text x="44" y="612" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#1f2328">Change a <tspan font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace">clone</tspan> and swap it in: searches keep the catalog they began on.</text>
 <rect x="490" y="88" width="442" height="540" rx="10" fill="#fff1e5" stroke="#bc4c00" stroke-width="1.5"/>
-<text x="506" y="116" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="15" fill="#762c00" font-weight="700">The snapshot file, format 3</text>
+<text x="506" y="116" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="15" fill="#762c00" font-weight="700">The snapshot file, format 1</text>
 <text x="506" y="136" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="11" fill="#59636e">little-endian, sections 8-byte aligned</text>
 <text x="542" y="158" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10" fill="#762c00" font-weight="700">catalog header</text>
 <text x="534" y="178" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#59636e" text-anchor="end">0</text>
 <rect x="542" y="164" width="184" height="20" rx="0" fill="#fff1e5" stroke="#bc4c00" stroke-width="1"/>
 <text x="634" y="178" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" fill="#1f2328" text-anchor="middle">"AFCT"</text>
 <rect x="726" y="164" width="184" height="20" rx="0" fill="#fff1e5" stroke="#bc4c00" stroke-width="1"/>
-<text x="818" y="178" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328" text-anchor="middle">version 3</text>
+<text x="818" y="178" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328" text-anchor="middle">version 1</text>
 <text x="534" y="198" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#59636e" text-anchor="end">8</text>
 <rect x="542" y="184" width="184" height="20" rx="0" fill="#fff1e5" stroke="#bc4c00" stroke-width="1"/>
 <text x="634" y="198" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328" text-anchor="middle">flags 0</text>
@@ -79,7 +79,7 @@
 <rect x="542" y="324" width="184" height="20" rx="0" fill="#fff1e5" stroke="#bc4c00" stroke-width="1"/>
 <text x="634" y="338" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" fill="#1f2328" text-anchor="middle">"AFIX"</text>
 <rect x="726" y="324" width="184" height="20" rx="0" fill="#fff1e5" stroke="#bc4c00" stroke-width="1"/>
-<text x="818" y="338" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328" text-anchor="middle">version 3</text>
+<text x="818" y="338" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328" text-anchor="middle">version 1</text>
 <text x="534" y="358" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10" fill="#59636e" text-anchor="end">8</text>
 <rect x="542" y="344" width="184" height="20" rx="0" fill="#fff1e5" stroke="#bc4c00" stroke-width="1"/>
 <text x="634" y="358" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="10.5" fill="#1f2328" text-anchor="middle">ref_bits</text>
@@ -123,7 +123,7 @@
 <rect x="192" y="690" width="128" height="108" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="1.5"/>
 <text x="256" y="710" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="12" fill="#762c00" text-anchor="middle" font-weight="700">header</text>
 <text x="202" y="730" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328">magic and</text>
-<text x="202" y="745" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328">version 3</text>
+<text x="202" y="745" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="10.5" fill="#1f2328">version 1</text>
 <line x1="322" y1="744" x2="338" y2="744" stroke="#1a7f37" stroke-width="1.8" marker-end="url(#a1a7f37)"/>
 <rect x="340" y="690" width="128" height="108" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="1.5"/>
 <text x="404" y="710" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="12" fill="#762c00" text-anchor="middle" font-weight="700">checksum</text>

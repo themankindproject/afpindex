@@ -26,40 +26,10 @@ use afpindex::{
     Catalog, Compaction, CompactionPolicy, Query, RefCoding, Scratch, SearchOptions, vote_floor,
 };
 
-struct Rng(u64);
+mod support;
+use support::{MAX_TIME, Rng, rows_of};
 
-impl Rng {
-    fn seeded(seed: u64) -> Self {
-        let mut r = Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        for _ in 0..4 {
-            r.next();
-        }
-        r
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
-
-const MAX_TIME: u64 = 168_750;
 const WINDOW: u32 = 30_000;
-
-/// A reference's rows are a pure function of its id, so the bench never
-/// keeps a second copy of the catalog.
-fn rows_of(reference: u32, per_ref: usize, hashes: u64) -> Vec<(u32, u32)> {
-    let mut rng = Rng::seeded(u64::from(reference) + 1);
-    (0..per_ref)
-        .map(|_| (rng.below(hashes) as u32, rng.below(MAX_TIME) as u32))
-        .collect()
-}
 
 /// The query of a window of `reference`'s rows, shifted to start at 0,
 /// with half as many random rows.

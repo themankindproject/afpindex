@@ -46,36 +46,14 @@ use std::time::Instant;
 
 use afpindex::{Catalog, CatalogStore, Query, RefCoding, Scratch, SearchOptions, vote_floor};
 
-struct Rng(u64);
-
-impl Rng {
-    fn seeded(seed: u64) -> Self {
-        let mut r = Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        for _ in 0..4 {
-            r.next();
-        }
-        r
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
+mod support;
+use support::Rng;
 
 const MAX_TIME: u64 = 32_000;
 
+/// The rows of synthetic reference `reference`, times below `MAX_TIME`.
 fn rows_of(reference: u32, per_ref: usize, hashes: u64) -> Vec<(u32, u32)> {
-    let mut rng = Rng::seeded(u64::from(reference) + 1);
-    (0..per_ref)
-        .map(|_| (rng.below(hashes) as u32, rng.below(MAX_TIME) as u32))
-        .collect()
+    support::rows_in(reference, per_ref, hashes, MAX_TIME)
 }
 
 /// The searches `--toggle-collect` counts: the rounds, not the load.
