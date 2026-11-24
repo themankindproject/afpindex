@@ -251,6 +251,7 @@ searches per second on four threads.
 ```bash
 cargo run --release --example bench -- 20000 3000 3600000 200 4
 cargo run --release --features mmap,simd --example lifecycle -- 20000 3000 3600000 2000
+cargo run --release --example serve -- 20000 3000 3600000 3 15 1 0.05:8 none
 ```
 
 Building, additions, compaction, loading, the real catalog against the

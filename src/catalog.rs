@@ -80,7 +80,8 @@ pub(crate) fn never<T>(result: Result<T, core::convert::Infallible>) -> T {
 /// posting takes part in `O(log n)` merges over its life and the list
 /// stays about `log2(largest / smallest)` long. A search looks every query
 /// hash up in every segment, so call [`Catalog::compact_deltas`] (cheap)
-/// or [`Catalog::compact`] (one pass over everything) when the list grows.
+/// or [`Catalog::compact`] (one pass over everything) when the list grows:
+/// [`Catalog::compaction_due`] says which, by a [`CompactionPolicy`].
 ///
 /// Segments are shared, so `clone` costs `O(segments + ids)` and the clone
 /// keeps the postings alive: a server can clone, compact the clone, and
@@ -112,6 +113,51 @@ pub struct Catalog {
     /// How the segments built and merged from now on store their
     /// references.
     coding: RefCoding,
+    /// References removed from the largest segment's id range since it
+    /// last held no removed reference: what a full compaction would drop
+    /// from it, counted for [`Catalog::compaction_due`].
+    base_removed: usize,
+}
+
+/// When [`Catalog::compaction_due`] calls for a compaction.
+///
+/// A search looks every query hash up in every segment and reads one run
+/// per segment that holds the hash, so each delta beside the largest
+/// segment costs every search: on a synthetic catalog of 60 M postings, a
+/// delta of 0.5 % of them added 7 % to a search and one of 15 % added
+/// 48 %. Removed references cost too until a merge drops their postings.
+/// Compacting costs a rewrite: [`Catalog::compact_deltas`] rewrites the
+/// deltas, [`Catalog::compact`] everything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct CompactionPolicy {
+    /// A full compaction once the deltas hold more postings than this
+    /// share of the largest segment's.
+    pub delta_share: f64,
+    /// A full compaction once more than this share of the largest
+    /// segment's id range has been removed since it was last clean.
+    pub removed_share: f64,
+    /// The deltas merged into one once there are more than this many.
+    pub deltas: usize,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            delta_share: 0.05,
+            removed_share: 0.05,
+            deltas: 8,
+        }
+    }
+}
+
+/// The compaction [`Catalog::compaction_due`] calls for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compaction {
+    /// [`Catalog::compact_deltas`]: merge every segment but the largest.
+    Deltas,
+    /// [`Catalog::compact`]: merge everything into one segment.
+    Full,
 }
 
 /// A segment of a catalog and what the catalog knows of its references.
@@ -223,6 +269,7 @@ impl Catalog {
             live: alloc::vec![true; n],
             live_count: n,
             coding,
+            base_removed: 0,
         }
     }
 
@@ -235,7 +282,7 @@ impl Catalog {
         coding: RefCoding,
     ) -> Self {
         let live_count = live.iter().filter(|&&l| l).count();
-        let parts = segments
+        let parts: Vec<Part> = segments
             .into_iter()
             .filter_map(|(segment, ids)| {
                 let ids = ids?;
@@ -250,11 +297,13 @@ impl Catalog {
                 })
             })
             .collect();
+        let base_removed = base_removed_of(&parts, &live);
         Self {
             parts,
             live,
             live_count,
             coding,
+            base_removed,
         }
     }
 
@@ -263,11 +312,13 @@ impl Catalog {
     #[cfg(feature = "mmap")]
     pub(crate) fn from_files(parts: Vec<Part>, live: Vec<bool>, coding: RefCoding) -> Self {
         let live_count = live.iter().filter(|&&l| l).count();
+        let base_removed = base_removed_of(&parts, &live);
         Self {
             parts,
             live,
             live_count,
             coding,
+            base_removed,
         }
     }
 
@@ -465,6 +516,12 @@ impl Catalog {
             Some(live) if *live => {
                 *live = false;
                 self.live_count -= 1;
+                if let Some(base) = self.parts.first()
+                    && (base.ids.0..=base.ids.1).contains(&id)
+                {
+                    // A clean largest segment starts the count again.
+                    self.base_removed = if base.stale { self.base_removed + 1 } else { 1 };
+                }
                 for part in &mut self.parts {
                     part.stale |= (part.ids.0..=part.ids.1).contains(&id);
                 }
@@ -554,6 +611,28 @@ impl Catalog {
             + self.live.capacity()
     }
 
+    /// The compaction `policy` calls for now, if any: cheap enough to ask
+    /// after every change.
+    ///
+    /// A server that changes its catalog while it serves can ask after
+    /// each batch of changes and run what it gets on a copy, as
+    /// [`Catalog::compact`] explains, so searches keep the catalog they
+    /// started on.
+    #[must_use]
+    pub fn compaction_due(&self, policy: &CompactionPolicy) -> Option<Compaction> {
+        let base = self.parts.first()?;
+        let base_postings = base.segment.len() as f64;
+        let deltas: usize = self.parts[1..].iter().map(|part| part.segment.len()).sum();
+        let span = f64::from(base.ids.1 - base.ids.0) + 1.0;
+        let removed = if base.stale { self.base_removed } else { 0 };
+        if deltas as f64 > policy.delta_share * base_postings
+            || removed as f64 > policy.removed_share * span
+        {
+            return Some(Compaction::Full);
+        }
+        (self.parts.len() - 1 > policy.deltas).then_some(Compaction::Deltas)
+    }
+
     /// Merge every segment but the largest into one, dropping the postings
     /// of removed references from them. The deltas are merged in one pass,
     /// which rewrites each of their postings once; the largest segment is
@@ -595,6 +674,17 @@ impl Catalog {
         self.parts.extend(only);
         Ok(())
     }
+}
+
+/// The references removed from the id range of `parts[0]`, the largest
+/// segment, if it may still hold their postings: one pass over its range
+/// of the liveness table, when a catalog is loaded.
+#[cfg(feature = "std")]
+fn base_removed_of(parts: &[Part], live: &[bool]) -> usize {
+    parts.first().filter(|base| base.stale).map_or(0, |base| {
+        live.get(base.ids.0 as usize..=base.ids.1 as usize)
+            .map_or(0, |range| range.iter().filter(|&&l| !l).count())
+    })
 }
 
 impl fmt::Debug for Catalog {
@@ -749,6 +839,7 @@ impl CatalogBuilder {
             live: alloc::vec![true; n],
             live_count: n,
             coding: self.coding,
+            base_removed: 0,
         };
         let segment = Segment::from_postings_in(self.rows, self.coding);
         // A posting implies a reference, so `next` is at least one here.
@@ -767,6 +858,59 @@ mod tests {
         (0..n)
             .map(|i| (seed.wrapping_mul(31).wrapping_add(i * 7), i))
             .collect()
+    }
+
+    /// Deltas past their share of the largest segment, or removals past
+    /// theirs, call for a full compaction, and too many deltas for merging
+    /// them; each compaction leaves nothing due.
+    #[test]
+    fn compaction_due_follows_the_policy() {
+        let policy = CompactionPolicy::default();
+        assert_eq!(Catalog::new().compaction_due(&policy), None);
+        let mut b = Catalog::builder();
+        for i in 0..200 {
+            b.add(rows(i, 100));
+        }
+        let mut cat = b.build();
+        assert_eq!(cat.compaction_due(&policy), None);
+        // 5 % of 20,000 postings is 1,000: ten more references reach it.
+        for i in 200..210 {
+            cat.add(rows(i, 100));
+            assert_eq!(cat.compaction_due(&policy), None, "{i}");
+        }
+        cat.add(rows(210, 100));
+        assert_eq!(cat.compaction_due(&policy), Some(Compaction::Full));
+        cat.compact();
+        assert_eq!(cat.compaction_due(&policy), None);
+
+        // Ten removals stay under 5 % of the 211 ids; the eleventh passes it.
+        for id in 0..10 {
+            assert!(cat.remove(id));
+        }
+        assert_eq!(cat.compaction_due(&policy), None);
+        assert!(cat.remove(10));
+        assert_eq!(cat.compaction_due(&policy), Some(Compaction::Full));
+        cat.compact();
+        assert_eq!(cat.compaction_due(&policy), None);
+        // A clean largest segment starts the count again.
+        assert!(cat.remove(11));
+        assert_eq!(cat.compaction_due(&policy), None);
+
+        // With room for any size of delta but only one of them.
+        let policy = CompactionPolicy {
+            delta_share: f64::INFINITY,
+            deltas: 1,
+            ..CompactionPolicy::default()
+        };
+        let mut i = 300;
+        while cat.segment_count() <= 2 {
+            assert_eq!(cat.compaction_due(&policy), None);
+            cat.add(rows(i, 100));
+            i += 1;
+        }
+        assert_eq!(cat.compaction_due(&policy), Some(Compaction::Deltas));
+        cat.compact_deltas();
+        assert_eq!(cat.compaction_due(&policy), None);
     }
 
     #[test]
@@ -1018,6 +1162,7 @@ mod tests {
             live: alloc::vec![true; 3],
             live_count: 3,
             coding: RefCoding::Packed,
+            base_removed: 0,
         };
         cat.compact_deltas();
         assert_eq!(cat.segment_count(), 2);

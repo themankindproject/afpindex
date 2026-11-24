@@ -131,7 +131,7 @@ mod store;
 #[doc = include_str!("../docs/USAGE.md")]
 mod usage_guide {}
 
-pub use catalog::{Catalog, CatalogBuilder};
+pub use catalog::{Catalog, CatalogBuilder, Compaction, CompactionPolicy};
 pub use error::SearchError;
 #[cfg(feature = "std")]
 pub use error::SnapshotError;

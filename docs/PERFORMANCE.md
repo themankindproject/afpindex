@@ -952,6 +952,49 @@ On the same two catalogs the files take 245.9 MB and 271.8 MB packed,
 the second, the larger directory slots and the stored offsets outweigh
 the bits the gaps save.
 
+## Segments and a catalog that changes
+
+A search pays for every segment: a directory lookup per query hash, and
+a run for each hash the segment holds. Splitting the same postings over
+more segments costs more than the extra postings: on the synthetic
+catalog with 3,000 references added (69 M postings, queries of 750
+rows), `profile search … 750 0 3000 2` counted:
+
+| the 69 M postings as | instructions | µs a search |
+|---|---|---|
+| one segment (`compact`) | 70.9 M | 95 |
+| the largest and one delta (`compact_deltas`) | 108.5 M | 147 |
+| five segments, as `add` left them | 128.1 M | 192 |
+
+A delta's short runs (2.7 postings against 19 in the largest) each cost
+nearly as much as a long one. A lookup had worked out a hash's home slot
+twice, once to load it ahead and once to probe from it, and probed
+through a chained iterator; working it out once per batch and probing in
+a plain loop took a lookup to about 28 instructions, 1.9 % off a search
+of one segment and 5.3 % off one of five (128.1 M to 121.2 M).
+
+The rest is the work a delta brings, so it is what
+`Catalog::compaction_due` weighs. `examples/serve.rs` runs search threads
+beside a writer that adds and removes references and compacts on a copy
+as a policy says, every policy from the same catalog; on the laptop, three
+search threads, one reference added and one removed per change, 15 s a
+policy, two rounds in opposite orders:
+
+| policy (`delta_share`:`deltas`) | searches per second | references added per second | compactions, deltas / full |
+|---|---|---|---|
+| no writes | 12,635 / 19,703 | | |
+| never compact | 6,347 / 5,812 | 414 / 397 | 0 / 0 |
+| 0.10:8 | 7,755 / 7,583 | 352 / 359 | 0 / 4, 0 / 4 |
+| 0.05:8 (the default) | – / 7,547 | – / 331 | 0 / 4 |
+| 0.05:4 | 6,842 / 7,674 | 171 / 204 | 72 / 2, 87 / 2 |
+| 0.02:2 | 9,959 / – | 52 / – | 190 / 1 |
+
+Removals as frequent as additions are what call for most of the full
+compactions here (5 % of 20,000 ids every 1,000 removals). Capping the
+deltas at four rewrote the largest delta every few changes for no faster
+searches, hence eight. In batches of 100 references the default policy
+added 593 a second beside 7,191 searches, and 912 without compacting.
+
 ## Reproducing
 
 ```bash
@@ -959,6 +1002,9 @@ the bits the gaps save.
 cargo run --release --example bench -- 20000 3000 3600000 200 4
 # Everything around a search: build, additions, compactions, snapshots.
 cargo run --release --features mmap --example lifecycle -- 20000 3000 3600000 2000
+# Searches beside a writer: refs, postings per ref, hashes, search threads,
+# seconds per policy, references per addition, then the policies.
+cargo run --release --example serve -- 20000 3000 3600000 3 15 1 0.05:8 none
 # A real catalog dumped as raw arrays and its clips (see the example's docs).
 cargo run --release --features mmap,simd --example replay -- <snapshot_dir> <fp_dir> <out_dir> [--mmap]
 ```

@@ -26,6 +26,13 @@ First release: the engine of the *afpindex* design notes as a library.
   (`Segment::from_postings_coded`, `Segment::to_ref_coding`): segments of
   both codings search and merge together, `compact` converts a catalog,
   and snapshots and manifests keep the choice.
+- `Catalog::compaction_due` and `CompactionPolicy`: whether a catalog is
+  due for `compact_deltas` or `compact`, by the share of postings its
+  deltas hold, the share of its largest segment's ids removed since that
+  segment was last clean, and the number of deltas; cheap enough to ask
+  after every change. Each delta costs every search a lookup per query
+  hash and a run per hash it holds: 7 % for a delta of 0.5 % of a
+  catalog's postings, 48 % for one of 15 %.
 - `Catalog` and `CatalogBuilder`: dense reference ids, bulk build with one
   sort, incremental `add` into geometrically merged delta segments,
   `add_many` to add a batch of references with one sort and one merge,
@@ -157,7 +164,9 @@ First release: the engine of the *afpindex* design notes as a library.
   only dependency. Minimum Rust version 1.89.
 - Examples: `quickstart` (build, search, add, remove), `bench`
   (synthetic catalog, latency and throughput), `lifecycle` (build,
-  additions, compactions, snapshots, query grouping, searches), `replay`
+  additions, compactions, snapshots, query grouping, searches), `serve`
+  (searches beside a writer adding, removing and compacting under a
+  policy), `replay`
   (real clips against a catalog dumped as raw arrays) and `audiofp`
   (audio fingerprinted by the `audiofp` crate, indexed and searched;
   `audiofp` is a dev-dependency only and needs Rust 1.93).

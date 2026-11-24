@@ -2,7 +2,8 @@
 #![cfg(feature = "std")]
 
 use afpindex::{
-    Catalog, Posting, Query, RefCoding, Scratch, SearchOptions, Segment, SnapshotError,
+    Catalog, Compaction, CompactionPolicy, Posting, Query, RefCoding, Scratch, SearchOptions,
+    Segment, SnapshotError,
 };
 
 const HEADER: usize = 48;
@@ -236,6 +237,28 @@ fn catalog_snapshot_keeps_ids_liveness_and_segments() {
     let back = Catalog::read_from(bytes.as_slice()).unwrap();
     assert_eq!(back.reference_count(), 0);
     assert_eq!(back.segment_count(), 0);
+}
+
+/// A loaded catalog knows what a full compaction would drop from its
+/// largest segment, so it calls for the compactions the original does.
+#[test]
+fn catalog_snapshot_keeps_what_compaction_is_due() {
+    let mut b = Catalog::builder();
+    for i in 0..100u32 {
+        b.add((0..50u32).map(|j| (i.wrapping_mul(2_654_435_761).wrapping_add(j) % 3_000, j)));
+    }
+    let mut cat = b.build();
+    for id in 0..6 {
+        assert!(cat.remove(id));
+    }
+    let policy = CompactionPolicy::default();
+    assert_eq!(cat.compaction_due(&policy), Some(Compaction::Full));
+    let mut bytes = Vec::new();
+    cat.write_to(&mut bytes).unwrap();
+    let mut back = Catalog::read_from(bytes.as_slice()).unwrap();
+    assert_eq!(back.compaction_due(&policy), Some(Compaction::Full));
+    back.compact();
+    assert_eq!(back.compaction_due(&policy), None);
 }
 
 /// A catalog snapshot keeps the reference coding: a loaded gap-coded

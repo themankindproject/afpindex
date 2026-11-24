@@ -244,18 +244,30 @@ fn find_in<T: Stored>(table: &[T], hash: u32) -> Option<Slot> {
     if table.is_empty() {
         return None;
     }
-    let (before, from) = table.split_at(slot_of(hash, table.len()));
-    for &slot in from.iter().chain(before) {
+    probe(table, slot_of(hash, table.len()), hash)
+}
+
+/// The slot of `hash` in `table`, probing from `home`, its home slot.
+#[inline(always)]
+fn probe<T: Stored>(table: &[T], mut i: usize, hash: u32) -> Option<Slot> {
+    // The load bound leaves empty slots, so the probe always ends.
+    loop {
+        let slot = table[i];
         if slot.len() == 0 {
             return None;
         }
         if slot.key() == hash {
             return Some(slot.slot());
         }
+        i += 1;
+        if i == table.len() {
+            i = 0;
+        }
     }
-    // The load bound leaves empty slots, so the probe above always ends.
-    None
 }
+
+/// The most hashes [`Segment::locate_each`] looks up per batch.
+const LOOKUP_MOST: usize = 64;
 
 /// Keys per batch when the directory is built or walked in key order. A
 /// key's slot is a cache miss of its own in a directory larger than the
@@ -989,14 +1001,34 @@ impl Segment {
         batch: usize,
         f: &mut impl FnMut(usize, Located),
     ) {
+        let (n, slots) = (hashes.len(), table.len());
+        if n == 0 || slots == 0 {
+            return;
+        }
         let width = u64::from(self.refs.layout().array_width());
-        let n = hashes.len();
-        touch_slots(table, &hashes[..batch.min(n)]);
-        for k in (0..n).step_by(batch) {
+        let batch = batch.clamp(1, LOOKUP_MOST);
+        // The home slots of a batch, worked out once: loading them ahead
+        // and probing from them both need them.
+        let homes_of = |homes: &mut [usize; LOOKUP_MOST], from: usize| {
+            let ahead = &hashes[from.min(n)..(from + batch).min(n)];
+            let acc = homes
+                .iter_mut()
+                .zip(ahead)
+                .fold(0u32, |acc, (home, &hash)| {
+                    *home = slot_of(hash, slots);
+                    acc ^ table[*home].len()
+                });
+            core::hint::black_box(acc);
+        };
+        let mut homes = [[0usize; LOOKUP_MOST]; 2];
+        homes_of(&mut homes[0], 0);
+        for (b, k) in (0..n).step_by(batch).enumerate() {
             let end = (k + batch).min(n);
-            touch_slots(table, &hashes[end..(end + batch).min(n)]);
-            for (i, &hash) in hashes[k..end].iter().enumerate() {
-                let Some(slot) = find_in(table, hash) else {
+            let [even, odd] = &mut homes;
+            let (current, next) = if b % 2 == 0 { (even, odd) } else { (odd, even) };
+            homes_of(next, end);
+            for (i, (&hash, &home)) in hashes[k..end].iter().zip(current.iter()).enumerate() {
+                let Some(slot) = probe(table, home, hash) else {
                     continue;
                 };
                 let at = if T::REFS {

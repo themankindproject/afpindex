@@ -601,12 +601,36 @@ removing many references, `compact_deltas` (if they were recent) or
 
 ### When to compact
 
-- `segment_count()` grows by about one per doubling of what has been
-  added since the last compaction. Compact the deltas when it passes 10
-  or so, or on a timer. On a catalog of 60 M postings, each extra delta
-  segment adds about 10 µs to a search of 800 rows (68.5 µs on one
-  segment against 117.4 µs on six), so set the threshold by what that
-  costs your query rate.
+A search looks every query hash up in every segment and reads a run in
+each one that holds the hash, so it pays for every delta, not only for
+the postings the deltas add. On a synthetic catalog of 60 M postings
+(3,000 per reference over 3.6 M hashes, queries of 750 rows), counted in
+instructions:
+
+| beside the largest segment | hashes the deltas hold | search cost |
+|---|---|---|
+| nothing | | 1 |
+| a delta of 0.5 % of its postings | 8 % | 1.07 |
+| a delta of 1.5 % | 22 % | 1.12 |
+| a delta of 5 % | 57 % | 1.28 |
+| a delta of 15 % | 92 % | 1.48 |
+| four deltas of 15 % in all, as `add` leaves them | 92 % | 1.69 |
+
+`Catalog::compaction_due` says when a compaction pays, by a
+`CompactionPolicy`: `Compaction::Full` once the deltas hold more than
+`delta_share` of the largest segment's postings (5 % by default) or more
+than `removed_share` of its id range has been removed since it was last
+clean (5 %), and `Compaction::Deltas` once there are more than `deltas`
+deltas (8). It costs a few comparisons, so ask after every change.
+
+- The default keeps searches within about a third of a compacted
+  catalog's cost. A tighter `delta_share` keeps them closer at the cost
+  of more full compactions, each a pass over every posting.
+- A smaller `deltas` costs more than it gains: `add` already keeps the
+  deltas to about one per doubling of what was added, and merging them
+  into one rewrites the largest delta each time. With at most four, a
+  writer adding and removing on the synthetic catalog managed 40 % fewer
+  additions a second for no faster searches (`examples/serve.rs`).
 - `posting_count()` against the postings of live references tells you how
   much removed data is still held.
 - Compact on a clone, not on the catalog that serves (next section).
@@ -718,7 +742,7 @@ writer that changes a private copy and publishes it:
 ```rust
 use std::sync::{Arc, RwLock};
 
-use afpindex::Catalog;
+use afpindex::{Catalog, Compaction, CompactionPolicy};
 
 /// The catalog searches read, swapped whole by a single writer.
 pub struct Served {
@@ -742,11 +766,27 @@ impl Served {
     pub fn add_all(&self, references: Vec<Vec<(u32, u32)>>) -> Vec<u32> {
         let mut next = (*self.get()).clone(); // shares the segments
         let ids = next.add_many(references).collect();
-        if next.segment_count() > 10 {
-            next.compact_deltas();
-        }
-        *self.current.write().expect("lock poisoned") = Arc::new(next);
+        Self::publish(&self.current, next);
         ids
+    }
+
+    /// For the writer: remove references the same way.
+    pub fn remove_all(&self, ids: &[u32]) {
+        let mut next = (*self.get()).clone();
+        for &id in ids {
+            next.remove(id);
+        }
+        Self::publish(&self.current, next);
+    }
+
+    /// Run the compaction the catalog is due for, if any, and swap it in.
+    fn publish(current: &RwLock<Arc<Catalog>>, mut next: Catalog) {
+        match next.compaction_due(&CompactionPolicy::default()) {
+            Some(Compaction::Deltas) => next.compact_deltas(),
+            Some(Compaction::Full) => next.compact(),
+            None => {}
+        }
+        *current.write().expect("lock poisoned") = Arc::new(next);
     }
 }
 ```
@@ -754,6 +794,26 @@ impl Served {
 Keep one writer: two writers working on copies of the same catalog would
 assign the same ids. Searches running on the old `Arc` finish on it; its
 segments are freed when the last search lets go.
+
+`examples/serve.rs` runs this arrangement: search threads beside a writer
+that alternately adds and removes references, under each policy it is
+given. On a four-core laptop with the 60 M-posting synthetic catalog,
+three search threads and a writer adding one reference and removing one
+per change:
+
+| | searches per second | references added per second |
+|---|---|---|
+| no writes | 12,600–19,700 | |
+| writes, default policy | 7,500–7,700 | 330 |
+| writes, never compacted | 5,400–6,300 | 400–410 |
+| writes in batches of 100 (`add_many`), default policy | 7,200 | 590 |
+
+A removal costs microseconds; an addition of one reference a
+millisecond or so, and the change that runs a full compaction about a
+second, on a copy while the searches go on. The searches lose most of
+what they lose to the cores the writer's merges take: a merge of a
+million postings or more runs on every core unless `set_max_threads`
+caps it.
 
 ---
 
