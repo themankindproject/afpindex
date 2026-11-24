@@ -482,6 +482,35 @@ impl Catalog {
         self.parts.iter().map(|part| &*part.segment)
     }
 
+    /// Read every page of every segment's packed references once, and
+    /// return how many bytes they hold.
+    ///
+    /// Every search reads the references of the runs it matches, and reads
+    /// the times of its survivors only. A catalog mapped without its pages
+    /// faulted in, as [`Catalog::map_dir`] and a `CatalogStore` map it,
+    /// pays a read from the disk for each page a search touches first;
+    /// calling this after a load puts the references in memory in one
+    /// sequential read and leaves the times, nearly half of a file, on the
+    /// disk until a survivor needs them. On a catalog held on the heap it
+    /// only reads memory. Whether the pages stay is the kernel's choice: it
+    /// can drop them again under memory pressure.
+    #[cfg(feature = "mmap")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
+    pub fn warm_references(&self) -> usize {
+        // One byte per page brings the page in; the read-ahead of a
+        // sequential walk brings the pages after it.
+        const PAGE: usize = 4096;
+        let mut bytes = 0;
+        let mut acc = 0u8;
+        for segment in self.segments() {
+            let data = segment.refs().data();
+            bytes += data.len();
+            acc ^= data.iter().step_by(PAGE).fold(0u8, |a, &b| a ^ b);
+        }
+        core::hint::black_box(acc);
+        bytes
+    }
+
     /// Heap bytes held by the segments and the liveness table.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
@@ -983,5 +1012,23 @@ mod tests {
             assert_eq!(catalog.posting_count(), 2 * postings);
             catalog.parts.truncate(1);
         }
+    }
+
+    /// Warming reads the references of every segment and reports their
+    /// bytes, on a catalog of several segments and on an empty one.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn warming_reads_every_segments_references() {
+        assert_eq!(Catalog::new().warm_references(), 0);
+        let mut catalog = Catalog::builder();
+        for r in 0..50u32 {
+            catalog.add((0..40u32).map(|i| (i * 7 + r, i)));
+        }
+        let mut catalog = catalog.build();
+        catalog.add([(3, 1), (4, 2)]);
+        assert!(catalog.segment_count() > 1);
+        let bytes: usize = catalog.segments().map(|s| s.refs().data().len()).sum();
+        assert!(bytes > 0);
+        assert_eq!(catalog.warm_references(), bytes);
     }
 }

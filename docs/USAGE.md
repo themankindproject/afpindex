@@ -1145,6 +1145,20 @@ larger than memory costs only the keys and directories it builds. As with
 `map_from`, nothing in the directory may change while a catalog mapped from
 it, a clone of it or a catalog sharing one of its segments is alive.
 
+**Warm the references, not the times.** A search reads the references of
+every run it matches and the times of its survivors only, so the
+references are the part of a file that must be in memory, a little over
+half of it. After `open_trusted` or `map_dir_trusted`, which read no
+posting, the first searches each wait on the disk instead;
+`catalog().warm_references()` reads every page of the references once, in
+order, and leaves the times on the disk until a survivor needs them. On
+the real catalog (499 M postings, 2.0 GB of segment file, NVMe, page cache
+emptied first) the 104 clips took 4.5 s, and up to 1.1 s for one clip,
+straight after a trusted open; after 1.7 s of `warm_references` they took
+0.25 s, and 20 ms at worst, with 1.06 GB of the file in memory. A full
+`open` reads every posting to check it, which leaves the pages in the
+cache anyway.
+
 ---
 
 ## 14. Working with segments directly
@@ -1370,6 +1384,9 @@ copies an array that grows where glibc remaps its pages.
   threads as hardware threads. If a compaction or a load shares the host
   with them, cap the threads it takes with `set_max_threads`
   ([section 11](#the-threads-a-build-merge-or-load-takes)).
+- **Warm a mapped directory** with `warm_references()` after a trusted
+  open, before the first query, so the first searches do not wait on the
+  disk ([section 13](#a-catalog-in-a-directory)).
 - **Load with `map_from`** for fast restarts and shared pages across
   processes; `read_from` for a catalog that changes heavily. Once a
   snapshot has passed a full load, `map_from_trusted` maps it again

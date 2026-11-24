@@ -28,6 +28,7 @@ by about 10 %, so compare columns within one table only.
 - [A catalog in a directory](#a-catalog-in-a-directory)
 - [Survivor blocks, run weights and the overflow bound](#survivor-blocks-run-weights-and-the-overflow-bound)
 - [Packing a build on every core](#packing-a-build-on-every-core)
+- [Warming the references of a mapped catalog](#warming-the-references-of-a-mapped-catalog)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -765,6 +766,30 @@ the snapshots written by the two builds of the synthetic catalog of 60 M
 postings have the same checksum. The pieces in flight add about 2 % to
 the peak of a build. Wall-clock numbers for this belong to the AWS host
 and are not measured yet.
+
+## Warming the references of a mapped catalog
+
+A catalog directory opened with `CatalogStore::open_trusted` reads no
+posting, so the first searches fault the pages they touch in from the
+disk, one run at a time. A search reads the references of every run it
+matches and the times of its survivors only, so the references are what
+has to be in memory: on the real catalog, 1.06 GB of a 2.0 GB segment
+file. `Catalog::warm_references` reads one byte of every page of them, in
+order, and the kernel's read-ahead streams the file behind it.
+
+The real catalog in a store directory on the laptop's NVMe drive, the
+page cache emptied before each run, four alternating rounds, the 104
+clips searched twice after the open; candidates identical in every run:
+
+| after `open_trusted` | first pass | worst clip | second pass | file in memory after |
+|---|---|---|---|---|
+| nothing | 4.42–4.63 s | 1.06–1.10 s | 0.14–0.23 s | 1.03 GB |
+| `warm_references`, 1.59–1.83 s | 0.24–0.26 s | 16–20 ms | 0.15 s | 1.06 GB |
+
+Asking the kernel instead (`madvise` with `MADV_WILLNEED` over the
+references) was tried first and left out: on this kernel it read the
+first 128 KiB of the range and no more, and the first pass took as long
+as with nothing.
 
 ## Allocators and huge pages
 

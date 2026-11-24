@@ -79,7 +79,10 @@ First release: the engine of the *afpindex* design notes as a library.
   `save` writes the segments that have no file, then the manifest, and only
   then deletes what the manifest no longer names, so a crash at any point
   leaves the catalog of the last `save` that returned. `map_dir` reads a
-  directory without writing to it and without faulting its pages in. A
+  directory without writing to it and without faulting its pages in, and
+  `Catalog::warm_references` reads the packed references of every segment
+  into memory once, so the first searches do not wait on the disk while
+  the times, which only survivors read, stay there. A
   store (and a builder) holds an exclusive lock on the directory's `LOCK`
   file while it lives, so a second one fails to open instead of removing
   the first one's unsaved files. A store removes only its own segment and
