@@ -602,48 +602,9 @@ mod tests {
     use super::*;
     use crate::Posting;
 
-    /// A directory named after the test and the process, removed at the
-    /// end.
-    struct Scratch {
-        dir: std::path::PathBuf,
-    }
+    use crate::test_util::TempDir;
 
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            // Tests run at the same time in one process: a counter keeps
-            // their directories apart.
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "afpindex-merge-to-file-{name}-{}-{n}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("a fresh directory");
-            Self { dir }
-        }
-
-        fn path(&self, name: &str) -> std::path::PathBuf {
-            self.dir.join(name)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
-        }
-    }
+    use crate::test_util::Rng;
 
     /// `rows` postings over `hashes` hashes and `refs` references.
     fn segment(rng: &mut Rng, rows: usize, hashes: u64, refs: u32, max_time: u64) -> Segment {
@@ -685,8 +646,8 @@ mod tests {
         let mut packed = None;
         for coding in [RefCoding::Gaps, RefCoding::Packed] {
             let (want, merged) = expected(sides, coding);
-            let scratch = Scratch::new(what);
-            let path = scratch.path("out.afs");
+            let scratch = TempDir::new(what);
+            let path = scratch.0.join("out.afs");
             let written = merge_to_file(sides, &path, coding, settings).expect("the merge writes");
             let got = std::fs::read(&path).expect("the file it wrote");
             assert_eq!(got, want, "{what}, {coding:?}: bytes");
@@ -857,13 +818,13 @@ mod tests {
     /// the one an empty segment writes, with no reference range.
     #[test]
     fn an_empty_result_writes_an_empty_segment() {
-        let scratch = Scratch::new("empty");
+        let scratch = TempDir::new("empty");
         let nothing: [(&Segment, Option<&Keep<'_>>); 0] = [];
         for (sides, what) in [
             (nothing.as_slice(), "no source"),
             (&[(&Segment::default(), None)][..], "an empty source"),
         ] {
-            let path = scratch.path("empty.afs");
+            let path = scratch.0.join("empty.afs");
             let written = merge_to_file(sides, &path, RefCoding::Packed, Settings::default())
                 .expect("the merge writes");
             assert_eq!(written.ids, None, "{what}");
@@ -897,8 +858,8 @@ mod tests {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         let owned = segment(&mut rng, 12_000, 900, 300, 9_000);
         let other = segment(&mut rng, 4_000, 900, 150, 3_000);
-        let scratch = Scratch::new("mapped-source");
-        let source = scratch.path("source.afs");
+        let scratch = TempDir::new("mapped-source");
+        let source = scratch.0.join("source.afs");
         let mut bytes = Vec::new();
         owned.write_to(&mut bytes).expect("writing to memory");
         std::fs::write(&source, &bytes).expect("writing the source file");
@@ -911,7 +872,7 @@ mod tests {
             let sides: Vec<(&Segment, Option<&Keep<'_>>)> =
                 vec![(&mapped, Some(&keep)), (&other, None)];
             let (want, merged) = expected(&sides, RefCoding::Gaps);
-            let path = scratch.path("merged-by-pieces.afs");
+            let path = scratch.0.join("merged-by-pieces.afs");
             let settings = settings(threads, piece);
             merge_to_file(&sides, &path, RefCoding::Gaps, settings).expect("the merge writes");
             assert_eq!(
@@ -933,10 +894,10 @@ mod tests {
         }
         // A source that is itself a file a merge wrote.
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&mapped, None)];
-        let path = scratch.path("twice.afs");
+        let path = scratch.0.join("twice.afs");
         merge_to_file(&sides, &path, RefCoding::Gaps, settings(2, 300)).expect("the merge writes");
         let once = Segment::map_from(&path).expect("a valid snapshot");
-        let again = scratch.path("thrice.afs");
+        let again = scratch.0.join("thrice.afs");
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&once, None)];
         merge_to_file(&sides, &again, RefCoding::Gaps, settings(3, 400))
             .expect("the second merge writes");
@@ -952,13 +913,13 @@ mod tests {
         let a = segment(&mut rng, 20_000, 2_000, 500, 5_000);
         let b = segment(&mut rng, 8_000, 2_000, 200, 5_000);
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&a, None), (&b, None)];
-        let scratch = Scratch::new("window");
+        let scratch = TempDir::new("window");
         for threads in [1usize, 2, 4] {
             // Pieces of 32 postings: 875 of them, so threads run well
             // ahead of the file if the merge lets them.
             let written = merge_to_file(
                 &sides,
-                &scratch.path("window.afs"),
+                &scratch.0.join("window.afs"),
                 RefCoding::Gaps,
                 settings(threads, 32),
             )
@@ -978,8 +939,8 @@ mod tests {
         let mut rng = Rng(0x4146_4958_0000_0001);
         let a = segment(&mut rng, 6_000, 800, 200, 3_000);
         let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&a, None)];
-        let scratch = Scratch::new("failed-merge");
-        let missing = scratch.path("no-such-directory").join("out.afs");
+        let scratch = TempDir::new("failed-merge");
+        let missing = scratch.0.join("no-such-directory").join("out.afs");
         let err = merge_to_file(&sides, &missing, RefCoding::Gaps, Settings::default())
             .expect_err("no such directory");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -994,7 +955,7 @@ mod tests {
         // header, one of the packed arrays, and the keys and offsets
         // written after the pass.
         for limit in [1u64, 64, 1_000, 5_000] {
-            let path = scratch.path("doomed.afs");
+            let path = scratch.0.join("doomed.afs");
             let settings = Settings {
                 threads: 2,
                 piece: 500,
@@ -1007,7 +968,7 @@ mod tests {
             assert!(!path.exists(), "the file went with the error at {limit}");
         }
         // And the next merge without the limit writes the file.
-        let path = scratch.path("fine.afs");
+        let path = scratch.0.join("fine.afs");
         merge_to_file(&sides, &path, RefCoding::Gaps, Settings::default())
             .expect("the merge writes");
         assert!(path.exists());
@@ -1023,8 +984,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for threads in [1usize, 2, 4] {
             let (done, outcome) = std::sync::mpsc::channel();
-            let scratch = Scratch::new("panicking-piece");
-            let path = scratch.path("panic.afs");
+            let scratch = TempDir::new("panicking-piece");
+            let path = scratch.0.join("panic.afs");
             let worker_path = path.clone();
             std::thread::spawn(move || {
                 let mut rng = Rng(0x5EED_0FA1_1000_0001);

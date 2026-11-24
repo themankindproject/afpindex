@@ -241,6 +241,7 @@ mod avx2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::Rng;
     use alloc::vec::Vec;
 
     use crate::packed::Packed;
@@ -278,22 +279,10 @@ mod tests {
     /// out and the values come one at a time.
     #[test]
     fn blocks_agree_with_single_reads_at_every_width() {
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut vector_blocks = 0;
         for bits in 0..=32u32 {
-            let mask = if bits == 0 {
-                0
-            } else {
-                u64::MAX >> (64 - bits)
-            };
-            let values: Vec<u32> = (0..700)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    (x & mask) as u32
-                })
-                .collect();
+            let values: Vec<u32> = (0..700).map(|_| rng.bits(bits)).collect();
             let packed = Packed::pack(&values, bits, values.len());
             let ranges = (0..40).map(|lo| (lo, lo + 3 * lo)).chain([
                 (0, 0),

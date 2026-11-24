@@ -245,16 +245,7 @@ mod parallel {
 mod tests {
     use super::*;
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-    }
+    use crate::test_util::Rng;
 
     fn check(mut rows: Vec<Posting>) {
         let mut expected = rows.clone();

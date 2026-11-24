@@ -695,24 +695,13 @@ impl fmt::Debug for Packed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::Rng;
 
     #[test]
     fn round_trips_every_width() {
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         for bits in 0..=32u32 {
-            let mask = if bits == 0 {
-                0
-            } else {
-                u64::MAX >> (64 - bits)
-            };
-            let values: Vec<u32> = (0..1_000)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    (x & mask) as u32
-                })
-                .collect();
+            let values: Vec<u32> = (0..1_000).map(|_| rng.bits(bits)).collect();
             // Through a small capacity, so pushes grow the buffer.
             let p = Packed::pack(&values, bits, 3);
             assert_eq!(p.len(), values.len());
@@ -739,16 +728,9 @@ mod tests {
     /// source range and of the destination's end.
     #[test]
     fn appends_resume_where_the_last_one_stopped() {
-        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
         for bits in 0..=32u32 {
-            let values: Vec<u32> = (0..300)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    (x & mask_of(bits)) as u32
-                })
-                .collect();
+            let values: Vec<u32> = (0..300).map(|_| rng.bits(bits)).collect();
             let whole = Packed::pack(&values, bits, values.len());
             // The same width copies bits; a wider destination decodes.
             for out_bits in [bits, 32] {
@@ -781,16 +763,9 @@ mod tests {
     /// to every bit offset in the destination.
     #[test]
     fn long_stretches_copy_as_they_decode() {
-        let mut x = 0x0DDB_A110_5EED_1234u64;
+        let mut rng = Rng(0x0DDB_A110_5EED_1234);
         for bits in [1u32, 3, 7, 8, 13, 15, 17, 24, 31, 32] {
-            let values: Vec<u32> = (0..5_000)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    (x & mask_of(bits)) as u32
-                })
-                .collect();
+            let values: Vec<u32> = (0..5_000).map(|_| rng.bits(bits)).collect();
             let whole = Packed::pack(&values, bits, values.len());
             for lead in 0..9 {
                 for (lo, hi) in [
@@ -826,21 +801,9 @@ mod tests {
 
     #[test]
     fn for_each_matches_get_at_every_width() {
-        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         for bits in [0u32, 1, 7, 13, 17, 24, 31, 32] {
-            let mask = if bits == 0 {
-                0
-            } else {
-                u64::MAX >> (64 - bits)
-            };
-            let values: Vec<u32> = (0..500)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    (x & mask) as u32
-                })
-                .collect();
+            let values: Vec<u32> = (0..500).map(|_| rng.bits(bits)).collect();
             let p = Packed::pack(&values, bits, values.len());
             for (lo, hi) in [
                 (0, 0),

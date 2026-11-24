@@ -274,35 +274,9 @@ mod tests {
     use crate::{CatalogBuilder, Query, Scratch, SearchOptions};
     use alloc::format;
 
-    struct TempDir(PathBuf);
+    use crate::test_util::TempDir;
 
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir()
-                .join(format!("afpindex-build-{name}-{}-{n}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
-        }
-    }
+    use crate::test_util::Rng;
 
     /// References of random rows, some with none and some with rows
     /// repeated.

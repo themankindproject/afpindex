@@ -800,16 +800,7 @@ mod tests {
 
     type Keep<'a> = &'a (dyn Fn(u32) -> bool + Sync);
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
-        }
-    }
+    use crate::test_util::Rng;
 
     /// Every key's run, and a lookup of hashes the segment does not hold,
     /// agree between `got` and `want`, as do the postings in order.

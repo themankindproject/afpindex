@@ -1905,6 +1905,7 @@ impl FusedIterator for Postings<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::Rng;
 
     /// Every way two segments of a merge can store their references.
     const CODING_PAIRS: [(RefCoding, RefCoding); 4] = [
@@ -2168,13 +2169,8 @@ mod tests {
     /// hash ranges that leave runs on one side only.
     #[test]
     fn merge_and_filter_agree_with_the_sorted_union() {
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut below = move |n: u32| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x % u64::from(n)) as u32
-        };
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15u64);
+        let mut below = move |n: u32| rng.below(u64::from(n)) as u32;
         let keeps: [fn(u32) -> bool; 4] = [|_| true, |r| r % 3 != 0, |r| r >= 25, |_| false];
         for (left, right) in [(0..20u32, 20..40u32), (20..40, 0..20), (0..30, 10..40)] {
             let mut rows = |hashes: core::ops::Range<u32>, refs: &core::ops::Range<u32>, n| {

@@ -874,28 +874,7 @@ mod tests {
     use crate::{Posting, Query, Scratch, SearchOptions};
     use alloc::format;
 
-    /// A directory named after the test and the process, removed at the
-    /// end.
-    struct TempDir {
-        dir: PathBuf,
-    }
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir()
-                .join(format!("afpindex-store-{name}-{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            Self { dir }
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
+    use crate::test_util::TempDir;
 
     /// Open a directory without its lock, as a store on a file system that
     /// does not honour locks would.
@@ -903,16 +882,7 @@ mod tests {
         CatalogStore::open_with(dir, false, None)
     }
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
-        }
-    }
+    use crate::test_util::Rng;
 
     fn rows(rng: &mut Rng, hashes: u32) -> Vec<(u32, u32)> {
         let n = 20 + rng.below(120) as usize;
@@ -970,7 +940,7 @@ mod tests {
         let scratch = TempDir::new("model");
         let hashes = 60u32;
         for spill in [0usize, 5, usize::MAX] {
-            let dir = scratch.dir.join(format!("spill-{spill}"));
+            let dir = scratch.0.join(format!("spill-{spill}"));
             let mut store = CatalogStore::create(&dir).expect("a fresh directory");
             store.set_spill_postings(spill);
             let mut plain = Catalog::new();
@@ -1095,7 +1065,7 @@ mod tests {
             .expect("a search");
         let mut results = Vec::new();
         for spill in [0usize, 1, 200, usize::MAX] {
-            let dir = scratch.dir.join(format!("spill-{spill}"));
+            let dir = scratch.0.join(format!("spill-{spill}"));
             let mut store = CatalogStore::create(&dir).expect("a fresh directory");
             store.set_spill_postings(spill);
             for batch in &calls {
@@ -1150,7 +1120,7 @@ mod tests {
             (Stop::AfterRename, false),
             (Stop::BeforeDeletions, false),
         ] {
-            let dir = scratch.dir.join(format!("{stop:?}"));
+            let dir = scratch.0.join(format!("{stop:?}"));
             // Segments stay on the heap, so every save has files to write
             // and each of its steps runs.
             let mut store = CatalogStore::create(&dir).expect("a fresh directory");
@@ -1225,7 +1195,7 @@ mod tests {
     fn a_failed_save_changes_nothing() {
         let mut rng = Rng(0x0DDB_A110_5EED_1234);
         let scratch = TempDir::new("failed-save");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut store = small_store(&dir, &mut rng, 5, 30);
         store.save().expect("the first save");
         for fault in 0..3 {
@@ -1264,7 +1234,7 @@ mod tests {
     fn a_failed_merge_changes_nothing() {
         let mut rng = Rng(0x4146_4958_0000_0001);
         let scratch = TempDir::new("failed-merge");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut store = small_store(&dir, &mut rng, 6, 40);
         store.save().expect("the first save");
         for fault in 0..2 {
@@ -1310,7 +1280,7 @@ mod tests {
         plain.compact();
         let mut built = Vec::new();
         for threads in [1usize, 4] {
-            let dir = scratch.dir.join(format!("threads-{threads}"));
+            let dir = scratch.0.join(format!("threads-{threads}"));
             let mut store = CatalogStore::create(&dir).expect("a fresh directory");
             store.settings.threads = threads;
             store.set_spill_postings(0);
@@ -1335,7 +1305,7 @@ mod tests {
     fn corruption_is_an_error_and_never_a_panic() {
         let mut rng = Rng(0xFA_0001);
         let scratch = TempDir::new("corruption");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut store = small_store(&dir, &mut rng, 6, 40);
         store.save().expect("the save");
         // The store maps its segments, and Windows refuses to write a
@@ -1411,7 +1381,7 @@ mod tests {
     fn a_held_directory_refuses_a_second_store() {
         let mut rng = Rng(0x10C4_ED00);
         let scratch = TempDir::new("held");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut first = small_store(&dir, &mut rng, 5, 30);
         first.save().expect("the first save");
         // Every merge writes a file, so the addition leaves one unsaved.
@@ -1446,7 +1416,7 @@ mod tests {
     fn a_second_writer_makes_the_first_save_fail() {
         let mut rng = Rng(0xB0B0_1234);
         let scratch = TempDir::new("second-writer");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut first = small_store(&dir, &mut rng, 5, 30);
         first.save().expect("the first save");
         // Without the lock, as on a file system that does not honour it.
@@ -1470,7 +1440,7 @@ mod tests {
     fn a_segment_file_is_never_written_over() {
         let mut rng = Rng(0x0C10_BBE5);
         let scratch = TempDir::new("no-clobber");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut first = small_store(&dir, &mut rng, 5, 30);
         first.save().expect("the first save");
         // Without the lock, as on a file system that does not honour it.
@@ -1507,7 +1477,7 @@ mod tests {
     fn a_new_store_clears_what_an_unsaved_one_left() {
         let mut rng = Rng(0x1EF7_0E55);
         let scratch = TempDir::new("unsaved");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut unsaved = small_store(&dir, &mut rng, 8, 30);
         unsaved.compact().expect("a compaction");
         assert!(files(&dir).iter().any(|(name, _)| name.starts_with("seg-")));
@@ -1529,7 +1499,7 @@ mod tests {
         let mut rng = Rng(0x0E0E_5EED);
         let scratch = TempDir::new("wide-ranges");
         for spill in [0usize, usize::MAX] {
-            let dir = scratch.dir.join(format!("spill-{spill}"));
+            let dir = scratch.0.join(format!("spill-{spill}"));
             let mut store = CatalogStore::create(&dir).expect("a fresh directory");
             store.set_spill_postings(spill);
             let batch = [
@@ -1576,7 +1546,7 @@ mod tests {
     fn files_of_other_names_are_left_alone() {
         let mut rng = Rng(0xF11E_5AFE);
         let scratch = TempDir::new("other-files");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         std::fs::create_dir_all(&dir).expect("the directory");
         let others = ["notes.txt", "seg-notes.afs", "MANIFEST.bak", "data.tmp"];
         for name in others {
@@ -1612,9 +1582,9 @@ mod tests {
     fn a_directory_of_its_own() {
         let mut rng = Rng(0x5151);
         let scratch = TempDir::new("own-directory");
-        let missing = scratch.dir.join("nothing").join("here");
+        let missing = scratch.0.join("nothing").join("here");
         assert!(Catalog::map_dir(&missing).is_err());
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut store = CatalogStore::create(&dir).expect("a fresh directory");
         store.add(rows(&mut rng, 20)).expect("an addition");
         store.save().expect("the save");
@@ -1630,11 +1600,11 @@ mod tests {
     fn a_clone_of_the_catalog_saves_the_same_segments() {
         let mut rng = Rng(0xC10E);
         let scratch = TempDir::new("clone");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut store = small_store(&dir, &mut rng, 6, 40);
         store.save().expect("the save");
         let copy = store.catalog().clone();
-        let other = scratch.dir.join("copy");
+        let other = scratch.0.join("copy");
         let mut store = CatalogStore::create_from(&other, copy).expect("a fresh directory");
         store.set_spill_postings(usize::MAX);
         store.save().expect("the copy saves");
@@ -1650,7 +1620,7 @@ mod tests {
     fn the_reference_coding_is_saved_and_a_compaction_converts() {
         let mut rng = Rng(0xC0DE_0001);
         let scratch = TempDir::new("coding");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut store = CatalogStore::create(&dir).expect("a fresh directory");
         store.set_spill_postings(0);
         store.set_ref_coding(RefCoding::Gaps);
@@ -1700,7 +1670,7 @@ mod tests {
     fn a_merge_that_removes_every_posting_leaves_no_file() {
         let mut rng = Rng(0xE3E3);
         let scratch = TempDir::new("emptied");
-        let dir = scratch.dir.join("store");
+        let dir = scratch.0.join("store");
         let mut store = small_store(&dir, &mut rng, 6, 40);
         store.save().expect("the save");
         for id in 0..store.catalog().reference_count() as u32 {

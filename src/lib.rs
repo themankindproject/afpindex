@@ -123,6 +123,8 @@ mod snapshot;
 mod sort;
 #[cfg(feature = "mmap")]
 mod store;
+#[cfg(test)]
+mod test_util;
 
 // The guide's examples run as doctests, so they cannot drift from the API.
 // They map snapshots, hence `mmap`; the first one uses the `audiofp`

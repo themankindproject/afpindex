@@ -1854,13 +1854,8 @@ mod tests {
     fn passes_agree_across_decoders() {
         use crate::simd::Scalar;
 
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut below = move |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x % n) as u32
-        };
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15u64);
+        let mut below = move |n: u64| rng.below(n) as u32;
         let mut rows = Vec::new();
         for hash in 0..48u32 {
             let len = [1, 3, 4, 7, 8, 9, 31, 32, 33, 64, 100, 700][hash as usize % 12];
@@ -2199,13 +2194,8 @@ mod tests {
     /// errors it can report.
     #[test]
     fn both_survivor_scans_agree() {
-        let mut x = 0x2F6E_2B1D_9C4E_7A31u64;
-        let mut below = move |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
+        let mut rng = Rng(0x2F6E_2B1D_9C4E_7A31u64);
+        let mut below = move |n: u64| rng.below(n);
         // Four segments of growing size, so a search looks in all of them.
         let mut catalog = Catalog::new();
         for n_rows in [40u32, 90, 200, 400] {
@@ -2303,26 +2293,13 @@ mod tests {
     }
 
     /// A small deterministic generator for the randomised comparison.
-    struct Gen(u64);
-
-    impl Gen {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
-        }
-    }
+    use crate::test_util::Rng;
 
     /// A random catalog of `refs` references over `hashes` hashes in
     /// several `add_many` batches, with some references removed. Every
     /// reference has a posting of hash 3, so a query of hash 3 lights up
     /// every counter and marks every block.
-    fn random_catalog(rng: &mut Gen, refs: usize, hashes: u32) -> Catalog {
+    fn random_catalog(rng: &mut Rng, refs: usize, hashes: u32) -> Catalog {
         let mut catalog = Catalog::new();
         let mut next = 0usize;
         while next < refs {
@@ -2357,7 +2334,7 @@ mod tests {
     #[test]
     fn both_survivor_scans_agree_on_random_catalogs() {
         for seed in [0x5EED_0001u64, 0x5EED_0002, 0x5EED_0003] {
-            let mut rng = Gen(seed);
+            let mut rng = Rng(seed);
             let refs = 2_500 + rng.below(2_000) as usize;
             let hashes = 40 + rng.below(60) as u32;
             let catalog = random_catalog(&mut rng, refs, hashes);
@@ -2591,13 +2568,8 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn a_search_on_several_threads_finds_what_one_finds() {
-        let mut seed = 0x005E_A2C4_u64;
-        let mut next = |n: u32| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % u64::from(n)) as u32
-        };
+        let mut rng = Rng(0x005E_A2C4);
+        let mut next = |n: u32| rng.below(u64::from(n)) as u32;
         let mut catalog = Catalog::new();
         for r in 0..400u32 {
             // A clip of each reference, and hashes shared by many.
