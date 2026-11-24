@@ -2,7 +2,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::packed::Packed;
-use crate::simd::{self, Decoder, LANES, Pass};
+use crate::refs::Run as CodedRun;
+use crate::simd::{self, Decoder, Pass};
 use crate::{Catalog, Query, SearchError, Segment};
 
 /// Bounds and statistics parameters for a search.
@@ -260,10 +261,20 @@ struct RunLoc {
     hash: u32,
     lo: usize,
     hi: usize,
+    /// Where the run's coded references start.
+    at: u64,
     /// Most postings any one reference has in the run (saturating).
     mult: u8,
     /// Query times of the hash: the vote weight of a posting.
     weight: u32,
+}
+
+impl RunLoc {
+    /// The run's coded references.
+    #[inline]
+    fn refs<'a>(&self, segments: &[&'a Segment]) -> crate::refs::Run<'a> {
+        segments[self.segment as usize].run_refs(self.at, self.hi - self.lo)
+    }
 }
 
 /// Per-thread buffers a search reuses.
@@ -542,9 +553,6 @@ const GROUP_BATCH: usize = 32;
 /// blocks are skipped. In a search that records which blocks its totals
 /// pass wrote, one byte of the scratch stands for each block.
 const SCAN_BLOCK: usize = 64;
-/// Fanouts up to this answer the fanout test from a fixed ring of the
-/// last references instead of a second read of the run.
-const RING: usize = 64;
 
 /// Locate every query hash's run in every segment.
 ///
@@ -567,13 +575,14 @@ fn locate(segments: &[&Segment], query: &Query, runs: &mut Vec<RunLoc>) {
             seg.touch_directory(&hashes[end..(end + LOOKUP_BATCH).min(n)]);
             for (i, &hash) in hashes[k..end].iter().enumerate() {
                 let qi = k + i;
-                if let Some((lo, hi, mult)) = seg.range_mult(hash) {
+                if let Some(run) = seg.locate(hash) {
                     runs.push(RunLoc {
                         segment: si as u32,
                         hash: qi as u32,
-                        lo,
-                        hi,
-                        mult,
+                        lo: run.lo,
+                        hi: run.hi,
+                        at: run.at,
+                        mult: run.mult,
                         weight: u32::try_from(query.times(qi).len()).unwrap_or(u32::MAX),
                     });
                 }
@@ -700,7 +709,7 @@ macro_rules! for_each_run {
         let n = runs.len();
         let touch = |from: usize, to: usize| {
             let acc = runs[from.min(n)..to.min(n)].iter().fold(0u32, |acc, run| {
-                acc ^ segments[run.segment as usize].touch_refs(run.lo, run.hi, $reach)
+                acc ^ segments[run.segment as usize].touch_refs(run.at, run.hi - run.lo, $reach)
             });
             core::hint::black_box(acc);
         };
@@ -708,13 +717,7 @@ macro_rules! for_each_run {
         for k in (0..n).step_by(RUN_BATCH) {
             touch(k + RUN_BATCH, k + 2 * RUN_BATCH);
             for run in &runs[k..(k + RUN_BATCH).min(n)] {
-                visit(
-                    segments[run.segment as usize].refs(),
-                    run.lo,
-                    run.hi,
-                    run.weight,
-                    run.mult,
-                );
+                visit(run.refs(segments), run.weight, run.mult);
             }
         }
     }};
@@ -722,12 +725,8 @@ macro_rules! for_each_run {
 
 /// Visit every run's references with its vote weight. Each batch of runs
 /// is loaded while the batch before it is visited.
-fn for_each_run(
-    segments: &[&Segment],
-    runs: &[RunLoc],
-    visit: impl FnMut(&Packed, usize, usize, u32, u8),
-) {
-    // One value at a time reads 8 bytes from the byte a value starts in.
+fn for_each_run(segments: &[&Segment], runs: &[RunLoc], visit: impl FnMut(CodedRun<'_>, u32, u8)) {
+    // One field at a time reads 8 bytes from the byte a field starts in.
     for_each_run!(segments, runs, Packed::SLACK, visit);
 }
 
@@ -735,51 +734,30 @@ fn for_each_run(
 /// every posting counts, which is how the stream and the block passes
 /// differ.
 ///
-/// Inside a run a reference's postings are contiguous, so entry `i` is its
-/// reference's `fanout + 1`th or later posting exactly when entry
-/// `i − fanout` has the same reference; a ring of the last [`RING`]
-/// references answers that without a second read of the run.
+/// Inside a run a reference's postings are neighbours, so an entry is its
+/// reference's `fanout + 1`th or later posting exactly when the
+/// `fanout` entries before it have its reference: a count of the streak
+/// so far answers that without a second read of the run.
 macro_rules! count_run {
     ($fanout:expr, $whole:expr, $totals:expr, $marks:expr, $each:expr) => {{
         let (fanout, whole): (Option<usize>, usize) = ($fanout, $whole);
         let each = $each;
-        move |refs: &Packed, lo: usize, hi: usize, qc: u32, mult: u8| match fanout {
+        move |run: CodedRun<'_>, qc: u32, mult: u8| match fanout {
             // Every posting counts, which on real catalogs is nearly every
             // run.
-            Some(_) if usize::from(mult) <= whole => {
-                each(refs, lo, hi, qc, &mut *$totals, &mut *$marks)
-            }
-            Some(f) if f <= RING => {
-                let head = lo + (hi - lo).min(f);
-                let mut ring = [0u32; RING];
-                let mut i = 0usize;
-                refs.for_each(lo, head, |r| {
-                    ring[i % RING] = r;
-                    i += 1;
-                    $totals[r as usize] += qc;
-                    M::mark(&mut *$marks, r);
-                });
-                refs.for_each(head, hi, |r| {
-                    let counts = ring[(i - f) % RING] != r;
-                    ring[i % RING] = r;
-                    i += 1;
-                    $totals[r as usize] += qc * u32::from(counts);
-                    M::mark(&mut *$marks, r);
-                });
-            }
+            Some(_) if usize::from(mult) <= whole => each(run, qc, &mut *$totals, &mut *$marks),
             Some(f) => {
-                let head = lo + (hi - lo).min(f);
-                refs.for_each(lo, head, |r| {
-                    $totals[r as usize] += qc;
+                // Unlike the first reference, so the first entry starts a
+                // streak.
+                let (mut last, mut streak) = (!run.first(), 0usize);
+                run.for_each(|r| {
+                    streak = if r == last { streak + 1 } else { 0 };
+                    last = r;
+                    $totals[r as usize] += qc * u32::from(streak < f);
                     M::mark(&mut *$marks, r);
                 });
-                for i in head..hi {
-                    let r = refs.get(i);
-                    $totals[r as usize] += qc * u32::from(refs.get(i - f) != r);
-                    M::mark(&mut *$marks, r);
-                }
             }
-            None => each(refs, lo, hi, qc, &mut *$totals, &mut *$marks),
+            None => each(run, qc, &mut *$totals, &mut *$marks),
         }
     }};
 }
@@ -818,26 +796,20 @@ impl<M: Marks> Pass for CountPlain<'_, M> {
             return count_plain(segments, fanout, runs, counters);
         }
         let CounterParts { totals, marks } = counters.parts();
-        let each = |refs: &Packed,
-                    lo: usize,
-                    hi: usize,
-                    qc: u32,
-                    totals: &mut [u32],
-                    marks: &mut M::Store<'_>| {
-            refs.for_each_in(
-                lo,
-                hi,
+        let each = |run: CodedRun<'_>, qc: u32, totals: &mut [u32], marks: &mut M::Store<'_>| {
+            run.for_each_in(
                 decoder,
-                // Forced in with the block loop around it: see
-                // `Packed::for_each_in`.
+                // Forced in with the block loop around it: outside the
+                // function that enabled the kernel's instructions a block
+                // costs calls.
                 #[inline(always)]
-                |r| {
+                |_, r| {
                     totals[r as usize] += qc;
                     M::mark(marks, r);
                 },
             );
         };
-        // A block reads a window from the byte its first value starts in.
+        // A block reads a window from the byte its first gap starts in.
         for_each_run!(
             segments,
             runs,
@@ -847,7 +819,7 @@ impl<M: Marks> Pass for CountPlain<'_, M> {
     }
 }
 
-/// Count every run with plain adds, decoding each run as a stream.
+/// Count every run with plain adds, decoding each run a field at a time.
 fn count_plain<M: Marks>(
     segments: &[&Segment],
     fanout: Option<usize>,
@@ -855,13 +827,8 @@ fn count_plain<M: Marks>(
     mut counters: Counters<'_, M>,
 ) {
     let CounterParts { totals, marks } = counters.parts();
-    let each = |refs: &Packed,
-                lo: usize,
-                hi: usize,
-                qc: u32,
-                totals: &mut [u32],
-                marks: &mut M::Store<'_>| {
-        refs.for_each(lo, hi, |r| {
+    let each = |run: CodedRun<'_>, qc: u32, totals: &mut [u32], marks: &mut M::Store<'_>| {
+        run.for_each(|r| {
             totals[r as usize] += qc;
             M::mark(marks, r);
         });
@@ -874,8 +841,8 @@ fn count_plain<M: Marks>(
 }
 
 /// Count every run straight into the counters, saturating at `u32::MAX`
-/// so an overflow is detectable afterwards. Entry `i` counts unless entry
-/// `i − fanout` has the same reference.
+/// so an overflow is detectable afterwards. An entry counts unless the
+/// `fanout` entries before it have its reference.
 fn count_direct<M: Marks>(
     segments: &[&Segment],
     fanout: Option<usize>,
@@ -883,31 +850,17 @@ fn count_direct<M: Marks>(
     mut counters: Counters<'_, M>,
 ) {
     let CounterParts { totals, marks } = counters.parts();
-    for_each_run(segments, runs, |refs, lo, hi, qc, _| match fanout {
-        Some(f) => {
-            let head = lo + (hi - lo).min(f);
-            for i in lo..head {
-                let r = refs.get(i);
-                let t = &mut totals[r as usize];
-                *t = t.saturating_add(qc);
-                M::mark(marks, r);
-            }
-            for i in head..hi {
-                let r = refs.get(i);
-                let v = qc * u32::from(refs.get(i - f) != r);
-                let t = &mut totals[r as usize];
-                *t = t.saturating_add(v);
-                M::mark(marks, r);
-            }
-        }
-        None => {
-            for i in lo..hi {
-                let r = refs.get(i);
-                let t = &mut totals[r as usize];
-                *t = t.saturating_add(qc);
-                M::mark(marks, r);
-            }
-        }
+    let f = fanout.unwrap_or(usize::MAX);
+    for_each_run(segments, runs, |run, qc, _| {
+        let (mut last, mut streak) = (!run.first(), 0usize);
+        run.for_each(|r| {
+            streak = if r == last { streak + 1 } else { 0 };
+            last = r;
+            let v = if streak < f { qc } else { 0 };
+            let t = &mut totals[r as usize];
+            *t = t.saturating_add(v);
+            M::mark(marks, r);
+        });
     });
 }
 
@@ -952,60 +905,20 @@ impl Pass for FindGroups<'_> {
     }
 }
 
-/// Longest range a search for a reference reads in blocks, where the
-/// decoder has a kernel: a block answers for eight entries without a
-/// branch that depends on them, which beats halving up to three blocks.
-/// Measured on runs of 17, 48 and 136 postings: reading runs of 17 this
-/// way took a tenth off the pass; reading up to 64 entries, or halving a
-/// longer range down to 32 first, cost a sixth to a half more.
-const SCAN: usize = 24;
-
-/// First entry in `lo..hi` whose reference is not below `r`, or `hi`; the
-/// references in the range are ascending.
-#[inline(always)]
-fn first_not_below<D: Decoder>(
-    refs: &Packed,
-    mut lo: usize,
-    hi: usize,
-    r: u32,
-    decoder: D,
-) -> usize {
-    if hi - lo >= Packed::BLOCK_MIN
-        && hi - lo <= SCAN
-        && let Some(mut blocks) = refs.blocks(lo, decoder)
-    {
-        while lo < hi {
-            let Some(block) = blocks.next() else {
-                return refs.partition_point(lo, hi, |x| x < r);
-            };
-            let n = (hi - lo).min(LANES);
-            // Ascending, so the entries below `r` are the block's
-            // first ones and their count is where `r` belongs.
-            let below = block
-                .iter()
-                .enumerate()
-                .filter(|&(lane, &x)| lane < n && x < r)
-                .count();
-            lo += below;
-            if below < n {
-                break;
-            }
-        }
-        return lo;
-    }
-    refs.partition_point(lo, hi, |x| x < r)
-}
-
 /// First half of the histogram pass: find every survivor's group in every
 /// run, in run order then reference order.
 ///
-/// A run is grouped by reference, ascending, so a run with few survivors
-/// relative to its length is searched for each survivor, and a run with
-/// many is walked once with a bitmap membership test per group (`index`
-/// then holds each survivor's index plus one). A group is no longer than
-/// the run's multiplicity, so its end is not searched for when that is
-/// one. Only the references are read here, through `decoder`, and they
-/// are still cached from the totals pass.
+/// A run is grouped by reference, ascending, and coded in blocks that each
+/// start from a whole reference, so only the blocks whose span of
+/// references holds a survivor (`survivors` ascend) are decoded; the rest
+/// cost a read of their first fields. A group of a survivor never reaches
+/// into a block passed over, which would have held the survivor, so a
+/// group ends where the reference changes or the decoded stretch does,
+/// and a bitmap membership test per group (`index` then holds each
+/// survivor's index plus one) says whether it is a survivor's. A run whose
+/// multiplicity is one has a group per posting and needs no look for the
+/// change. The references are decoded through `decoder` and are still
+/// cached from the totals pass.
 #[expect(clippy::too_many_arguments, reason = "the fields of `FindGroups`")]
 #[inline(always)]
 fn find_groups<D: Decoder>(
@@ -1019,76 +932,58 @@ fn find_groups<D: Decoder>(
     decoder: D,
 ) {
     groups.clear();
-    let n_surv = survivors.len();
+    debug_assert!(survivors.is_sorted(), "survivors ascend");
     let is_survivor = |r: u32| survivor_bits[(r >> 6) as usize] & (1u64 << (r & 63)) != 0;
     for run in runs {
-        let refs = segments[run.segment as usize].refs();
-        let (run_lo, run_hi) = (run.lo, run.hi);
-        let len = run_hi - run_lo;
+        let refs = run.refs(segments);
+        let base = run.lo;
         let mut push = |i: usize, j: usize, survivor: u32| {
             let end = fanout.map_or(j, |f| j.min(i.saturating_add(f)));
             groups.push(Group {
                 segment: run.segment,
                 hash: run.hash,
                 survivor,
-                lo: i,
-                hi: end,
+                lo: base + i,
+                hi: base + end,
             });
         };
-        // Probing costs about `survivors × log2(len)`; walking costs `len`.
-        let probe_cost = n_surv.saturating_mul((usize::BITS - len.leading_zeros()) as usize + 1);
-        if probe_cost < len {
-            // The most postings a group can have; a saturated multiplicity
-            // is only a lower bound.
-            let longest = if run.mult == u8::MAX {
-                len
-            } else {
-                usize::from(run.mult)
-            };
-            let mut lo = run_lo;
-            for (sv, &r) in survivors.iter().enumerate() {
-                let i = first_not_below(refs, lo, run_hi, r, decoder);
-                if i == run_hi {
-                    break;
-                }
-                lo = i;
-                if refs.get(i) != r {
-                    continue;
-                }
-                let j = if longest == 1 {
-                    i + 1
-                } else {
-                    let end = run_hi.min(i.saturating_add(longest));
-                    refs.partition_point(i + 1, end, |x| x == r)
-                };
-                push(i, j, sv as u32);
-                lo = j;
-            }
-        } else if run.mult == 1 {
+        // The first survivor not below the blocks offered so far.
+        let mut next = 0;
+        let want = |lo: u32, hi: u32| {
+            next += survivors[next..].partition_point(|&s| s < lo);
+            survivors.get(next).is_some_and(|&s| s <= hi)
+        };
+        if run.mult == 1 {
             // Every posting is its own group: a membership test per
-            // posting, no search for the group's end.
-            let mut i = run_lo;
-            refs.for_each_in(run_lo, run_hi, decoder, |r| {
+            // posting, no look for the group's end.
+            refs.for_each_where(decoder, want, |i, r| {
                 if is_survivor(r) {
                     push(i, i + 1, index[r as usize] - 1);
                 }
-                i += 1;
             });
         } else {
-            // One read of the run: a group ends where the reference
-            // changes.
-            let (mut i, mut start, mut current) = (run_lo, run_lo, refs.get(run_lo));
-            refs.for_each_in(run_lo, run_hi, decoder, |r| {
-                if r != current {
-                    if is_survivor(current) {
-                        push(start, i, index[current as usize] - 1);
+            // The group being read (its first position and reference), and
+            // the position after the last one read.
+            let mut open: Option<(usize, u32)> = None;
+            let mut after = 0;
+            refs.for_each_where(decoder, want, |i, r| {
+                match open {
+                    Some((_, current)) if i == after && r == current => {}
+                    _ => {
+                        if let Some((start, current)) = open
+                            && is_survivor(current)
+                        {
+                            push(start, after, index[current as usize] - 1);
+                        }
+                        open = Some((i, r));
                     }
-                    (start, current) = (i, r);
                 }
-                i += 1;
+                after = i + 1;
             });
-            if is_survivor(current) {
-                push(start, run_hi, index[current as usize] - 1);
+            if let Some((start, current)) = open
+                && is_survivor(current)
+            {
+                push(start, after, index[current as usize] - 1);
             }
         }
     }
@@ -1885,11 +1780,12 @@ mod tests {
                 }
                 let mut want = Vec::new();
                 for run in &runs {
-                    let refs = seg.refs();
+                    let refs: Vec<u32> = run.refs(&segments).cursor().collect();
+                    let get = |i: usize| refs[i - run.lo];
                     let mut i = run.lo;
                     while i < run.hi {
-                        let r = refs.get(i);
-                        let j = (i..run.hi).find(|&j| refs.get(j) != r).unwrap_or(run.hi);
+                        let r = get(i);
+                        let j = (i..run.hi).find(|&j| get(j) != r).unwrap_or(run.hi);
                         if index[r as usize] != 0 {
                             want.push(Group {
                                 segment: 0,

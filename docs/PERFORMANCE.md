@@ -185,7 +185,7 @@ query. On the laptop:
 
 | | this crate | prototype in the notes |
 |---|---|---|
-| memory | 1.94 GiB (17-bit references, 15-bit times) | 3.0 GiB packed, 3.8 GiB raw |
+| memory | 1.94 GiB (17-bit references, 15-bit times; 1.70 GiB since [references are coded as gaps](#references-coded-as-gaps)) | 3.0 GiB packed, 3.8 GiB raw |
 | build from rows in memory | 8.3 s | 333 s including the export |
 | search, one thread | p50 1.10 ms, p95 8.8 ms, max 14.2 ms | p50 2.9 ms |
 | searches per second, 4 threads | 1,456 | 890 |
@@ -874,6 +874,59 @@ were 0.9 s under every setup, since their large arrays never pass
 through the allocator; their searches gained 4–5 % from huge pages. The
 tunable is the recommendation in
 [Running in production](USAGE.md#17-running-in-production).
+
+## References coded as gaps
+
+Inside a run the references ascend, so snapshot format 6 stores them as
+the gaps between neighbours instead of packing each at the width of the
+largest id. A run is cut into blocks of 65 references; each block holds
+its first reference whole (at a width shared by the run), a five-bit
+width, and 64 gaps at the width of its widest (`src/refs.rs`). The
+directory slot grew from 12 bytes to 16 to hold where a run's coded
+references start, and the file stores that offset per key.
+
+On the real catalog with a laptop (i5-1135G7), against packed references
+at 17 bits; the two builds alternated, five rounds, best time per clip,
+and candidates were byte-identical on all 104 clips:
+
+| | packed (format 5) | gaps (format 6) |
+|---|---|---|
+| reference bits per posting | 17 | 12.50 |
+| file | 2.05 GB | 1.79 GB (−12.5 %) |
+| heap, `read_from` / mapped | 1.94 / 0.08 GiB | 1.70 / 0.10 GiB |
+| first search of each clip, summed | 1 | 1.12 (median clip 1.09) |
+| all 104 clips in turn, trusted map | 127.6 ms | 136.7 ms (+7 %) |
+| a clip searched again at once, best of three | 1 | 1.48 |
+| searches per second, eight threads | 1,426–1,466 | 1,287–1,312 |
+| instructions, all clips twice (callgrind) | 1.61 G | 2.21 G |
+| `read_from` / checked `map_from` | 0.99 / 0.75 s | 1.1 / 0.6–0.9 s |
+
+A run takes a quarter fewer bits, so a search loads fewer lines; decoding
+costs a running sum per reference and the fields between blocks. Where a
+run is not in the cache yet the two nearly cancel (+7–12 %); where it
+is, the decoding shows (+48 %), and eight threads sharing the memory
+system answer 10 % fewer searches.
+
+The layout is the third tried:
+
+- **One stream of gaps per run**, 32-gap blocks each carrying only a
+  width (12.36 bits): the histogram pass had to decode a whole run to
+  find a few survivors, where packed references let it search. All clips
+  took 2.73 G instructions, 1.70 times the packed ones.
+- **A whole reference at the head of every block** lets the histogram
+  pass step from base to base and decode only the blocks whose span holds
+  a survivor, for 0.07 bits a reference: 2.37 G instructions with blocks
+  of 33.
+- **Blocks of 65** halve the fields read between blocks, for another
+  0.07 bits: 2.21 G.
+
+The load check decodes the gaps eight at a time like a search does: a
+sum that passes the largest id wraps below the reference before it, so
+one compare per reference finds it. Checking a reference at a time had
+taken `read_from` from 0.99 s to 1.74 s.
+
+Elias–Fano coding would take 11.6 bits a reference on the same runs
+(sized, not built), but has no eight-at-a-time decode with these kernels.
 
 ## Reproducing
 

@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::ops::Range;
 
+#[cfg(test)]
 use crate::simd::{Decoder, LANES, WINDOW};
 
 /// Unsigned integers of one width, `bits` each, packed back to back in
@@ -224,6 +225,7 @@ impl Packed {
         }
     }
 
+    #[cfg(test)]
     /// Call `f` with entries `lo..hi` in order. A streaming decode: one
     /// word load every few entries instead of one per entry, and no
     /// per-entry bounds check.
@@ -253,6 +255,7 @@ impl Packed {
         }
     }
 
+    #[cfg(test)]
     /// A cursor over the entries from `at` on in blocks of [`LANES`], if
     /// `decoder` has a kernel for this width.
     #[inline(always)]
@@ -273,6 +276,7 @@ impl Packed {
         })
     }
 
+    #[cfg(test)]
     /// Call `f` with entries `lo..hi` in blocks of up to [`LANES`], as far
     /// as `decoder` has a kernel for them, and return the entry it stopped
     /// at: `hi`, or an earlier one the caller reads the rest from.
@@ -307,6 +311,7 @@ impl Packed {
         i
     }
 
+    #[cfg(test)]
     /// Load a byte of every cache line that entries `lo..hi` lie in, and
     /// for a short range of those up to `reach` bytes past its last byte,
     /// and fold them together for a caller to discard: the lines a decode
@@ -341,10 +346,12 @@ impl Packed {
         u32::from(acc)
     }
 
+    #[cfg(test)]
     /// Entries a range must have before it is decoded in blocks: below
     /// this, setting a kernel up costs more than the values it decodes.
     pub(crate) const BLOCK_MIN: usize = 4;
 
+    #[cfg(test)]
     /// Call `f` with entries `lo..hi` in order, decoded in blocks where
     /// `decoder` has a kernel and as a stream ([`Packed::for_each`])
     /// otherwise.
@@ -392,6 +399,13 @@ impl Packed {
         self.bits
     }
 
+    /// The data bytes and the slack after them: what a reader that loads
+    /// a window at a time reads from.
+    #[inline]
+    pub(crate) fn raw(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
     /// The data bytes, without the slack.
     #[cfg(any(feature = "std", test))]
     pub(crate) fn data(&self) -> &[u8] {
@@ -409,12 +423,14 @@ impl Packed {
         range.map(move |i| self.get(i))
     }
 
+    #[cfg(test)]
     pub(crate) fn max(&self) -> Option<u32> {
         let mut max = None;
         self.for_each(0, self.len, |v| max = max.max(Some(v)));
         max
     }
 
+    #[cfg(test)]
     /// First index in `lo..hi` whose value fails `pred`, or `hi`; the
     /// values in the range must be partitioned by `pred`.
     #[inline]
@@ -437,6 +453,7 @@ impl Packed {
     }
 }
 
+#[cfg(test)]
 /// A cursor over a [`Packed`] array in blocks of [`LANES`] values
 /// (see [`Packed::blocks`]).
 pub(crate) struct Blocks<'a, K> {
@@ -448,6 +465,7 @@ pub(crate) struct Blocks<'a, K> {
     step: usize,
 }
 
+#[cfg(test)]
 impl<K: Fn(&[u8; WINDOW]) -> [u32; LANES]> Blocks<'_, K> {
     /// The next [`LANES`] values, or `None` within a window of the end of
     /// the bytes, where the caller reads what is left one value at a
@@ -523,6 +541,7 @@ impl PackedBuilder {
         self.len
     }
 
+    #[cfg(test)]
     /// Append `v`, which must fit the width. For one value at a time;
     /// [`PackedBuilder::extend`] keeps a loop's state in registers.
     #[inline]
@@ -557,6 +576,25 @@ impl PackedBuilder {
         }
         (self.acc, self.fill) = (acc, fill);
         self.len += pushed;
+    }
+
+    /// Append the low `n` bits of `v` (at most 32) to an array of single
+    /// bits, as `n` values: how a bit stream of fields of varying widths
+    /// is written.
+    #[inline]
+    pub(crate) fn push_bits(&mut self, v: u64, n: u32) {
+        debug_assert_eq!(self.bits, 1, "fields go into an array of single bits");
+        debug_assert!(n <= u32::BITS, "a field of {n} bits");
+        // At most 31 pending bits and 32 new ones, so nothing is lost.
+        self.acc |= (v & mask_of(n)) << self.fill;
+        self.fill += n;
+        if self.fill >= u32::BITS {
+            self.bytes
+                .extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= u32::BITS;
+            self.fill -= u32::BITS;
+        }
+        self.len += n as usize;
     }
 
     /// Append values `lo..hi` of `src`.

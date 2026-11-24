@@ -761,30 +761,36 @@ segments are freed when the last search lets go.
 
 | What | Cost |
 |---|---|
-| A posting | Its reference width plus its time width, in bits (`Segment::widths`) |
-| A distinct hash, per segment | 4 bytes of key plus about 20 of directory, or plus about 48 in a segment of fewer than 2<sup>20</sup> keys |
+| A posting | Its coded reference (12.5 bits on the real catalog) plus its time width, in bits (`Segment::bits`, `Segment::time_bits`) |
+| A distinct hash, per segment | 4 bytes of key plus about 27 of directory, or plus about 64 in a segment of fewer than 2<sup>20</sup> keys |
 | An id | 1 byte of liveness table |
 | A `Scratch`, per thread | 4 bytes and a bit per id of the largest catalog it searched, plus buffers that grow with the queries; a search on several threads adds 4 bytes per id for each thread beyond the first |
 | A search's histogram | 16 bytes per survivor vote and 32 bytes per survivor group, while it runs |
 | Building with `CatalogBuilder` | 12 bytes per collected posting, about 20 while `build` runs |
 
-**Widths.** A segment packs references at the bits of its largest
-reference id and times at the bits of its largest time. 120,329
-references need 17 bits; times up to 32,767 frames (8.7 minutes at 62.5
-frames per second) 15. The real catalog: 499.4 M postings × 32 bits =
-1.86 GiB, plus 3.66 M hashes × 24 bytes = 0.08 GiB, is the 1.94 GiB it
-measures. Packing saves 41 % against 32-bit arrays, for 3–8 % more
-cycles per search.
+**References and times.** Inside a run the references ascend, so a
+segment codes them as the gaps between neighbours, in blocks of 65 that
+each start from a whole reference and take the width of their widest
+gap ([The format](#the-format)). On the real catalog that is 12.5 bits a
+reference, where packing them at the width of the largest of 120,329
+ids took 17. Times are packed at the bits of the largest time: up to
+32,767 frames (8.7 minutes at 62.5 frames per second) take 15. The real
+catalog: 499.4 M postings × 27.5 bits = 1.60 GiB, plus 3.66 M hashes ×
+31 bytes = 0.10 GiB, is the 1.70 GiB it measures, 57 % less than 32-bit
+arrays. Decoding the gaps costs a search 7–12 % when its runs are not
+already in the cache, and about half again when they are
+([PERFORMANCE.md](PERFORMANCE.md#references-coded-as-gaps)).
 
 **The directory** is an open-addressing table rebuilt from the keys
 whenever a segment is built or loaded (never stored). A slot holds the
-run's start and length and the most postings any one reference has in
-it, which is what lets the search skip the fanout test on most runs.
+run's start and length, where its coded references start, and the most
+postings any one reference has in it, which is what lets the search skip
+the fanout test on most runs.
 A directory of fewer than 2<sup>20</sup> keys leaves four slots per key
 instead of the 1.7 of a larger one: a lookup that misses then reaches an
 empty slot in under two probes instead of five, which is what most
-lookups in a delta segment are, at 48 bytes per key instead of 20 (at
-most about 50 MB for a segment that small). There is no offsets array:
+lookups in a delta segment are, at 64 bytes per key instead of 27 (at
+most about 67 MB for a segment that small). There is no offsets array:
 iteration in key order looks each key up in the directory, and a merge
 recovers the order of the runs from one scan of the directory and a sort
 of what it finds (16 bytes per distinct hash while the merge runs). A
@@ -872,7 +878,7 @@ catalog. The checksum is a fast 64-bit hash that catches accidents
 from where you write them.
 
 The load is bound by that check, then by the checksum and the directory.
-On the real catalog (1.94 GiB) on two hardware threads, `read_from` takes
+On the real catalog (1.94 GiB with packed references) on two hardware threads, `read_from` takes
 about 2 s and `map_from` about 1 s with the `simd` feature (2.7 s and
 1.6 s without it), and huge pages for the heap take `read_from` down to
 1.5 s.
@@ -884,9 +890,9 @@ about 2 s and `map_from` about 1 s with the `simd` feature (2.7 s and
 posting: the checksum of each segment, and the order of each run. The
 header, the sizes, the keys and offsets, the liveness table and its
 checksum, and the id space are still checked, and so is the stored
-reference range: that its smallest reference is not above its largest,
-and that the largest fits the segment's reference width. No posting is
-read at all, because each run's multiplicity and the segment's reference
+reference range (that its smallest reference is not above its largest),
+and that each run's coded references take a length its postings can
+take. No posting is read at all, because each run's multiplicity and the segment's reference
 range are stored in the file (see [The format](#the-format)).
 
 ```rust
@@ -940,31 +946,33 @@ anyway).
 
 ### The format
 
-Both formats are version 5: little-endian arrays behind a header, every
+Both formats are version 6: little-endian arrays behind a header, every
 section 8-byte aligned, closed by checksums. References and times are
-stored packed as they are in memory, so a file is about the size of the
+stored as they are in memory, so a file is about the size of the
 catalog. A file of an earlier version is refused with
 `SnapshotError::UnsupportedVersion`: there is no reader for it, so write
 the catalog out again with the current version.
 
 ```text
 Segment snapshot
-0   "AFIX"            4   version u32 = 5
-8   ref_bits u32      12  time_bits u32
+0   "AFIX"            4   version u32 = 6
+8   time_bits u32     12  reserved u32 = 0
 16  key_count u64     24  posting_count u64
 32  min_ref u32       36  max_ref u32      (both 0 without postings)
-40  refs    ceil(posting_count × ref_bits / 8) bytes    (zero-padded to 8)
-    times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
+40  ref_bits u64                           (bits of the coded references)
+48  times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
+    refs    ceil(ref_bits / 8) bytes                    (zero-padded to 8)
     keys    u32 × key_count                             (zero-padded to 8)
     offsets u64 × (key_count + 1)
+    ref_offsets u64 × (key_count + 1)
     mults   u8  × key_count                             (zero-padded to 8)
-    checksum u64 of refs, in four lanes
     checksum u64 of times, in four lanes
-    checksum u64 of keys, offsets and mults
+    checksum u64 of refs, in four lanes
+    checksum u64 of keys, both offsets and mults
     checksum u64 of the header and the three checksums before it
 
 Catalog snapshot
-0   "AFCT"            4   version u32 = 5
+0   "AFCT"            4   version u32 = 6
 8   flags u32 = 0     12  reserved u32 = 0
 16  reference_count u64   24  segment_count u64
 32  live bitmap, one bit per id, LSB first              (zero-padded to 8)
@@ -972,13 +980,31 @@ Catalog snapshot
     segment_count segment snapshots, back to back
 ```
 
+The references of a run are coded in blocks of up to 65, in one stream
+of bits for the whole segment, little-endian bit order:
+
+```text
+run    := width(5) block+
+block  := base(width) [width(5) gap(width) × (count − 1)]
+```
+
+The run's width is that of its largest base (its last block's), a
+block's base is its first reference whole, and its gaps, between
+neighbours, take the width of the widest; a block of one reference has
+no gap width. A width field names 0 to 30 bits, or 32 for 31 (a value of
+31 bits is stored at 32). The coding is canonical (every width the
+smallest that holds its field), which a full load checks, so equal runs
+are equal bits. `offsets` holds where each key's run starts among the
+postings and `ref_offsets` where its coded references start, in bits;
+each closes with the total.
+
 The postings come first and each section has its own checksum so that a
-merge can write a segment file in one pass: the two packed arrays grow
-side by side, each summed as it is written, and the counts and the index
+merge can write a segment file in one pass: the times and the coded
+references grow side by side, each summed as it is written, and the counts and the index
 are known, and written, only once the last posting is. A load checks the
 last checksum and the index's on every load, trusted or not, since they
-read no posting; a full load also sums the two packed arrays, on two
-cores of a mapped file. The packed arrays are summed in four interleaved
+read no posting; a full load also sums the two arrays, on two cores of
+a mapped file. The two arrays are summed in four interleaved
 lanes (word `i` of an array goes into lane `i % 4`), so that the sum
 runs at memory speed rather than at the latency of one multiplication
 per word.
@@ -989,12 +1015,13 @@ postings any one reference has in it, saturating at 255. `min_ref` and
 A load would otherwise walk every run for the two, a posting at a time;
 stored, a trusted load takes them and reads no posting, while a full load
 checks them against the runs it walks (`Corrupt` if they differ). One walk
-of the directory gives the writer both what it needs: the start of each
-run, which the offsets hold, and its multiplicity. Each run is sorted by
+of the directory gives the writer what it needs: the start of each run
+and of its coded references, which the two offsets hold, and its
+multiplicity. Each run is sorted by
 reference, so its first and last posting bound the segment's range.
 
-Flags and reserved fields are written as zero and ignored on read. The
-directory is not stored; it is rebuilt from the keys and the
+The catalog's flags and reserved field are written as zero and ignored
+on read; the segment's reserved field must be zero. The directory is not stored; it is rebuilt from the keys and the
 multiplicities on load (0.05 s on the real catalog).
 
 ### A catalog in a directory
@@ -1191,8 +1218,12 @@ pub fn segment_tour() -> Catalog {
     assert_eq!(run.iter().collect::<Vec<_>>(), [(0, 10), (1, 3)]);
     assert!(segment.run(8).is_none());
 
-    // Bits per posting: references up to 1 take 1 bit, times up to 10 take 4.
-    assert_eq!(segment.widths(), (1, 4));
+    // Bits in all: each run codes its first reference and the gaps after
+    // it (hash 7: a 5-bit width, reference 0 in no bits, a 5-bit width and
+    // a 1-bit gap; hash 9: a width and reference 0), and the times are
+    // packed at the width of the largest, 4 bits for 10.
+    assert_eq!(segment.bits(), (16, 12));
+    assert_eq!(segment.time_bits(), 4);
 
     // Every posting in (hash, reference, time) order.
     let all: Vec<Posting> = segment.postings().collect();
@@ -1415,13 +1446,13 @@ copies an array that grows where glibc remaps its pages.
 
 ### Sizing
 
-Memory is about 4 bytes per posting with typical widths, plus 24 bytes per
-distinct hash, plus 4 bytes and a bit per id per search thread. Estimate
+Memory is about 3.5 bytes per posting on the real catalog, plus about 31
+bytes per distinct hash, plus 4 bytes and a bit per id per search thread. Estimate
 postings from your fingerprinter's density: audiofp's Wang gives about
 300 hashes per second of music at its defaults, so a 3-minute track is
 about 54,000 postings and 100,000 such tracks about 5.4 G postings, or
-20 GiB. The real catalog averages 4,150 postings per reference (499 M
-over 120,329) and holds them in 1.94 GiB. Searches are bound by memory
+17 GiB. The real catalog averages 4,150 postings per reference (499 M
+over 120,329) and holds them in 1.70 GiB. Searches are bound by memory
 latency: more memory channels and cores scale throughput, and the target
 is a host whose catalog fits in RAM with room for the page cache (for
 `map_from`). Past one host, shard by reference and serve replicas from

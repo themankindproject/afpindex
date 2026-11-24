@@ -9,22 +9,25 @@
 //! segment.
 //!
 //! One pass is enough because of how a snapshot is laid out: the two
-//! packed arrays come first, each with a checksum of its own, and
+//! arrays of postings come first, each with a checksum of its own, and
 //! everything that is known only at the end (the counts in the header, the
 //! keys, the offsets, the multiplicities) is small and written last. The
-//! references are appended right behind the header through one handle and
-//! the times through another, which starts where the times of a merge that
-//! drops nothing belong. Most merges drop nothing; when one did (removed
-//! references, repeated postings), the times are moved down to where the
-//! references ended, which is the one part of the file written twice.
+//! times are appended right behind the header through one handle and the
+//! coded references through another, which starts where the references of
+//! a merge that drops nothing belong: the times are packed at one width,
+//! so theirs is known in advance, and the references, whose coding has no
+//! size until it is done, come last and grow as far as they need. Most
+//! merges drop nothing; when one did (removed references, repeated
+//! postings), the references are moved down to where the times ended,
+//! which is the one part of the file written twice.
 //!
 //! A piece rarely ends on a whole byte, so the byte two pieces share is
 //! put together in memory as the pieces arrive and every other byte has a
 //! single writer.
 //!
 //! Memory is bounded by what a piece is worth and by what the result holds
-//! per distinct hash (its keys, the start of each run and its
-//! multiplicity, 13 bytes), never by the posting count. A piece holds at
+//! per distinct hash (its key, the start of its run and of its references
+//! and its multiplicity, 21 bytes), never by the posting count. A piece holds at
 //! most [`PIECE`] postings of input, and no piece is started while it is
 //! more than [`WINDOW`] times the thread count ahead of the one the file
 //! waits for, so pieces that merge early cannot pile up.
@@ -35,8 +38,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Condvar, Mutex, PoisonError};
 
-use super::parallel::{Parts, Plan};
-use super::{MAX_POSTINGS, Segment, postings, widths};
+use super::parallel::Plan;
+use super::{MAX_POSTINGS, Parts, Segment, copied_ids, postings, time_bits, union_ids};
 use crate::packed::Packed;
 use crate::par::{lock, run_tasks, slots};
 use crate::snapshot::{ByteSum, HEADER, Head, index_sum, pad_len, write_index};
@@ -120,33 +123,12 @@ pub(crate) fn merge_to_file<F: Fn(u32) -> bool + Sync>(
     let pieces = most.div_ceil(settings.piece.max(1)).max(1);
     let plan = Plan::new(sides, pieces);
     let guard = RemoveOnFailure::new(path);
-    let written = write_pieces(&plan, path, widths(sides), most, settings)?;
+    // Runs of a source without a `keep` are copied unread; every posting of
+    // such a source is in the merge, and so its range.
+    let copied = copied_ids(sides);
+    let written = write_pieces(&plan, path, (time_bits(sides), copied), most, settings)?;
     guard.keep();
     Ok(written)
-}
-
-/// The range that covers both ranges, if either has one.
-fn ids_of(all: Option<(u32, u32)>, one: Option<(u32, u32)>) -> Option<(u32, u32)> {
-    match (all, one) {
-        (Some((lo, hi)), Some((a, b))) => Some((lo.min(a), hi.max(b))),
-        (a, b) => a.or(b),
-    }
-}
-
-/// The reference range of one merged piece.
-fn range_of((_, starts, _, refs, _): &Parts) -> Option<(u32, u32)> {
-    let postings = refs.len();
-    let mut ids: Option<(u32, u32)> = None;
-    for (k, &start) in starts.iter().enumerate() {
-        let lo = start as usize;
-        let hi = starts.get(k + 1).map_or(postings, |&next| next as usize);
-        if lo < hi {
-            // A run's references ascend, so its first bounds it from below
-            // and its last from above.
-            ids = ids_of(ids, Some((refs.get(lo), refs.get(hi - 1))));
-        }
-    }
-    ids
 }
 
 /// Where the section after a packed array of `n` values of `bits` starts,
@@ -181,30 +163,33 @@ impl Drop for RemoveOnFailure<'_> {
 
 /// Merge every piece and append it to the file in piece order, then write
 /// what only the whole merge knows: the keys, the offsets, the
-/// multiplicities, the checksums and the header.
+/// multiplicities, the checksums and the header. `copied` is the range of
+/// the sources whose runs the pieces may copy unread.
 fn write_pieces<F: Fn(u32) -> bool + Sync>(
     plan: &Plan<'_, F>,
     path: &Path,
-    (ref_bits, time_bits): (u32, u32),
+    (time_bits, copied): (u32, Option<(u32, u32)>),
     most: usize,
     settings: Settings,
 ) -> std::io::Result<Written> {
     let mut head = Handle::create(path, settings.fail_after)?;
-    // Each packed array is written through a handle of its own, so that
-    // both are appended in piece order at once. The times start where
-    // they belong if no posting is dropped.
-    let refs_at = HEADER as u64;
-    let room = after_packed(refs_at, most, ref_bits);
-    let refs = Handle::open_at(path, refs_at, settings.fail_after)?;
-    let times = Handle::open_at(path, room, settings.fail_after)?;
+    // Each array is written through a handle of its own, so that both are
+    // appended in piece order at once. The references start where they
+    // belong if no posting is dropped.
+    let times_at = HEADER as u64;
+    let room = after_packed(times_at, most, time_bits);
+    let times = Handle::open_at(path, times_at, settings.fail_after)?;
+    let refs = Handle::open_at(path, room, settings.fail_after)?;
     let writer = Writer {
         next: 0,
         postings: 0,
+        ref_bits: 0,
         keys: Vec::new(),
         starts: Vec::new(),
+        ref_starts: Vec::new(),
         mults: Vec::new(),
-        ids: None,
-        refs: Sink::new(refs, ref_bits),
+        ids: copied,
+        refs: Sink::new(refs, 1),
         times: Sink::new(times, time_bits),
         held: 0,
         high: 0,
@@ -217,12 +202,14 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
     write_in_pieces(plan, &gate, settings)?;
     let Writer {
         mut starts,
+        mut ref_starts,
         keys,
         mults,
         ids,
         refs,
         times,
         postings,
+        ref_bits,
         high,
         ..
     } = gate
@@ -236,25 +223,31 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
     }
     // No more than the sources hold, which are in this address space.
     let n = usize::try_from(postings).unwrap_or(most);
-    // The last start is where the postings end, which closes the offsets.
+    let ref_len = usize::try_from(ref_bits)
+        .map_err(|_| std::io::Error::other("the references exceed the address space"))?;
+    // The last start is where the postings end, which closes the offsets,
+    // and likewise for the references.
     starts.push(postings);
-    let refs_sum = refs.finish()?;
+    ref_starts.push(ref_bits);
     let times_sum = times.finish()?;
-    let times_at = after_packed(refs_at, n, ref_bits);
-    let index_at = after_packed(times_at, n, time_bits);
-    if times_at != room {
-        head.move_down(room, times_at, index_at - times_at)?;
+    let refs_sum = refs.finish()?;
+    let refs_at = after_packed(times_at, n, time_bits);
+    let index_at = after_packed(refs_at, ref_len, 1);
+    if refs_at != room {
+        head.move_down(room, refs_at, index_at - refs_at)?;
     }
     head.seek_to(index_at)?;
-    write_index(&mut head, &keys, &starts, &mults)?;
+    write_index(&mut head, &keys, (&starts, &ref_starts), &mults)?;
     let header = Head {
-        widths: (ref_bits, time_bits),
+        time_bits,
         keys: keys.len() as u64,
         postings,
         range: ids.unwrap_or((0, 0)),
+        ref_bits,
     };
-    head.put(&header.footer([refs_sum, times_sum, index_sum(&keys, &starts, &mults)]))?;
-    // Times that moved down left their old bytes past the end.
+    let index = index_sum(&keys, (&starts, &ref_starts), &mults);
+    head.put(&header.footer([times_sum, refs_sum, index]))?;
+    // References that moved down left their old bytes past the end.
     head.end_here()?;
     head.seek_to(0)?;
     head.put(&header.bytes())?;
@@ -270,11 +263,14 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
 struct Writer {
     /// The next piece to write.
     next: usize,
-    /// Postings written so far.
+    /// Postings and bits of references written so far.
     postings: u64,
+    ref_bits: u64,
     keys: Vec<u32>,
     /// Where each key's run starts, counted from the file's first posting.
     starts: Vec<u64>,
+    /// Where each key's coded references start, counted from the first.
+    ref_starts: Vec<u64>,
     mults: Vec<u8>,
     /// The range of the references written so far.
     ids: Option<(u32, u32)>,
@@ -288,21 +284,20 @@ struct Writer {
     stop: bool,
 }
 
-/// A merged piece and the range of its references.
-type Piece = (Parts, Option<(u32, u32)>);
-
 impl Writer {
     /// Append one merged piece after the pieces before it.
-    fn place(&mut self, (parts, ids): Piece) -> std::io::Result<()> {
-        let (keys, starts, mults, refs, times) = parts;
-        self.keys.extend_from_slice(&keys);
+    fn place(&mut self, parts: &Parts) -> std::io::Result<()> {
+        self.keys.extend_from_slice(&parts.keys);
         self.starts
-            .extend(starts.iter().map(|&start| start + self.postings));
-        self.mults.extend_from_slice(&mults);
-        self.ids = ids_of(self.ids, ids);
-        self.refs.append(&refs)?;
-        self.times.append(&times)?;
-        self.postings += refs.len() as u64;
+            .extend(parts.starts.iter().map(|&start| start + self.postings));
+        self.ref_starts
+            .extend(parts.ref_starts.iter().map(|&at| at + self.ref_bits));
+        self.mults.extend_from_slice(&parts.mults);
+        self.ids = union_ids(self.ids, parts.ids);
+        self.times.append(&parts.times)?;
+        self.refs.append(&parts.refs)?;
+        self.postings += parts.times.len() as u64;
+        self.ref_bits += parts.refs.len() as u64;
         self.next += 1;
         Ok(())
     }
@@ -331,7 +326,7 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
     };
     let window = WINDOW * threads;
     let failure: Mutex<Option<std::io::Error>> = Mutex::new(None);
-    let merged = slots::<Piece>(plan.pieces);
+    let merged = slots::<Parts>(plan.pieces);
     plan.deal(threads);
     run_tasks(threads, plan.pieces, |piece| {
         let _stop = StopOnUnwind(gate);
@@ -348,7 +343,6 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
             }
         }
         let parts = plan.merge(piece);
-        let ids = range_of(&parts);
         {
             // The piece is published under the writer's lock, so that the
             // count of pieces held moves with it: the thread that writes
@@ -356,7 +350,7 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
             let mut w = lock(&gate.writer);
             w.held += 1;
             w.high = w.high.max(w.held);
-            *lock(&merged[piece]) = Some((parts, ids));
+            *lock(&merged[piece]) = Some(parts);
         }
         // Write every piece that is next in line: this one, or the ones
         // before it that finished first.
@@ -368,7 +362,7 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
             let Some(piece) = merged.get(w.next).and_then(|slot| lock(slot).take()) else {
                 return;
             };
-            let placed = w.place(piece);
+            let placed = w.place(&piece);
             w.held -= 1;
             gate.wake.notify_all();
             if let Err(e) = placed {
@@ -690,7 +684,7 @@ mod tests {
     fn merged_refs(seg: &Segment) -> Option<(u32, u32)> {
         let mut ids: Option<(u32, u32)> = None;
         for posting in seg.postings() {
-            ids = ids_of(ids, Some((posting.reference, posting.reference)));
+            ids = union_ids(ids, Some((posting.reference, posting.reference)));
         }
         ids
     }
@@ -783,27 +777,30 @@ mod tests {
         // Width 0: one reference of time 0, the result of a single posting
         // of reference 0 at time 0.
         let zero = Segment::from_postings(vec![Posting::new(3, 0, 0)]);
-        assert_eq!(zero.widths(), (0, 0));
+        assert_eq!((zero.max_reference(), zero.time_bits()), (Some(0), 0));
         // Width 1: references 0 and 1, times 0 and 1.
         let one = Segment::from_postings(vec![
             Posting::new(3, 1, 1),
             Posting::new(4, 0, 0),
             Posting::new(5, 1, 0),
         ]);
-        assert_eq!(one.widths(), (1, 1));
+        assert_eq!((one.max_reference(), one.time_bits()), (Some(1), 1));
         // Width 17: a reference and a time above 2^16.
         let seventeen = Segment::from_postings(vec![
             Posting::new(7, 70_000, 90_000),
             Posting::new(7, 70_000, 31),
             Posting::new(8, 65_537, 65_536),
         ]);
-        assert_eq!(seventeen.widths(), (17, 17));
+        assert_eq!(seventeen.time_bits(), 17);
         // Width 32: the widest reference and time.
         let full = Segment::from_postings(vec![
             Posting::new(9, u32::MAX, u32::MAX),
             Posting::new(9, u32::MAX - 1, 1),
         ]);
-        assert_eq!(full.widths(), (32, 32));
+        assert_eq!(
+            (full.max_reference(), full.time_bits()),
+            (Some(u32::MAX), 32)
+        );
         // Runs of one hash that interleave: every reference of each source
         // sits between two of the other's.
         let a = Segment::from_postings(vec![

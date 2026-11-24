@@ -3,7 +3,7 @@
 
 use afpindex::{Catalog, Posting, Query, Scratch, SearchOptions, Segment, SnapshotError};
 
-const HEADER: usize = 40;
+const HEADER: usize = 48;
 /// Bytes of the four checksums that close a segment snapshot.
 const FOOTER: usize = 32;
 /// Bytes before a catalog snapshot's liveness bitmap.
@@ -16,24 +16,21 @@ fn sample() -> Segment {
     Segment::from_postings(rows)
 }
 
-/// Byte offsets of the five arrays, the end of the times data, and the
-/// four checksums in a segment snapshot (version 5: the packed arrays
-/// first, then the keys, the offsets and the multiplicities). References
-/// and times are packed at the width of their largest value.
+/// Byte offsets of the keys, the offsets, the multiplicities, the coded
+/// references, the times, the end of the references' data, and the four
+/// checksums in a segment snapshot (version 6: the times first, then the
+/// coded references, the keys, the two offsets and the multiplicities).
 fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize, usize) {
     let k = seg.key_count();
-    let p = seg.len();
-    let packed = |max: u32| (p * (32 - max.leading_zeros()) as usize).div_ceil(8);
-    let ref_bytes = packed(seg.max_reference().unwrap_or(0));
-    let time_bytes = packed(seg.postings().map(|r| r.time).max().unwrap_or(0));
-    let refs = HEADER;
-    let times = (refs + ref_bytes).next_multiple_of(8);
-    let times_end = times + time_bytes;
-    let keys = times_end.next_multiple_of(8);
+    let (ref_bits, time_bits) = seg.bits();
+    let times = HEADER;
+    let refs = (times + time_bits.div_ceil(8) as usize).next_multiple_of(8);
+    let refs_end = refs + ref_bits.div_ceil(8) as usize;
+    let keys = refs_end.next_multiple_of(8);
     let offsets = (keys + 4 * k).next_multiple_of(8);
-    let mults = offsets + 8 * (k + 1);
+    let mults = offsets + 16 * (k + 1);
     let footer = (mults + k).next_multiple_of(8);
-    (keys, offsets, mults, refs, times, times_end, footer)
+    (keys, offsets, mults, refs, times, refs_end, footer)
 }
 
 fn query() -> Query {
@@ -70,7 +67,7 @@ fn corruption_is_reported_not_trusted() {
     let seg = sample();
     let mut good = Vec::new();
     seg.write_to(&mut good).unwrap();
-    let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, footer_at) = layout(&seg);
+    let (keys_at, offsets_at, mults_at, refs_at, times_at, refs_end, footer_at) = layout(&seg);
 
     let mut bad = good.clone();
     bad[0] = b'X';
@@ -86,7 +83,7 @@ fn corruption_is_reported_not_trusted() {
         Err(SnapshotError::UnsupportedVersion(9))
     ));
     // Earlier versions are not read: there is no reader for them.
-    for version in [2u8, 3, 4] {
+    for version in [2u8, 3, 4, 5] {
         let mut bad = good.clone();
         bad[4] = version;
         assert!(matches!(
@@ -121,7 +118,7 @@ fn corruption_is_reported_not_trusted() {
         mults_at + 2,
         refs_at + 5,
         times_at + 9,
-        times_end - 1,
+        refs_end - 1,
     ] {
         let mut bad = good.clone();
         bad[at] ^= 0x40;
@@ -136,9 +133,9 @@ fn corruption_is_reported_not_trusted() {
     ));
 
     // The header is covered too: a width change that keeps the packed
-    // length (two 1-bit references read as 2-bit) fails the checksum
-    // instead of decoding wrong values.
-    let tiny = Segment::from_postings(vec![Posting::new(7, 0, 0), Posting::new(9, 1, 0)]);
+    // length (two 1-bit times read as 2-bit) fails the checksum instead
+    // of decoding wrong values.
+    let tiny = Segment::from_postings(vec![Posting::new(7, 0, 0), Posting::new(9, 1, 1)]);
     let mut bytes = Vec::new();
     tiny.write_to(&mut bytes).unwrap();
     assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
@@ -365,8 +362,8 @@ fn full_width_references_and_times_round_trip() {
 
 /// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
 /// snapshots (format version 5).
-const CATALOG_GOLDEN: (usize, u64) = (96_936, 6_927_546_800_028_242_596);
-const SEGMENT_GOLDEN: (usize, u64) = (32_088, 1_898_618_898_607_066_370);
+const CATALOG_GOLDEN: (usize, u64) = (141_368, 2_899_748_872_935_442_005);
+const SEGMENT_GOLDEN: (usize, u64) = (48_912, 17_202_788_408_228_145_483);
 
 /// FNV-1a over `bytes`.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -520,14 +517,14 @@ mod mapped {
         assert_eq!(back.max_reference(), seg.max_reference());
         drop(back);
         // Every data byte is checksummed in place, as on the read path.
-        let (keys_at, offsets_at, mults_at, refs_at, times_at, times_end, footer_at) = layout(&seg);
+        let (keys_at, offsets_at, mults_at, refs_at, times_at, refs_end, footer_at) = layout(&seg);
         for at in [
             keys_at,
             offsets_at + 8,
             mults_at + 2,
             refs_at + 5,
             times_at + 9,
-            times_end - 1,
+            refs_end - 1,
             footer_at,
         ] {
             let mut bad = good.clone();

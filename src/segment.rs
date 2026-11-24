@@ -4,6 +4,7 @@ use core::iter::FusedIterator;
 
 use crate::Posting;
 use crate::packed::{Packed, PackedBuilder, View};
+use crate::refs::{self, Refs};
 
 #[cfg(feature = "std")]
 mod parallel;
@@ -12,9 +13,10 @@ mod parallel;
 #[cfg(feature = "mmap")]
 pub(crate) mod to_file;
 
-/// One directory slot, 12 bytes: `key`'s run starts at `start` (40 bits),
-/// holds `len` postings (16 bits), and no reference has more than `mult`
-/// postings in it (8 bits, saturating).
+/// One directory slot, 16 bytes: `key`'s run starts at `start` (40 bits),
+/// holds `len` postings (16 bits), no reference has more than `mult`
+/// postings in it (8 bits, saturating), and its coded references start
+/// `refs` bits after the first run of its page (see [`PAGE_BITS`]).
 ///
 /// `len == 0` marks an empty slot (a present key always has a posting), and
 /// `len == LONG` sends the lookup to the sorted keys for the run's end, so
@@ -26,7 +28,17 @@ struct Slot {
     start_lo: u32,
     /// `len << 16 | mult << 8 | start >> 32`.
     len_mult_hi: u32,
+    /// Where the run's references start, in bits from the start of the
+    /// first run of the page its first posting is in.
+    refs: u32,
 }
+
+/// The postings of a page are `2^PAGE_BITS`: the segment records where
+/// the coded references of the first run of each page start, and a slot
+/// where its run's start counting from there. A page's runs hold fewer
+/// than `2^PAGE_BITS` postings in fewer runs, at most
+/// [`refs::max_run_bits`] each, so that offset fits 32 bits with room.
+const PAGE_BITS: u32 = 20;
 
 /// Run length a slot cannot hold exactly.
 const LONG: u32 = (1 << 16) - 1;
@@ -36,15 +48,17 @@ impl Slot {
         key: 0,
         start_lo: 0,
         len_mult_hi: 0,
+        refs: 0,
     };
 
     #[inline]
-    fn new(key: u32, start: u64, len: u64, mult: u8) -> Self {
+    fn new(key: u32, start: u64, len: u64, mult: u8, refs: u32) -> Self {
         let len = u32::try_from(len).map_or(LONG, |l| l.min(LONG));
         Self {
             key,
             start_lo: start as u32,
             len_mult_hi: (len << 16) | (u32::from(mult) << 8) | ((start >> 32) as u32 & 0xFF),
+            refs,
         }
     }
 
@@ -107,10 +121,12 @@ fn slot_of(key: u32, slots: usize) -> usize {
 ///
 /// Every hash owns one contiguous run; inside a run each reference's
 /// postings sit together with times ascending. The segment holds its
-/// sorted distinct `keys`, the `refs` and `times` of every posting packed
-/// to the width of the largest value present (a 20,000-reference catalog
-/// spends 15 bits per reference), and an open-addressing directory from
-/// hash to run. A lookup costs one directory read: a hash's slot depends
+/// sorted distinct `keys`, the `refs` of every run coded as the gaps
+/// between neighbours, in blocks that each start from a whole reference
+/// (12.5 bits a reference on the real catalog of
+/// 120,329 references), the `times`
+/// packed to the width of the largest, and an open-addressing directory
+/// from hash to run. A lookup costs one directory read: a hash's slot depends
 /// only on the hash, so the lookups of a query are independent and overlap
 /// in the memory system. Iteration in key order looks each key up the same
 /// way, so no offsets array is kept. The directory is rebuilt from the
@@ -121,11 +137,19 @@ fn slot_of(key: u32, slots: usize) -> usize {
 #[derive(Clone)]
 pub struct Segment {
     keys: Vec<u32>,
-    refs: Packed,
+    refs: Refs,
     times: Packed,
     /// Linear-probing directory: at most three keys per five slots, or one
     /// per four below [`SPARSE_KEYS`] keys (see [`build_table`]).
     table: Vec<Slot>,
+    /// Per page of `2^PAGE_BITS` postings, the bit the coded references
+    /// of its first run start at (see [`Slot`]).
+    pages: Vec<u64>,
+    /// The smallest and the largest reference, if there is a posting.
+    ids: Option<(u32, u32)>,
+    /// Bits of coded references per posting, rounded up: how far a
+    /// prefetch of a run reaches.
+    density: u32,
 }
 
 /// Postings a segment can hold: the reach of a directory slot.
@@ -138,6 +162,8 @@ pub struct Run<'a> {
     segment: &'a Segment,
     lo: usize,
     hi: usize,
+    /// Where the run's coded references start.
+    at: u64,
 }
 
 impl<'a> Run<'a> {
@@ -157,8 +183,10 @@ impl<'a> Run<'a> {
     /// The postings as `(reference, time)`, grouped by reference with
     /// times ascending.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, u32)> + 'a {
-        let (refs, times) = (self.segment.refs.view(), self.segment.times.view());
-        (self.lo..self.hi).map(move |i| (refs.get(i), times.get(i)))
+        let times = self.segment.times.view();
+        let refs = self.segment.refs.run(self.at, self.len()).cursor();
+        refs.zip(self.lo..self.hi)
+            .map(move |(reference, i)| (reference, times.get(i)))
     }
 }
 
@@ -188,8 +216,8 @@ const REGION_SLOTS: usize = 1 << 13;
 /// A miss walks to an empty slot, and a delta segment is mostly misses: a
 /// search looks every query hash up in every segment, and most of them are
 /// not in the small ones. Four slots per key make the table sparser, so a
-/// miss finds an empty slot sooner; the price is 48 bytes per key instead
-/// of 20, at most about 50 MB per segment.
+/// miss finds an empty slot sooner; the price is 64 bytes per key instead
+/// of 27, at most about 67 MB per segment.
 const SPARSE_KEYS: usize = 1 << 20;
 
 /// Slots in a directory over `keys` keys at the dense load of a large
@@ -219,9 +247,45 @@ fn slots_for(keys: usize) -> usize {
     }
 }
 
-/// Directory over sorted `keys` and their `offsets`, in a table of
-/// `slots`: [`slots_for`] at the load a segment's size picks.
-fn build_table_with(keys: &[u32], offsets: &[u64], mults: &[u8], slots: usize) -> Vec<Slot> {
+/// What a directory is built from: the sorted keys, where each key's run
+/// starts (and the posting count after the last), where its coded
+/// references start (and the bit count after the last), and its
+/// multiplicity.
+#[derive(Clone, Copy)]
+pub(crate) struct Index<'a> {
+    pub(crate) keys: &'a [u32],
+    pub(crate) offsets: &'a [u64],
+    pub(crate) ref_starts: &'a [u64],
+    pub(crate) mults: &'a [u8],
+}
+
+/// Per page of `2^PAGE_BITS` postings, the bit the references of the
+/// first run starting in it start at (the bit count where no run starts
+/// in it, as past the last run).
+fn pages_of(index: Index<'_>) -> Vec<u64> {
+    let n = index.keys.len();
+    let postings = index.offsets[n];
+    let pages = (postings >> PAGE_BITS) as usize + 1;
+    let mut out = Vec::with_capacity(pages);
+    let mut k = 0;
+    for page in 0..pages as u64 {
+        while k < n && index.offsets[k] < page << PAGE_BITS {
+            k += 1;
+        }
+        out.push(index.ref_starts[k]);
+    }
+    out
+}
+
+/// Directory over `index`, in a table of `slots`: [`slots_for`] at the
+/// load a segment's size picks.
+fn build_table_with(index: Index<'_>, pages: &[u64], slots: usize) -> Vec<Slot> {
+    let Index {
+        keys,
+        offsets,
+        ref_starts,
+        mults,
+    } = index;
     debug_assert_eq!(mults.len(), keys.len());
     if keys.is_empty() {
         return Vec::new();
@@ -233,7 +297,11 @@ fn build_table_with(keys: &[u32], offsets: &[u64], mults: &[u8], slots: usize) -
     // no slot, which reads as "absent".
     let slot_of_key = |k: usize| {
         let (start, end) = (offsets[k], offsets[k + 1]);
-        (end > start).then(|| Slot::new(keys[k], start, end - start, mults[k]))
+        (end > start).then(|| {
+            let refs = ref_starts[k] - pages[(start >> PAGE_BITS) as usize];
+            let refs = u32::try_from(refs).expect("a page's references span less than 2^32 bits");
+            Slot::new(keys[k], start, end - start, mults[k], refs)
+        })
     };
     if slots <= DIRECT_SLOTS {
         for slot in (0..n).filter_map(slot_of_key) {
@@ -272,11 +340,12 @@ fn build_table_with(keys: &[u32], offsets: &[u64], mults: &[u8], slots: usize) -
     table
 }
 
-/// Directory over sorted `keys` and their `offsets`, in the table size
-/// [`slots_for`] gives them.
-fn build_table(keys: &[u32], offsets: &[u64], mults: &[u8]) -> Vec<Slot> {
-    let slots = slots_for(keys.len());
-    build_table_with(keys, offsets, mults, slots)
+/// Directory over `index` in the table size [`slots_for`] gives its
+/// keys, and the start of each page's references the slots count from.
+fn build_table(index: Index<'_>) -> (Vec<Slot>, Vec<u64>) {
+    let pages = pages_of(index);
+    let slots = slots_for(index.keys.len());
+    (build_table_with(index, &pages, slots), pages)
 }
 
 /// Put `slot` in the first free slot from its key's home.
@@ -297,207 +366,294 @@ pub(crate) struct Writer {
     keys: Vec<u32>,
     /// Where each key's run starts.
     starts: Vec<u64>,
+    /// Where each key's coded references start.
+    ref_starts: Vec<u64>,
     /// Per key, the most postings any one reference has in its run.
     mults: Vec<u8>,
+    /// The coded references (see [`crate::refs`]), an array of single
+    /// bits.
     refs: PackedBuilder,
     times: PackedBuilder,
-    /// The union of two runs that interleave, kept between runs for its
+    /// The smallest and the largest reference coded here. A run copied
+    /// as it is adds nothing: a merge adds its source's whole range
+    /// instead ([`Writer::include`]).
+    ids: Option<(u32, u32)>,
+    /// The references of the run being written, kept between runs for
+    /// its capacity: a run is coded once it is whole.
+    run: Vec<u32>,
+    /// The union of runs that interleave, kept between runs for its
     /// capacity.
     union: Vec<(u32, u32)>,
 }
 
+/// The range that covers both ranges, if either has one.
+pub(crate) fn union_ids(a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    match (a, b) {
+        (Some((lo, hi)), Some((x, y))) => Some((lo.min(x), hi.max(y))),
+        (a, b) => a.or(b),
+    }
+}
+
 impl Writer {
-    /// Room for `postings` rows whose references and times fit `ref_bits`
-    /// and `time_bits`, and for `keys` distinct hashes. A merge passes the
-    /// sum of its sources' key counts, an upper bound that keeps `keys`,
-    /// `starts` and `mults` from growing by doubling as the runs arrive;
-    /// [`Writer::finish`] cuts what the merge did not need.
+    /// Room for `postings` rows whose coded references take about
+    /// `ref_bits` bits and whose times fit `time_bits`, and for `keys`
+    /// distinct hashes. A merge passes the sum of its sources' key counts,
+    /// an upper bound that keeps `keys`, `starts` and `mults` from
+    /// growing by doubling as the runs arrive; [`Writer::finish`] cuts
+    /// what the merge did not need.
     pub(crate) fn with_capacity(
         postings: usize,
         keys: usize,
-        ref_bits: u32,
+        ref_bits: u64,
         time_bits: u32,
     ) -> Self {
         Self {
             keys: Vec::with_capacity(keys),
             // One past the keys: `finish` records where the last run ends.
             starts: Vec::with_capacity(keys.saturating_add(1)),
+            ref_starts: Vec::with_capacity(keys.saturating_add(1)),
             mults: Vec::with_capacity(keys),
-            refs: PackedBuilder::with_capacity(postings, ref_bits),
+            refs: PackedBuilder::with_capacity(usize::try_from(ref_bits).unwrap_or(0), 1),
             times: PackedBuilder::with_capacity(postings, time_bits),
+            ids: None,
+            run: Vec::new(),
             union: Vec::new(),
         }
+    }
+
+    /// Postings appended so far.
+    #[inline]
+    fn postings(&self) -> usize {
+        self.times.len()
+    }
+
+    /// Bits of coded references appended so far.
+    #[inline]
+    fn ref_len(&self) -> u64 {
+        self.refs.len() as u64
     }
 
     /// Append the run of `hash`, which must be greater than the hash of
     /// every run before it: `(reference, time)` pairs in ascending order.
     /// A run without pairs leaves no trace.
     pub(crate) fn push_run(&mut self, hash: u32, pairs: impl Iterator<Item = (u32, u32)> + Clone) {
-        let start = self.refs.len();
-        let mult = self.append_pairs(pairs);
-        self.close(hash, start, mult);
+        let (start, at) = (self.postings(), self.ref_len());
+        self.run.clear();
+        let mut streaks = Streaks::default();
+        // References and times in one loop each, which keeps either
+        // loop's state in registers.
+        self.run.extend(pairs.clone().map(|(reference, _)| {
+            streaks.see(reference);
+            reference
+        }));
+        self.times.extend(pairs.map(|(_, time)| time));
+        self.code_run();
+        self.close(hash, start, at, streaks.longest);
     }
 
-    /// Record the run of `hash` that began `start` postings into the
-    /// segment and has multiplicity `mult`, if it got a posting.
+    /// Code the references gathered for the run being written, if any.
+    fn code_run(&mut self) {
+        let (Some(&first), Some(&last)) = (self.run.first(), self.run.last()) else {
+            return;
+        };
+        refs::push_run(&mut self.refs, &self.run);
+        self.include(Some((first, last)));
+    }
+
+    /// Count `ids` in the range the segment reports: what a merge adds for
+    /// a source whose runs it copied without a look at their references.
+    pub(crate) fn include(&mut self, ids: Option<(u32, u32)>) {
+        self.ids = union_ids(self.ids, ids);
+    }
+
+    /// Record the run of `hash` that began `start` postings and `at` bits
+    /// of references into the segment and has multiplicity `mult`, if it
+    /// got a posting.
     #[inline]
-    fn close(&mut self, hash: u32, start: usize, mult: u32) {
-        if self.refs.len() > start {
+    fn close(&mut self, hash: u32, start: usize, at: u64, mult: u32) {
+        if self.postings() > start {
             debug_assert!(
                 self.keys.last().is_none_or(|&last| last < hash),
                 "runs out of order"
             );
             self.keys.push(hash);
             self.starts.push(start as u64);
+            self.ref_starts.push(at);
             self.mults.push(u8::try_from(mult).unwrap_or(u8::MAX));
         }
     }
 
-    /// Append `pairs` to the run being written and return their
-    /// multiplicity. References and times go in one loop each, which keeps
-    /// either loop's state in registers.
-    fn append_pairs(&mut self, pairs: impl Iterator<Item = (u32, u32)> + Clone) -> u32 {
-        let mut streaks = Streaks::default();
-        self.refs.extend(pairs.clone().map(|(reference, _)| {
-            streaks.see(reference);
-            reference
-        }));
-        self.times.extend(pairs.map(|(_, time)| time));
-        streaks.longest
-    }
-
-    /// Append entries `lo..hi` of `source` as they are.
+    /// Copy the coded references of `run` of `source` as bits.
     #[inline]
-    fn append_bits<F>(&mut self, source: &Source<'_, '_, F>, lo: usize, hi: usize) {
-        match hi - lo {
-            0 => {}
-            // The run of most hashes in a small segment: not worth a call.
-            1 => {
-                self.refs.push(source.refs.get(lo));
-                self.times.push(source.times.get(lo));
-            }
-            _ => {
-                self.refs.extend_from(source.refs, lo, hi);
-                self.times.extend_from(source.times, lo, hi);
-            }
-        }
+    fn copy_refs<F>(&mut self, source: &Source<'_, '_, F>, run: Span) {
+        self.refs
+            .extend_from(source.refs.bits().view(), run.at as usize, run.end as usize);
     }
 
-    /// Append the postings of `run` that its source's `keep` accepts
-    /// (every posting without a `keep`) to the run being written, and
-    /// return their multiplicity.
-    ///
-    /// Postings are copied as bits, never decoded and packed again: the
-    /// whole run without a `keep`, and otherwise the stretches between
-    /// rejected references, found in one pass over the references.
-    fn append_run<F: Fn(u32) -> bool>(&mut self, source: &Source<'_, '_, F>, run: Span) -> u32 {
-        let Some(keep) = source.keep else {
-            self.append_bits(source, run.lo, run.hi);
-            return u32::from(run.mult);
-        };
+    /// Gather the postings of `run` that its source's `keep` accepts
+    /// (every posting without a `keep`) into the run being written: the
+    /// references into [`Writer::run`] and the times onto the times,
+    /// copied as bits in the stretches between rejected references.
+    /// Returns their multiplicity and whether every posting was kept.
+    fn gather<F: Fn(u32) -> bool>(&mut self, source: &Source<'_, '_, F>, run: Span) -> (u32, bool) {
         let mut streaks = Streaks::default();
-        let mut from = run.lo;
-        for i in run.lo..run.hi {
-            let reference = source.refs.get(i);
-            if keep(reference) {
+        let (mut from, mut i, mut whole) = (run.lo, run.lo, true);
+        for reference in source.refs.run(run.at, run.hi - run.lo).cursor() {
+            if source.keep.is_none_or(|keep| keep(reference)) {
                 streaks.see(reference);
+                self.run.push(reference);
             } else {
-                self.append_bits(source, from, i);
+                self.times.extend_from(source.times, from, i);
                 from = i + 1;
+                whole = false;
             }
+            i += 1;
         }
-        self.append_bits(source, from, run.hi);
-        streaks.longest
+        self.times.extend_from(source.times, from, run.hi);
+        (streaks.longest, whole)
     }
 
     /// Append the run of `hash` as the union of `runs`, each with the
     /// index of its source (a posting in several of them once), filtered
     /// by its source's `keep` if it has one.
+    ///
+    /// A run that is the only one of its hash keeps its coding: copied
+    /// as bits without a look at its references when its source has no
+    /// `keep`, and also when a `keep` rejects none of them. Otherwise the
+    /// references are decoded and the run is coded again.
     fn merge_runs<F: Fn(u32) -> bool>(
         &mut self,
         hash: u32,
         sources: &[Source<'_, '_, F>],
         runs: &mut [(usize, Span)],
     ) {
-        let start = self.refs.len();
+        let (start, at) = (self.postings(), self.ref_len());
+        self.run.clear();
         let mult = if let &mut [(source, run)] = runs {
-            self.append_run(&sources[source], run)
-        } else {
-            // In a catalog a reference lives in one segment, so the runs
-            // of a hash rarely interleave: ordered by their first
-            // reference, each ends before the next begins, and no streak
-            // of references spans two of them.
-            runs.sort_unstable_by_key(|&(source, run)| sources[source].refs.get(run.lo));
-            let disjoint = runs.windows(2).all(|w| {
-                let ((a, last), (b, next)) = (w[0], w[1]);
-                sources[a].refs.get(last.hi - 1) < sources[b].refs.get(next.lo)
-            });
-            if disjoint {
-                runs.iter().fold(0, |mult, &(source, run)| {
-                    mult.max(self.append_run(&sources[source], run))
-                })
+            let source = &sources[source];
+            if source.keep.is_none() {
+                self.copy_refs(source, run);
+                self.times.extend_from(source.times, run.lo, run.hi);
+                u32::from(run.mult)
             } else {
-                self.append_union(sources, runs)
+                let (mult, whole) = self.gather(source, run);
+                if whole {
+                    self.copy_refs(source, run);
+                    let ids = Some((self.run[0], self.run[self.run.len() - 1]));
+                    self.include(ids);
+                } else {
+                    self.code_run();
+                }
+                mult
             }
+        } else {
+            let mult = self.append_union(sources, runs);
+            self.code_run();
+            mult
         };
-        self.close(hash, start, mult);
+        self.close(hash, start, at, mult);
     }
 
-    /// Append the union of runs whose references interleave, one posting
-    /// at a time, and return its multiplicity.
+    /// Gather the union of `runs` into the run being written and return
+    /// its multiplicity.
     fn append_union<F: Fn(u32) -> bool>(
         &mut self,
         sources: &[Source<'_, '_, F>],
-        runs: &[(usize, Span)],
+        runs: &mut [(usize, Span)],
     ) -> u32 {
         let mut union = core::mem::take(&mut self.union);
         union.clear();
-        for &(source, run) in runs {
-            let (refs, times) = (sources[source].refs, sources[source].times);
-            union.extend((run.lo..run.hi).map(|i| (refs.get(i), times.get(i))));
+        // In a catalog a reference lives in one segment, so the runs of a
+        // hash rarely interleave: ordered by their first reference, they
+        // are mostly the union already.
+        runs.sort_unstable_by_key(|&(source, run)| {
+            sources[source].refs.run(run.at, run.hi - run.lo).first()
+        });
+        for &(source, run) in &*runs {
+            let source = &sources[source];
+            let times = source.times;
+            let pairs = source
+                .refs
+                .run(run.at, run.hi - run.lo)
+                .cursor()
+                .zip(run.lo..run.hi)
+                .map(|(reference, i)| (reference, times.get(i)));
+            // A source without a `keep` holds nothing another's rejects.
+            match source.keep {
+                Some(keep) => union.extend(pairs.filter(|&(reference, _)| keep(reference))),
+                None => union.extend(pairs),
+            }
         }
-        union.sort_unstable();
-        union.dedup();
-        // A source without a `keep` holds nothing another's rejects, so
-        // any `keep` among them filters the union.
-        if let Some(keep) = runs.iter().find_map(|&(source, _)| sources[source].keep) {
-            union.retain(|&(reference, _)| keep(reference));
+        if !union.windows(2).all(|w| w[0] < w[1]) {
+            union.sort_unstable();
+            union.dedup();
         }
-        let mult = self.append_pairs(union.iter().copied());
+        let mut streaks = Streaks::default();
+        self.run.extend(union.iter().map(|&(reference, _)| {
+            streaks.see(reference);
+            reference
+        }));
+        self.times.extend(union.iter().map(|&(_, time)| time));
         self.union = union;
-        mult
+        streaks.longest
     }
 
-    /// The keys, the start of each key's run, the multiplicities and the
-    /// finished arrays, for a caller that joins several writers' output.
+    /// The keys, the start of each key's run and of its references, the
+    /// multiplicities and the finished arrays, for a caller that joins
+    /// several writers' output.
     #[cfg(feature = "std")]
-    fn into_parts(self) -> (Vec<u32>, Vec<u64>, Vec<u8>, Packed, Packed) {
-        (
-            self.keys,
-            self.starts,
-            self.mults,
-            self.refs.finish(),
-            self.times.finish(),
-        )
+    fn into_parts(self) -> Parts {
+        Parts {
+            keys: self.keys,
+            starts: self.starts,
+            ref_starts: self.ref_starts,
+            mults: self.mults,
+            refs: self.refs.finish(),
+            times: self.times.finish(),
+            ids: self.ids,
+        }
     }
 
     pub(crate) fn finish(mut self) -> Segment {
-        let postings = self.refs.len() as u64;
+        let postings = self.postings() as u64;
         assert!(
             postings < MAX_POSTINGS,
             "a segment holds fewer than 2^40 postings, not {postings}"
         );
         self.starts.push(postings);
-        let table = build_table(&self.keys, &self.starts, &self.mults);
+        self.ref_starts.push(self.ref_len());
+        let (table, pages) = build_table(Index {
+            keys: &self.keys,
+            offsets: &self.starts,
+            ref_starts: &self.ref_starts,
+            mults: &self.mults,
+        });
         let mut keys = self.keys;
         keys.shrink_to_fit();
-        Segment {
+        Segment::assemble(
             keys,
-            refs: self.refs.finish(),
-            times: self.times.finish(),
-            table,
-        }
+            Refs::from_bits(self.refs.finish()),
+            self.times.finish(),
+            (table, pages),
+            self.ids,
+        )
     }
+}
+
+/// One piece of a merge: its keys, the start of each key's run counted
+/// from the piece's first posting and of its references counted from the
+/// piece's first bit, the multiplicities, the coded references (an array
+/// of single bits), the packed times, and the range of the references it
+/// coded.
+#[cfg(feature = "std")]
+pub(crate) struct Parts {
+    pub(crate) keys: Vec<u32>,
+    pub(crate) starts: Vec<u64>,
+    pub(crate) ref_starts: Vec<u64>,
+    pub(crate) mults: Vec<u8>,
+    pub(crate) refs: Packed,
+    pub(crate) times: Packed,
+    pub(crate) ids: Option<(u32, u32)>,
 }
 
 /// The longest streak of one reference in a run's references, which
@@ -524,27 +680,33 @@ impl Streaks {
     }
 }
 
-/// One run of a source: entries `lo..hi` of its arrays.
+/// One run of a source: entries `lo..hi` of its times, and bits
+/// `at..end` of its coded references.
 #[derive(Clone, Copy)]
 struct Span {
     lo: usize,
     hi: usize,
     /// Most postings any one reference has in the run (saturating).
     mult: u8,
+    at: u64,
+    end: u64,
 }
 
 /// A segment being merged: its arrays, its filter, and a walk over its
 /// runs in key order (see [`Segment::source`]).
 struct Source<'a, 'k, F> {
-    refs: View<'a>,
+    refs: &'a Refs,
     times: View<'a>,
     /// Which references to keep; `None` keeps every posting unread.
     keep: Option<&'k F>,
     keys: &'a [u32],
-    /// Per key, `start << 8 | multiplicity` of its run.
-    order: Vec<u64>,
+    /// Per key, `start << 8 | multiplicity` of its run and where its
+    /// coded references start.
+    order: Vec<(u64, u64)>,
     /// Where the last run ends: the posting count.
     end: usize,
+    /// Where the last run's coded references end.
+    end_bit: u64,
     /// Index of the next key.
     next: usize,
 }
@@ -567,16 +729,20 @@ impl<F> Source<'_, '_, F> {
     fn take(&mut self) -> Span {
         let k = self.next;
         self.next += 1;
-        let run = self.order[k];
+        let (run, at) = self.order[k];
         // Runs are laid out in key order: one ends where the next begins.
-        let hi = self
+        let (hi, end) = self
             .order
             .get(k + 1)
-            .map_or(self.end, |&next| (next >> 8) as usize);
+            .map_or((self.end, self.end_bit), |&(next, next_at)| {
+                ((next >> 8) as usize, next_at)
+            });
         Span {
             lo: (run >> 8) as usize,
             hi,
             mult: run as u8,
+            at,
+            end,
         }
     }
 }
@@ -616,34 +782,49 @@ impl Segment {
     /// cost of merging segments with few postings per hash. Instead the
     /// directory is read once in memory order and its runs are sorted by
     /// where they start, which is key order because runs are laid out in
-    /// key order: sequential passes only, over 16 bytes per key that are
+    /// key order: sequential passes only, over 24 bytes per key that are
     /// released when the merge ends.
     fn source<'k, F>(&self, keep: Option<&'k F>) -> Source<'_, 'k, F> {
-        let mut order: Vec<u64> = Vec::with_capacity(self.keys.len());
+        let mut order: Vec<(u64, u64)> = Vec::with_capacity(self.keys.len());
         order.extend(
             self.table
                 .iter()
                 .filter(|slot| slot.len() != 0)
-                .map(Slot::order),
+                .map(|slot| self.walk_entry(slot)),
         );
         debug_assert_eq!(order.len(), self.keys.len(), "every key has a run");
-        self.source_of(keep, &self.keys, order, self.len())
+        self.source_of(keep, &self.keys, order, (self.len(), self.refs.bit_len()))
+    }
+
+    /// What a merge's walk keeps of a slot: [`Slot::order`], and where its
+    /// run's coded references start.
+    #[inline]
+    fn walk_entry(&self, slot: &Slot) -> (u64, u64) {
+        (slot.order(), self.ref_at(slot))
+    }
+
+    /// Where the coded references of `slot`'s run start.
+    #[inline]
+    fn ref_at(&self, slot: &Slot) -> u64 {
+        self.pages[(slot.start() >> PAGE_BITS) as usize] + u64::from(slot.refs)
     }
 
     /// A walk over `keys`, a stretch of this segment's keys whose runs
-    /// end at entry `end`, from their runs as [`Slot::order`] gives them in
-    /// any order.
+    /// end at entry `end.0` and bit `end.1` of the references, from their
+    /// runs as [`Segment::walk_entry`] gives them in any order.
     fn source_of<'a, 'k, F>(
         &'a self,
         keep: Option<&'k F>,
         keys: &'a [u32],
-        mut order: Vec<u64>,
-        end: usize,
+        mut order: Vec<(u64, u64)>,
+        (end, end_bit): (usize, u64),
     ) -> Source<'a, 'k, F> {
         let start_bits = u64::BITS - (self.len() as u64).leading_zeros();
-        crate::sort::radix_sort_by_key(&mut order, &mut Vec::new(), start_bits, |&run| run >> 8);
+        crate::sort::radix_sort_by_key(&mut order, &mut Vec::new(), start_bits, |&(run, _)| {
+            run >> 8
+        });
         Source {
-            refs: self.refs.view(),
+            refs: &self.refs,
             times: self.times.view(),
             keep,
             // Every key has a run; the shorter of the two bounds the walk
@@ -651,17 +832,26 @@ impl Segment {
             keys: &keys[..keys.len().min(order.len())],
             order,
             end,
+            end_bit,
             next: 0,
         }
     }
 
-    /// Load every cache line of the references of the run at `lo..hi`,
-    /// and those up to `reach` bytes past it (the caller discards the
-    /// value the same way; see [`Packed::touch`]).
+    /// Load every cache line of the coded references of a run of `n`
+    /// postings from bit `at`, as far as the segment's density says it
+    /// reaches, and those up to `reach` bytes past it (the caller discards
+    /// the value the same way; see [`Packed::touch`]).
     #[inline]
-    pub(crate) fn touch_refs(&self, lo: usize, hi: usize, reach: usize) -> u32 {
-        debug_assert!(lo < hi, "a run is never empty");
-        self.refs.touch(lo, hi, reach)
+    pub(crate) fn touch_refs(&self, at: u64, n: usize, reach: usize) -> u32 {
+        debug_assert!(n > 0, "a run is never empty");
+        self.refs
+            .touch(at, n as u64 * u64::from(self.density), reach)
+    }
+
+    /// The coded references of the run of `n` postings from bit `at`.
+    #[inline]
+    pub(crate) fn run_refs(&self, at: u64, n: usize) -> refs::Run<'_> {
+        self.refs.run(at, n)
     }
 
     /// Load the time at entry `i` (the caller discards it the same way).
@@ -673,7 +863,7 @@ impl Segment {
 
 impl Default for Segment {
     fn default() -> Self {
-        Self::from_parts(Vec::new(), &[0], Packed::default(), Packed::default(), &[])
+        Writer::with_capacity(0, 0, 0, 0).finish()
     }
 }
 
@@ -713,7 +903,7 @@ impl Segment {
         let mut out = Writer::with_capacity(
             rows.len(),
             keys,
-            Packed::bits_for(max_ref),
+            ref_room(rows.len(), keys, max_ref),
             Packed::bits_for(max_time),
         );
         for run in rows.chunk_by(|a, b| a.hash == b.hash) {
@@ -725,44 +915,71 @@ impl Segment {
         out.finish()
     }
 
-    /// Assemble from arrays the caller has validated
-    /// (`offsets.len() == keys.len() + 1`, `refs.len() == times.len()`,
-    /// fewer than [`MAX_POSTINGS`] postings, and `mults[k]` the most
-    /// postings one reference has in key `k`'s run, saturating at 255).
+    /// Assemble from arrays the caller has validated (`index.offsets` and
+    /// `index.ref_starts` one longer than the keys and spanning
+    /// `times` and `refs`, each run's references at most
+    /// [`refs::max_run_bits`] long, fewer than [`MAX_POSTINGS`] postings,
+    /// `mults[k]` the most postings one reference has in key `k`'s run,
+    /// saturating at 255, and `ids` the smallest and largest reference).
     /// The offsets and multiplicities go into the directory and are not
     /// kept.
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn from_parts(
         keys: Vec<u32>,
-        offsets: &[u64],
-        refs: Packed,
+        index: (&[u64], &[u64], &[u8]),
+        refs: Refs,
         times: Packed,
-        mults: &[u8],
+        ids: Option<(u32, u32)>,
     ) -> Self {
+        let (offsets, ref_starts, mults) = index;
         debug_assert_eq!(offsets.len(), keys.len() + 1);
-        debug_assert_eq!(refs.len(), times.len());
+        debug_assert_eq!(ref_starts.len(), keys.len() + 1);
+        debug_assert_eq!(offsets.last().copied(), Some(times.len() as u64));
+        debug_assert_eq!(ref_starts.last().copied(), Some(refs.bit_len()));
         assert!(
-            (refs.len() as u64) < MAX_POSTINGS,
+            (times.len() as u64) < MAX_POSTINGS,
             "a segment holds fewer than 2^40 postings"
         );
-        let table = build_table(&keys, offsets, mults);
+        let directory = build_table(Index {
+            keys: &keys,
+            offsets,
+            ref_starts,
+            mults,
+        });
+        Self::assemble(keys, refs, times, directory, ids)
+    }
+
+    /// The segment of these arrays and this directory.
+    fn assemble(
+        keys: Vec<u32>,
+        refs: Refs,
+        times: Packed,
+        (table, pages): (Vec<Slot>, Vec<u64>),
+        ids: Option<(u32, u32)>,
+    ) -> Self {
+        let postings = times.len().max(1) as u64;
+        let density = u32::try_from(refs.bit_len().div_ceil(postings)).unwrap_or(u32::MAX);
         Self {
             keys,
             refs,
             times,
             table,
+            pages,
+            ids,
+            density,
         }
     }
 
     /// Number of postings.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.refs.len()
+        self.times.len()
     }
 
     /// `true` if the segment holds no postings.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.refs.is_empty()
+        self.times.is_empty()
     }
 
     /// Number of distinct hashes.
@@ -780,20 +997,28 @@ impl Segment {
     /// Where each key's run starts, then the posting count: `key_count + 1`
     /// values, one directory lookup each, read a batch of keys ahead.
     pub(crate) fn offsets(&self) -> impl Iterator<Item = u64> + '_ {
-        self.starts_and_mults()
-            .map(|(start, _)| start)
-            .chain(core::iter::once(self.refs.len() as u64))
+        self.index_walk()
+            .map(|(start, _, _)| start)
+            .chain(core::iter::once(self.len() as u64))
     }
 
-    /// Where each key's run starts and the most postings any one reference
-    /// has in it, in key order: one directory lookup each, read a batch of
-    /// keys ahead, for a caller that wants both.
-    pub(crate) fn starts_and_mults(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+    /// Per key in key order, where its run starts, where its coded
+    /// references start and the most postings any one reference has in
+    /// it: one directory lookup each, read a batch of keys ahead.
+    pub(crate) fn index_walk(&self) -> impl Iterator<Item = (u64, u64, u8)> + '_ {
         self.touch_first();
         self.keys.iter().enumerate().map(|(k, &key)| {
             self.touch_ahead(k);
-            self.slot(key).map_or((0, 0), |s| (s.start(), s.mult()))
+            self.slot(key)
+                .map_or((0, 0, 0), |s| (s.start(), self.ref_at(s), s.mult()))
         })
+    }
+
+    /// The smallest and the largest reference, if there is a posting.
+    #[cfg(any(feature = "std", test))]
+    #[inline]
+    pub(crate) fn ids(&self) -> Option<(u32, u32)> {
+        self.ids
     }
 
     /// Plain arrays packed at the width of their largest value (tests).
@@ -815,12 +1040,24 @@ impl Segment {
                 u8::try_from(best).unwrap_or(u8::MAX)
             })
             .collect();
+        let mut coded = PackedBuilder::with_capacity(0, 1);
+        let mut ref_starts = Vec::with_capacity(offsets.len());
+        let mut ids = None;
+        for w in offsets.windows(2) {
+            ref_starts.push(coded.len() as u64);
+            let run = &refs[w[0] as usize..w[1] as usize];
+            if let (Some(&first), Some(&last)) = (run.first(), run.last()) {
+                refs::push_run(&mut coded, run);
+                ids = union_ids(ids, Some((first, last)));
+            }
+        }
+        ref_starts.push(coded.len() as u64);
         Self::from_parts(
             keys.to_vec(),
-            offsets,
-            Packed::from_values(refs),
+            (offsets, &ref_starts, &mults),
+            Refs::from_bits(coded.finish()),
             Packed::from_values(times),
-            &mults,
+            ids,
         )
     }
 
@@ -833,25 +1070,34 @@ impl Segment {
         while self.table[i].key != hash {
             i = (i + 1) % slots;
         }
-        let (start, mult) = (self.table[i].start(), self.table[i].mult());
-        self.table[i] = Slot::new(hash, start, u64::from(LONG), mult);
+        let slot = self.table[i];
+        self.table[i] = Slot::new(hash, slot.start(), u64::from(LONG), slot.mult(), slot.refs);
     }
 
     /// Rebuild the directory in a table of `slots`, the size a test picks
     /// instead of the one [`slots_for`] gives the key count (tests).
     #[cfg(test)]
     fn retable(&mut self, slots: usize) {
-        let offsets: Vec<u64> = self.offsets().collect();
-        let mults: Vec<u8> = self
-            .keys
-            .iter()
-            .map(|&k| self.range_mult(k).expect("every key has a run").2)
-            .collect();
-        self.table = build_table_with(&self.keys, &offsets, &mults, slots);
+        let (mut offsets, mut ref_starts, mut mults) = (Vec::new(), Vec::new(), Vec::new());
+        for (start, at, mult) in self.index_walk() {
+            offsets.push(start);
+            ref_starts.push(at);
+            mults.push(mult);
+        }
+        offsets.push(self.len() as u64);
+        ref_starts.push(self.refs.bit_len());
+        let index = Index {
+            keys: &self.keys,
+            offsets: &offsets,
+            ref_starts: &ref_starts,
+            mults: &mults,
+        };
+        self.table = build_table_with(index, &self.pages, slots);
     }
 
+    #[cfg(any(feature = "std", test))]
     #[inline]
-    pub(crate) fn refs(&self) -> &Packed {
+    pub(crate) fn refs(&self) -> &Refs {
         &self.refs
     }
 
@@ -880,15 +1126,22 @@ impl Segment {
     }
 
     /// Entry range of `hash`'s run, if the segment holds the hash.
+    #[cfg(any(feature = "std", test))]
     #[inline]
     pub(crate) fn range(&self, hash: u32) -> Option<(usize, usize)> {
-        self.range_mult(hash).map(|(lo, hi, _)| (lo, hi))
+        self.locate(hash).map(|run| (run.lo, run.hi))
     }
 
     /// Entry range of `hash`'s run and the most postings any one reference
     /// has in it (saturating at 255), if the segment holds the hash.
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn range_mult(&self, hash: u32) -> Option<(usize, usize, u8)> {
+        self.locate(hash).map(|run| (run.lo, run.hi, run.mult))
+    }
+
+    /// Where `hash`'s run is, if the segment holds the hash.
+    #[inline]
+    pub(crate) fn locate(&self, hash: u32) -> Option<Located> {
         let slot = self.slot(hash)?;
         let lo = slot.start() as usize;
         let hi = if slot.len() == LONG {
@@ -896,7 +1149,12 @@ impl Segment {
         } else {
             lo + slot.len() as usize
         };
-        Some((lo, hi, slot.mult()))
+        Some(Located {
+            lo,
+            hi,
+            mult: slot.mult(),
+            at: self.ref_at(slot),
+        })
     }
 
     /// End of `hash`'s run through the sorted keys (the start of the next
@@ -909,7 +1167,7 @@ impl Segment {
             .expect("a key in the directory is in the sorted keys");
         match self.keys.get(k + 1) {
             Some(&next) => self.slot(next).expect("every key has a slot").start() as usize,
-            None => self.refs.len(),
+            None => self.len(),
         }
     }
 
@@ -929,11 +1187,12 @@ impl Segment {
     /// The postings of `hash`, if the segment holds it.
     #[must_use]
     pub fn run(&self, hash: u32) -> Option<Run<'_>> {
-        let (lo, hi) = self.range(hash)?;
+        let run = self.locate(hash)?;
         Some(Run {
             segment: self,
-            lo,
-            hi,
+            lo: run.lo,
+            hi: run.hi,
+            at: run.at,
         })
     }
 
@@ -942,45 +1201,54 @@ impl Segment {
     pub fn postings(&self) -> Postings<'_> {
         self.touch_first();
         self.touch_ahead(0);
-        let (index, end) = self
-            .keys
-            .first()
-            .and_then(|&k| self.range(k))
-            .unwrap_or((0, 0));
+        let first = self.keys.first().and_then(|&k| self.locate(k));
         Postings {
             segment: self,
-            refs: self.refs.view(),
             times: self.times.view(),
             key: 0,
-            index,
-            end,
+            index: first.map_or(0, |run| run.lo),
+            end: first.map_or(0, |run| run.hi),
+            refs: first.map(|run| self.refs.run(run.at, run.hi - run.lo).cursor()),
         }
     }
 
     /// The largest reference id with a posting, if any.
     #[must_use]
     pub fn max_reference(&self) -> Option<u32> {
-        self.refs.max()
+        self.ids.map(|(_, max)| max)
     }
 
-    /// Bits per posting for the references and the times.
+    /// Bits the coded references and the packed times take, in total. The
+    /// times are packed at the width of the largest; the references take
+    /// about the bits of the gap between neighbours in a run (see
+    /// [`Segment`]).
     #[must_use]
-    pub fn widths(&self) -> (u32, u32) {
-        (self.refs.bits(), self.times.bits())
+    pub fn bits(&self) -> (u64, u64) {
+        (
+            self.refs.bit_len(),
+            self.times.len() as u64 * u64::from(self.times.bits()),
+        )
+    }
+
+    /// Bits per time, the width of the largest.
+    #[must_use]
+    pub fn time_bits(&self) -> u32 {
+        self.times.bits()
     }
 
     /// Heap bytes held by the arrays and the directory.
     ///
-    /// A posting costs its two widths (see [`Segment::widths`]); a distinct
-    /// hash costs 4 bytes of key and about 20 of directory, or 4 bytes of
-    /// key and 48 of directory in a segment of fewer than 2<sup>20</sup>
-    /// keys.
+    /// A posting costs its share of the coded references and its time
+    /// (see [`Segment::bits`]); a distinct hash costs 4 bytes of key and
+    /// about 27 of directory, or 4 bytes of key and 64 of directory in a
+    /// segment of fewer than 2<sup>20</sup> keys.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         self.keys.capacity() * size_of::<u32>()
             + self.refs.heap_bytes()
             + self.times.heap_bytes()
             + self.table.capacity() * size_of::<Slot>()
+            + self.pages.capacity() * size_of::<u64>()
     }
 
     /// Merge two segments, keeping only postings whose reference `keep`
@@ -1023,11 +1291,15 @@ impl Segment {
         if let Some(merged) = parallel::merge_all(sides) {
             return merged;
         }
-        let (ref_bits, time_bits) = widths(sides);
         // Every source's keys, an upper bound on the merge's distinct
         // hashes: one allocation each for the keys, their starts and their
         // multiplicities instead of a doubling per batch of runs.
-        let mut out = Writer::with_capacity(postings(sides), keys(sides), ref_bits, time_bits);
+        let mut out = Writer::with_capacity(
+            postings(sides),
+            keys(sides),
+            ref_bits(sides),
+            time_bits(sides),
+        );
         let mut sources: Vec<_> = sides
             .iter()
             .map(|&(segment, keep)| segment.source(keep))
@@ -1035,6 +1307,7 @@ impl Segment {
         merge_sources(&mut out, &mut sources);
         // The walks are spent: the directory is built without them.
         drop(sources);
+        out.include(copied_ids(sides));
         out.finish()
     }
 
@@ -1051,7 +1324,7 @@ impl Segment {
         let mut out = Writer::with_capacity(
             rows.len(),
             rows.len(),
-            Packed::bits_for(reference),
+            ref_room(rows.len(), rows.len(), reference),
             Packed::bits_for(max_time),
         );
         for run in rows.chunk_by(|a, b| a >> 32 == b >> 32) {
@@ -1079,14 +1352,53 @@ fn keys<F>(sides: &[(&Segment, Option<&F>)]) -> usize {
         .fold(0usize, |n, (s, _)| n.saturating_add(s.key_count()))
 }
 
-/// The widest references and times across `sides`: the widths of their
-/// merge.
-fn widths<F>(sides: &[(&Segment, Option<&F>)]) -> (u32, u32) {
-    let widest = |bits: fn(&Segment) -> u32| sides.iter().map(|&(s, _)| bits(s)).max();
-    (
-        widest(|s| s.refs.bits()).unwrap_or(0),
-        widest(|s| s.times.bits()).unwrap_or(0),
-    )
+/// The widest times across `sides`: the width of their merge's.
+fn time_bits<F>(sides: &[(&Segment, Option<&F>)]) -> u32 {
+    sides
+        .iter()
+        .map(|&(s, _)| s.times.bits())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The bits of coded references across `sides`, saturating: about what
+/// their merge's take.
+fn ref_bits<F>(sides: &[(&Segment, Option<&F>)]) -> u64 {
+    sides
+        .iter()
+        .fold(0u64, |n, (s, _)| n.saturating_add(s.refs.bit_len()))
+}
+
+/// The range of the references of the sides without a `keep`, whose
+/// runs a merge may copy without a look at them: every one of their
+/// postings is in the merge.
+fn copied_ids<F>(sides: &[(&Segment, Option<&F>)]) -> Option<(u32, u32)> {
+    sides
+        .iter()
+        .filter(|(_, keep)| keep.is_none())
+        .fold(None, |ids, (s, _)| union_ids(ids, s.ids))
+}
+
+/// About the bits the coded references of `postings` postings in `keys`
+/// runs take, references up to `max_ref`: room a writer reserves, which
+/// is at most a little more than they take.
+fn ref_room(postings: usize, keys: usize, max_ref: u32) -> u64 {
+    // A run's first reference at its width, then gaps that are mostly
+    // well below it.
+    let per_posting = u64::from(Packed::bits_for(max_ref)).max(1);
+    (postings as u64)
+        .saturating_mul(per_posting)
+        .saturating_add(keys as u64 * 10)
+}
+
+/// Where a run is: entries `lo..hi` of the times, its multiplicity, and
+/// the bit its coded references start at.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Located {
+    pub(crate) lo: usize,
+    pub(crate) hi: usize,
+    pub(crate) mult: u8,
+    pub(crate) at: u64,
 }
 
 /// Write the union of every run of `sources` to `out`, hashes ascending.
@@ -1119,6 +1431,7 @@ impl PartialEq for Segment {
             && self.refs == other.refs
             && self.times == other.times
             && self.offsets().eq(other.offsets())
+            && self.ids == other.ids
     }
 }
 
@@ -1137,7 +1450,7 @@ impl fmt::Debug for Segment {
             .field("postings", &self.len())
             .field("keys", &self.keys.len())
             .field("slots", &self.table.len())
-            .field("ref_bits", &self.refs.bits())
+            .field("ref_bits", &self.refs.bit_len())
             .field("time_bits", &self.times.bits())
             .finish_non_exhaustive()
     }
@@ -1148,13 +1461,14 @@ impl fmt::Debug for Segment {
 #[derive(Clone)]
 pub struct Postings<'a> {
     segment: &'a Segment,
-    refs: View<'a>,
     times: View<'a>,
     key: usize,
     /// Next entry, inside `key`'s run or at its end.
     index: usize,
     /// End of `key`'s run.
     end: usize,
+    /// The references of `key`'s run not yet returned.
+    refs: Option<refs::Cursor<'a>>,
 }
 
 impl Iterator for Postings<'_> {
@@ -1169,11 +1483,18 @@ impl Iterator for Postings<'_> {
             self.key += 1;
             let &key = s.keys.get(self.key)?;
             s.touch_ahead(self.key);
-            self.end = s.range(key).expect("every key has a run").1;
+            let run = s.locate(key).expect("every key has a run");
+            self.end = run.hi;
+            self.refs = Some(s.refs.run(run.at, run.hi - run.lo).cursor());
         }
+        let reference = self
+            .refs
+            .as_mut()
+            .and_then(Iterator::next)
+            .expect("a run's references are as many as its postings");
         let p = Posting {
             hash: s.keys[self.key],
-            reference: self.refs.get(self.index),
+            reference,
             time: self.times.get(self.index),
         };
         self.index += 1;
@@ -1181,7 +1502,7 @@ impl Iterator for Postings<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.segment.refs.len() - self.index;
+        let n = self.segment.len() - self.index;
         (n, Some(n))
     }
 }
@@ -1366,12 +1687,13 @@ mod tests {
 
     #[test]
     fn slot_packs_length_multiplicity_and_start() {
-        let s = Slot::new(7, (1 << 40) - 1, u64::from(LONG) - 1, 255);
+        let s = Slot::new(7, (1 << 40) - 1, u64::from(LONG) - 1, 255, u32::MAX);
         assert_eq!(
-            (s.key, s.start(), s.len(), s.mult()),
-            (7, (1 << 40) - 1, LONG - 1, 255)
+            (s.key, s.start(), s.len(), s.mult(), s.refs),
+            (7, (1 << 40) - 1, LONG - 1, 255, u32::MAX)
         );
-        assert_eq!(Slot::new(1, 0, 1 << 20, 0).len(), LONG);
+        assert_eq!(Slot::new(1, 0, 1 << 20, 0, 0).len(), LONG);
+        assert_eq!(size_of::<Slot>(), 16);
         assert_eq!(Slot::EMPTY.len(), 0);
     }
 
@@ -1623,16 +1945,17 @@ mod tests {
     #[test]
     fn heap_bytes_counts_every_array_and_finish_trims_capacity() {
         let s = Segment::from_postings(vec![p(1, 0, 0), p(2, 0, 0)]);
-        // Two keys get a nine-slot directory of 12-byte slots, the sparse
-        // load of a small segment; references and times are all zero, so
-        // they pack to no data bytes plus slack.
-        assert_eq!(s.widths(), (0, 0));
-        assert!(s.heap_bytes() >= 2 * 4 + 8 + 8 + 9 * 12);
+        // Two keys get a nine-slot directory of 16-byte slots, the sparse
+        // load of a small segment; the times are all zero, so they pack to
+        // no data bytes plus slack, and each run codes its one reference in
+        // a width field of 5 bits.
+        assert_eq!(s.bits(), (10, 0));
+        assert!(s.heap_bytes() >= 2 * 4 + 2 + 8 + 8 + 9 * 16);
         // Ten duplicates of one posting: the hint was 10, the segment holds 1
-        // reference of one bit.
+        // reference, a width field and one bit.
         let s = Segment::from_postings(vec![p(1, 1, 0); 10]);
         assert_eq!(s.len(), 1);
-        assert_eq!(s.widths(), (1, 0));
+        assert_eq!(s.bits(), (6, 0));
         assert_eq!(s.refs.heap_bytes(), 1 + Packed::SLACK);
         assert!(alloc::format!("{s:?}").starts_with("Segment { postings: 1"));
     }

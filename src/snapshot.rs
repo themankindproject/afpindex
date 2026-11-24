@@ -1,51 +1,59 @@
 //! Snapshot files (`std`): little-endian arrays behind a small header,
 //! every section 8-byte aligned, closed by checksums.
 //!
-//! Segment snapshot, version 5:
+//! Segment snapshot, version 6:
 //!
 //! ```text
-//! 0   "AFIX"            4   version u32 = 5
-//! 8   ref_bits u32      12  time_bits u32
+//! 0   "AFIX"            4   version u32 = 6
+//! 8   time_bits u32     12  reserved u32 = 0
 //! 16  key_count u64     24  posting_count u64
 //! 32  min_ref u32       36  max_ref u32      (both 0 without postings)
-//! 40  refs    ceil(posting_count × ref_bits / 8) bytes    (zero-padded to 8)
-//!     times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
+//! 40  ref_bits u64                           (bits of the coded references)
+//! 48  times   ceil(posting_count × time_bits / 8) bytes   (zero-padded to 8)
+//!     refs    ceil(ref_bits / 8) bytes                    (zero-padded to 8)
 //!     keys    u32 × key_count                             (zero-padded to 8)
 //!     offsets u64 × (key_count + 1)
+//!     ref_offsets u64 × (key_count + 1)
 //!     mults   u8  × key_count                             (zero-padded to 8)
-//!     checksum u64 of refs, as little-endian 64-bit words in four lanes
-//!     checksum u64 of times, likewise
-//!     checksum u64 of the keys and the offsets as values, then the
+//!     checksum u64 of times, as little-endian 64-bit words in four lanes
+//!     checksum u64 of refs, likewise
+//!     checksum u64 of the keys and both offsets as values, then the
 //!     multiplicities as little-endian 64-bit words
-//!     checksum u64 of the header words (widths, key_count, posting_count,
-//!     min_ref and max_ref) and the three checksums before it
+//!     checksum u64 of the header words (time_bits and the reserved field,
+//!     key_count, posting_count, min_ref and max_ref, ref_bits) and the
+//!     three checksums before it
 //! ```
 //!
-//! References and times are packed at the width of the largest value in
-//! the segment, little-endian bit order, as held in memory. `mults` holds
-//! per key what a directory slot records of its run: the most postings any
-//! one reference has in it, saturating at 255. `min_ref` and `max_ref` are
-//! the smallest and the largest reference in the segment. A load would
-//! otherwise recompute both from the runs one posting at a time; stored,
-//! a trusted load can take them, and a full load checks them.
+//! Times are packed at the width of the largest in the segment, and the
+//! references are coded run by run, in blocks that each hold a whole
+//! reference and the gaps after it (see [`crate::refs`]), both in
+//! little-endian bit order, as held in memory. `offsets` holds where each key's run starts among the
+//! postings and `ref_offsets` where its coded references start, in bits;
+//! each closes with the total. `mults` holds per key what a directory slot
+//! records of its run: the most postings any one reference has in it,
+//! saturating at 255. `min_ref` and `max_ref` are the smallest and the
+//! largest reference in the segment. A load would otherwise recompute both
+//! from the runs one posting at a time; stored, a trusted load can take
+//! them, and a full load checks them.
 //!
 //! The postings come first and every section has a checksum of its own so
 //! that a merge can write the file in one pass
-//! ([`crate::segment::to_file`]): the two packed arrays grow side by side,
-//! each summed as it is written, and the counts in the header are known
-//! only once the last posting is. A reader likewise sums the two arrays
-//! apart, on two cores.
+//! ([`crate::segment::to_file`]): the two arrays grow side by side, each
+//! summed as it is written, and the counts in the header are known only
+//! once the last posting is. The times come before the references because
+//! their size is known from the posting count alone. A reader likewise
+//! sums the two arrays apart, on two cores.
 //!
-//! The packed arrays, nearly all of a file, are summed in four lanes:
+//! The two arrays, nearly all of a file, are summed in four lanes:
 //! word `i` goes into lane `i % 4`, and the lanes are folded together at
 //! the end. Each lane is a chain of multiplications that waits for the
 //! one before it, so one chain runs at the latency of a multiply; four
 //! run side by side, and a load or a write sums at memory speed.
 //!
-//! Catalog snapshot, version 5 (the segments' format gave it the number):
+//! Catalog snapshot, version 6 (the segments' format gave it the number):
 //!
 //! ```text
-//! 0   "AFCT"            4   version u32 = 5
+//! 0   "AFCT"            4   version u32 = 6
 //! 8   flags u32 = 0     12  reserved u32 = 0
 //! 16  reference_count u64   24  segment_count u64
 //! 32  live bitmap, one bit per id, LSB first, ceil(n / 8) bytes (zero-padded to 8)
@@ -53,7 +61,8 @@
 //!     segment_count segment snapshots, back to back
 //! ```
 //!
-//! Flags and reserved fields are written as zero and ignored on read.
+//! The catalog's flags and reserved field are written as zero and ignored
+//! on read; the segment's reserved field must be zero.
 
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
@@ -62,15 +71,16 @@ use std::vec::Vec;
 
 use crate::packed::Packed;
 use crate::par::{lock, run_tasks, slots, threads};
+use crate::refs::{self, Refs};
 use crate::segment::MAX_POSTINGS;
-use crate::simd::{self, Decoder, LANES, Pass};
+use crate::simd::{self, Decoder, Pass};
 use crate::{Catalog, Segment, SnapshotError};
 
 pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"AFIX";
 const CATALOG_MAGIC: [u8; 4] = *b"AFCT";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// Bytes before the first array of a segment snapshot.
-pub(crate) const HEADER: usize = 40;
+pub(crate) const HEADER: usize = 48;
 /// Bytes of the four checksums that close a segment snapshot.
 pub(crate) const FOOTER: usize = 32;
 /// Bytes before the first array of a catalog snapshot, which has no
@@ -275,28 +285,33 @@ fn write_values<W: Write, T: Copy, const N: usize>(
     Ok(())
 }
 
-/// Write the keys, the offsets and the multiplicities of a segment whose
-/// arrays end at `pos`, each padded to 8 bytes.
+/// Write the keys, the two offsets and the multiplicities of a segment
+/// whose arrays end at `pos`, each padded to 8 bytes.
 pub(crate) fn write_index<W: Write>(
     w: &mut W,
     keys: &[u32],
-    offsets: &[u64],
+    (offsets, ref_offsets): (&[u64], &[u64]),
     mults: &[u8],
 ) -> std::io::Result<()> {
     write_values(w, keys, u32::to_le_bytes)?;
     w.write_all(&[0u8; 8][..pad_len(4 * keys.len() as u64)])?;
     write_values(w, offsets, u64::to_le_bytes)?;
+    write_values(w, ref_offsets, u64::to_le_bytes)?;
     w.write_all(mults)?;
     w.write_all(&[0u8; 8][..pad_len(mults.len() as u64)])
 }
 
 /// The checksum of a segment's keys, offsets and multiplicities.
-pub(crate) fn index_sum(keys: &[u32], offsets: &[u64], mults: &[u8]) -> u64 {
+pub(crate) fn index_sum(
+    keys: &[u32],
+    (offsets, ref_offsets): (&[u64], &[u64]),
+    mults: &[u8],
+) -> u64 {
     let mut ck = Checksum::new();
     for &key in keys {
         ck.word(u64::from(key));
     }
-    for &offset in offsets {
+    for &offset in offsets.iter().chain(ref_offsets) {
         ck.word(offset);
     }
     ck.words(mults);
@@ -440,25 +455,42 @@ fn read_u8s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>, SnapshotError> {
     Ok(out)
 }
 
-/// A segment's keys, offsets and multiplicities.
-type Index = (Vec<u32>, Vec<u64>, Vec<u8>);
+/// A segment's keys, offsets, reference offsets and multiplicities.
+struct Index {
+    keys: Vec<u32>,
+    offsets: Vec<u64>,
+    ref_offsets: Vec<u64>,
+    mults: Vec<u8>,
+}
 
-/// Read the keys, the offsets and the multiplicities of a segment of
-/// `n_keys` keys, with the padding of each.
+impl Index {
+    fn sum(&self) -> u64 {
+        index_sum(&self.keys, (&self.offsets, &self.ref_offsets), &self.mults)
+    }
+}
+
+/// Read the keys, the offsets, the reference offsets and the
+/// multiplicities of a segment of `n_keys` keys, with the padding of each.
 fn read_index<R: Read>(r: &mut R, n_keys: usize) -> Result<Index, SnapshotError> {
     let keys = read_u32s(r, n_keys)?;
     read_pad(r, 4 * n_keys as u64)?;
     let offsets = read_u64s(r, n_keys + 1)?;
+    let ref_offsets = read_u64s(r, n_keys + 1)?;
     let mults = read_u8s(r, n_keys)?;
     read_pad(r, n_keys as u64)?;
-    Ok((keys, offsets, mults))
+    Ok(Index {
+        keys,
+        offsets,
+        ref_offsets,
+        mults,
+    })
 }
 
-/// Bytes of the keys, the offsets and the multiplicities of `n_keys` keys
-/// in a snapshot.
+/// Bytes of the keys, the two offsets and the multiplicities of `n_keys`
+/// keys in a snapshot.
 #[cfg(any(feature = "mmap", test))]
 fn index_len(n_keys: u64) -> u64 {
-    (4 * n_keys).next_multiple_of(8) + 8 * (n_keys + 1) + n_keys.next_multiple_of(8)
+    (4 * n_keys).next_multiple_of(8) + 16 * (n_keys + 1) + n_keys.next_multiple_of(8)
 }
 
 /// Append exactly `n` bytes from `r` to `out`, which has room for them:
@@ -533,42 +565,66 @@ fn checksum_of(fields: (u32, u32), a: u64, b: u64) -> Checksum {
 /// What a segment snapshot's header says of the segment.
 #[derive(Clone, Copy)]
 pub(crate) struct Head {
-    /// Bits of a reference and of a time.
-    pub(crate) widths: (u32, u32),
+    /// Bits of a time.
+    pub(crate) time_bits: u32,
     pub(crate) keys: u64,
     pub(crate) postings: u64,
     /// Smallest and largest reference, both zero without postings.
     pub(crate) range: (u32, u32),
+    /// Bits of the coded references.
+    pub(crate) ref_bits: u64,
 }
 
 impl Head {
+    /// The two 32-bit fields of the header: the time width and a reserved
+    /// zero.
+    fn fields(&self) -> (u32, u32) {
+        (self.time_bits, 0)
+    }
+
     /// The header as it lies in the file.
     pub(crate) fn bytes(&self) -> [u8; HEADER] {
         let mut out = [0u8; HEADER];
         let mut w = out.as_mut_slice();
-        write_header(&mut w, SEGMENT_MAGIC, self.widths, self.keys, self.postings)
-            .and_then(|()| w.write_all(&range_word(self.range).to_le_bytes()))
-            .expect("the header is 40 bytes");
+        write_header(
+            &mut w,
+            SEGMENT_MAGIC,
+            self.fields(),
+            self.keys,
+            self.postings,
+        )
+        .and_then(|()| w.write_all(&range_word(self.range).to_le_bytes()))
+        .and_then(|()| w.write_all(&self.ref_bits.to_le_bytes()))
+        .expect("the header is 48 bytes");
         out
     }
 
     fn read<R: Read>(r: &mut R) -> Result<Self, SnapshotError> {
-        let (widths, keys, postings) = read_header(r, SEGMENT_MAGIC)?;
+        let ((time_bits, reserved), keys, postings) = read_header(r, SEGMENT_MAGIC)?;
         let range = read_range(r)?;
+        let ref_bits = read_u64(r)?;
+        if reserved != 0 {
+            return Err(SnapshotError::Corrupt("a reserved header field is set"));
+        }
+        if time_bits > u32::BITS {
+            return Err(SnapshotError::Corrupt("a width exceeds 32 bits"));
+        }
         Ok(Self {
-            widths,
+            time_bits,
             keys,
             postings,
             range,
+            ref_bits,
         })
     }
 
     /// The four checksums that close the snapshot, from those of its
-    /// sections: the references', the times' and the index's, then one
+    /// sections: the times', the references' and the index's, then one
     /// over the header words and those three.
     pub(crate) fn footer(&self, sums: [u64; 3]) -> [u8; FOOTER] {
-        let mut ck = checksum_of(self.widths, self.keys, self.postings);
+        let mut ck = checksum_of(self.fields(), self.keys, self.postings);
         ck.word(range_word(self.range));
+        ck.word(self.ref_bits);
         let mut out = [0u8; FOOTER];
         for (sum, bytes) in sums.iter().zip(out.as_chunks_mut::<8>().0) {
             ck.word(*sum);
@@ -579,7 +635,7 @@ impl Head {
     }
 }
 
-/// The checksums a snapshot stores for its references and its times, once
+/// The checksums a snapshot stores for its times and its references, once
 /// the footer is read and found to agree with the header and the index.
 ///
 /// Those two are the checks that read no posting, so a trusted load makes
@@ -587,68 +643,67 @@ impl Head {
 fn read_footer<R: Read>(
     r: &mut R,
     head: &Head,
-    (keys, offsets, mults): &Index,
+    index: &Index,
 ) -> Result<(u64, u64), SnapshotError> {
     let mut stored = [0u8; FOOTER];
     r.read_exact(&mut stored)?;
     let word = |i: usize| u64::from_le_bytes(stored[8 * i..8 * i + 8].try_into().expect("8 bytes"));
-    let (refs, times) = (word(0), word(1));
-    if stored != head.footer([refs, times, index_sum(keys, offsets, mults)]) {
+    let (times, refs) = (word(0), word(1));
+    if stored != head.footer([times, refs, index.sum()]) {
         return Err(SnapshotError::Checksum);
     }
-    Ok((refs, times))
+    Ok((times, refs))
 }
 
 fn write_segment<W: Write>(seg: &Segment, w: &mut W) -> std::io::Result<()> {
     let n_post = seg.len() as u64;
     // One walk of the directory gives what the directory records of every
-    // run, in key order: where it starts, which the offsets need, and its
-    // multiplicity. Runs are sorted by reference, so the first and the
-    // last posting of each run bound the segment's reference range.
-    let mut offsets = Vec::with_capacity(seg.key_count() + 1);
-    let mut mults = Vec::with_capacity(seg.key_count());
-    for (start, mult) in seg.starts_and_mults() {
+    // run, in key order: where it and its references start, which the
+    // offsets need, and its multiplicity. The segment keeps its reference
+    // range.
+    let n_keys = seg.key_count();
+    let mut offsets = Vec::with_capacity(n_keys + 1);
+    let mut ref_offsets = Vec::with_capacity(n_keys + 1);
+    let mut mults = Vec::with_capacity(n_keys);
+    for (start, at, mult) in seg.index_walk() {
         offsets.push(start);
+        ref_offsets.push(at);
         mults.push(mult);
     }
     offsets.push(n_post);
-    let refs = seg.refs();
-    let mut range = (0u32, 0u32);
-    let mut any = false;
-    for run in offsets.windows(2) {
-        let (start, end) = (run[0] as usize, run[1] as usize);
-        if start < end {
-            let (lo, hi) = (refs.get(start), refs.get(end - 1));
-            range = if any {
-                (range.0.min(lo), range.1.max(hi))
-            } else {
-                (lo, hi)
-            };
-            any = true;
-        }
-    }
+    ref_offsets.push(seg.refs().bit_len());
     let head = Head {
-        widths: seg.widths(),
-        keys: seg.key_count() as u64,
+        time_bits: seg.time_bits(),
+        keys: n_keys as u64,
         postings: n_post,
-        range,
+        range: seg.ids().unwrap_or((0, 0)),
+        ref_bits: seg.refs().bit_len(),
     };
     w.write_all(&head.bytes())?;
     let mut sums = [0u64; 3];
-    for (packed, sum) in [seg.refs(), seg.times()].into_iter().zip(&mut sums) {
-        let bytes = packed.data();
+    for (bytes, sum) in [seg.times().data(), seg.refs().data()]
+        .into_iter()
+        .zip(&mut sums)
+    {
         *sum = packed_sum(bytes);
         w.write_all(bytes)?;
         w.write_all(&[0u8; 8][..pad_len(bytes.len() as u64)])?;
     }
-    sums[2] = index_sum(seg.keys(), &offsets, &mults);
-    write_index(w, seg.keys(), &offsets, &mults)?;
+    sums[2] = index_sum(seg.keys(), (&offsets, &ref_offsets), &mults);
+    write_index(w, seg.keys(), (&offsets, &ref_offsets), &mults)?;
     w.write_all(&head.footer(sums))
 }
 
-/// The key and posting counts of a segment header as sizes, refused when
-/// implausible before anything is allocated.
-fn segment_counts(n_keys: u64, n_post: u64) -> Result<(usize, usize), SnapshotError> {
+/// The key and posting counts and the bits of coded references of a
+/// segment header as sizes, refused when implausible before anything is
+/// allocated.
+fn segment_counts(head: &Head) -> Result<(usize, usize, usize), SnapshotError> {
+    let (n_keys, n_post) = (head.keys, head.postings);
+    if head.ref_bits > refs::bound_bits(n_post, n_keys) {
+        return Err(SnapshotError::Corrupt(
+            "more references than the postings can code",
+        ));
+    }
     if n_post >= MAX_POSTINGS {
         return Err(SnapshotError::Corrupt("too many postings for a segment"));
     }
@@ -661,7 +716,7 @@ fn segment_counts(n_keys: u64, n_post: u64) -> Result<(usize, usize), SnapshotEr
     if n_keys > n_post {
         return Err(SnapshotError::Corrupt("more keys than postings"));
     }
-    Ok((n_keys, n_post))
+    Ok((n_keys, n_post, to_usize(head.ref_bits)?))
 }
 
 /// Refuse a segment with a reference a catalog of `n_refs` ids cannot
@@ -692,27 +747,23 @@ type Ids = Option<(u32, u32)>;
 /// Read a segment snapshot and report the range of its references.
 fn read_segment<R: Read>(r: &mut R, check: Check) -> Result<(Segment, Ids), SnapshotError> {
     let head = Head::read(r)?;
-    let (ref_bits, time_bits) = head.widths;
-    let (n_keys, n_post) = segment_counts(head.keys, head.postings)?;
+    let (n_keys, n_post, ref_bits) = segment_counts(&head)?;
     let full = check == Check::Full;
-    let (mut refs_sum, mut times_sum) = (WordSum::new(), WordSum::new());
-    let refs = read_packed(r, n_post, ref_bits, full.then_some(&mut refs_sum))?;
-    read_pad(r, refs.data().len() as u64)?;
-    let times = read_packed(r, n_post, time_bits, full.then_some(&mut times_sum))?;
+    let (mut times_sum, mut refs_sum) = (WordSum::new(), WordSum::new());
+    let times = read_packed(r, n_post, head.time_bits, full.then_some(&mut times_sum))?;
     read_pad(r, times.data().len() as u64)?;
+    let refs = read_packed(r, ref_bits, 1, full.then_some(&mut refs_sum))?;
+    read_pad(r, refs.data().len() as u64)?;
     let index = read_index(r, n_keys)?;
     let stored = read_footer(r, &head, &index)?;
-    if full && stored != (refs_sum.finish(), times_sum.finish()) {
+    if full && stored != (times_sum.finish(), refs_sum.finish()) {
         return Err(SnapshotError::Checksum);
     }
-    // The packed arrays were summed as they were read, if at all.
-    let (keys, offsets, mults) = index;
+    // The arrays were summed as they were read, if at all.
     finish_segment(
-        head.widths,
-        n_post,
-        (keys, &offsets),
-        (mults, head.range),
-        (refs, times),
+        &head,
+        index,
+        (Refs::from_bits(refs), times),
         check,
         |_, _| true,
     )
@@ -728,44 +779,46 @@ const PARALLEL_MIN: usize = 1 << 22;
 const PARALLEL_MIN: usize = 1 << 10;
 
 /// Check that the arrays describe a valid segment (keys ascending, offsets
-/// consistent, each run sorted by `(reference, time)` without duplicates)
-/// and assemble it, with each run's multiplicity for its directory slot
-/// and the range of the references.
+/// consistent, each run coded as [`crate::refs`] codes it and sorted by
+/// `(reference, time)` without duplicates) and assemble it, with each
+/// run's multiplicity for its directory slot and the range of the
+/// references.
 ///
 /// The file stores both, so a trusted load takes them as they are and
-/// reads no posting: it checks only that the range could describe
-/// references of the segment's width (see [`check_range`]). A full load
-/// walks the runs ([`CheckRuns`]) and refuses a file whose stored
-/// multiplicities or range differ from what the runs hold.
+/// reads no posting: it checks only that the range is not inverted (see
+/// [`check_range`]). A full load walks the runs ([`CheckRuns`]) and
+/// refuses a file whose stored multiplicities or range differ from what
+/// the runs hold.
 ///
-/// `checksum` checks the packed arrays, unless the caller already has (it
+/// `checksum` checks the two arrays, unless the caller already has (it
 /// then returns `true`); a mismatch is reported before anything else,
 /// though the runs are checked while it runs.
 fn finish_segment(
-    (ref_bits, time_bits): (u32, u32),
-    n_post: usize,
-    (keys, offsets): (Vec<u32>, &[u64]),
-    (mults, range): (Vec<u8>, (u32, u32)),
-    (refs, times): (Packed, Packed),
+    head: &Head,
+    index: Index,
+    (refs, times): (Refs, Packed),
     check: Check,
-    checksum: impl FnOnce(&Packed, &Packed) -> bool + Send,
+    checksum: impl FnOnce(&Refs, &Packed) -> bool + Send,
 ) -> Result<(Segment, Ids), SnapshotError> {
-    let index = check_index(n_post, &keys, offsets);
+    let Index {
+        keys,
+        offsets,
+        ref_offsets,
+        mults,
+    } = index;
+    let checked = check_index(&keys, &offsets, &ref_offsets, (times.len(), refs.bit_len()));
     let side = || checksum(&refs, &times);
     // A segment without postings has no reference range.
-    let stored = (n_post > 0).then_some(range);
+    let stored = (head.postings > 0).then_some(head.range);
     // The walk relies on the index, so it runs only once that holds.
-    let (summed, walk) = match (check, index.is_ok()) {
+    let (summed, walk) = match (check, checked.is_ok()) {
         (_, false) | (Check::Trusted, true) => (side(), None),
         (Check::Full, true) => {
             let (summed, walk) = walk_runs(
-                offsets,
+                &offsets,
                 |keys| CheckRuns {
-                    // Distinct `(reference, time)` pairs bound a run's
-                    // length by the widths, which keeps the scan
-                    // proportional to the bytes read.
-                    longest: 1u64 << (ref_bits + time_bits).min(63),
-                    offsets: &offsets[keys],
+                    offsets: &offsets[keys.clone()],
+                    ref_offsets: &ref_offsets[keys],
                     refs: &refs,
                     times: &times,
                 },
@@ -777,10 +830,10 @@ fn finish_segment(
     if !summed {
         return Err(SnapshotError::Checksum);
     }
-    index?;
+    checked?;
     let ids = match walk {
         None => {
-            check_range(stored, ref_bits)?;
+            check_range(stored)?;
             stored
         }
         Some(walk) => {
@@ -793,32 +846,32 @@ fn finish_segment(
             found_ids
         }
     };
-    Ok((Segment::from_parts(keys, offsets, refs, times, &mults), ids))
+    let segment = Segment::from_parts(keys, (&offsets, &ref_offsets, &mults), refs, times, ids);
+    Ok((segment, ids))
 }
 
 /// Check a stored reference range that no walk has confirmed: it must not
-/// be inverted, its largest reference must fit the segment's reference
-/// width (a value wider than the packed array could hold is a corrupt
-/// file, and a range alone would let a segment claim references its
-/// postings cannot have), and a segment without postings has none.
-fn check_range(ids: Ids, ref_bits: u32) -> Result<(), SnapshotError> {
-    let Some((min, max)) = ids else {
-        return Ok(());
-    };
-    if min > max {
-        return Err(SnapshotError::Corrupt("the reference range is inverted"));
+/// be inverted, and a segment without postings has none.
+fn check_range(ids: Ids) -> Result<(), SnapshotError> {
+    match ids {
+        Some((min, max)) if min > max => {
+            Err(SnapshotError::Corrupt("the reference range is inverted"))
+        }
+        _ => Ok(()),
     }
-    if u64::from(max) >= 1u64 << ref_bits {
-        return Err(SnapshotError::Corrupt(
-            "a reference range exceeds the reference width",
-        ));
-    }
-    Ok(())
 }
 
-/// Keys strictly ascending, and offsets strictly ascending from 0 to the
-/// posting count: what the walk over the runs relies on.
-fn check_index(n_post: usize, keys: &[u32], offsets: &[u64]) -> Result<(), SnapshotError> {
+/// Keys strictly ascending; offsets strictly ascending from 0 to the
+/// posting count; reference offsets from 0 to the bit count, each run's
+/// coding no shorter than a run's can be and no longer than its postings'
+/// can be ([`refs::max_run_bits`]): what the walk over the runs and the
+/// directory rely on.
+fn check_index(
+    keys: &[u32],
+    offsets: &[u64],
+    ref_offsets: &[u64],
+    (n_post, ref_bits): (usize, u64),
+) -> Result<(), SnapshotError> {
     if !keys.windows(2).all(|w| w[0] < w[1]) {
         return Err(SnapshotError::Corrupt("keys not strictly ascending"));
     }
@@ -827,6 +880,25 @@ fn check_index(n_post: usize, keys: &[u32], offsets: &[u64]) -> Result<(), Snaps
     }
     if !offsets.windows(2).all(|w| w[0] < w[1]) {
         return Err(SnapshotError::Corrupt("offsets not strictly ascending"));
+    }
+    if ref_offsets.first() != Some(&0) || ref_offsets.last().copied() != Some(ref_bits) {
+        return Err(SnapshotError::Corrupt(
+            "reference offsets do not span the references",
+        ));
+    }
+    let fits = offsets
+        .windows(2)
+        .zip(ref_offsets.windows(2))
+        .all(|(run, bits)| {
+            let coded = bits[1].wrapping_sub(bits[0]);
+            bits[0] <= bits[1]
+                && coded >= refs::MIN_RUN_BITS
+                && coded <= refs::max_run_bits(run[1] - run[0])
+        });
+    if !fits {
+        return Err(SnapshotError::Corrupt(
+            "a run's references do not fit its postings",
+        ));
     }
     Ok(())
 }
@@ -908,14 +980,15 @@ fn walk_runs<T: Send, P: Pass<Out = Walk>>(
     (out, Ok((mults, ids)))
 }
 
-/// The walk over every run of a segment being loaded: each run sorted by
-/// `(reference, time)` without duplicates and no longer than `longest`.
-/// Returns each run's multiplicity and the range of the references.
+/// The walk over every run of a segment being loaded: each run coded as
+/// [`crate::refs`] codes it, ending where the next begins, and sorted by
+/// `(reference, time)` without duplicates. Returns each run's
+/// multiplicity and the range of the references.
 #[derive(Clone, Copy)]
 struct CheckRuns<'a> {
-    longest: u64,
     offsets: &'a [u64],
-    refs: &'a Packed,
+    ref_offsets: &'a [u64],
+    refs: &'a Refs,
     times: &'a Packed,
 }
 
@@ -925,87 +998,43 @@ impl Pass for CheckRuns<'_> {
     type Out = Result<(Vec<u8>, Ids), SnapshotError>;
 
     /// A posting is compared with the one before it as one word that
-    /// orders as `(reference, time)` does. Where the decoder has a kernel,
-    /// eight references and eight times are decoded and compared at a
-    /// time, both arrays in the same loop; a block in which no reference
-    /// repeats, which is most of them, needs no look at its streaks.
+    /// orders as `(reference, time)` does; the references come from the
+    /// checked decode of their run, the times one at a time.
     #[inline(always)]
     fn run<D: Decoder>(self, decoder: D) -> Self::Out {
         let mut mults = Vec::with_capacity(self.offsets.len().saturating_sub(1));
         let mut ids: Ids = None;
-        let (refs, times) = (self.refs.view(), self.times.view());
-        let posting = |i: usize| u64::from(refs.get(i)) << 32 | u64::from(times.get(i));
-        for w in self.offsets.windows(2) {
-            if w[1] - w[0] > self.longest {
-                return Err(SnapshotError::Corrupt(
-                    "a run is longer than its widths allow",
-                ));
-            }
+        let times = self.times.view();
+        for (w, bits) in self.offsets.windows(2).zip(self.ref_offsets.windows(2)) {
             let (lo, hi) = (w[0] as usize, w[1] as usize);
-            let (mut mult, mut streak) = (1u32, 1u32);
-            let first = posting(lo);
-            let mut prev = first;
-            let mut i = lo + 1;
-            if hi - i >= LANES {
-                let blocks = self
-                    .refs
-                    .blocks(i, decoder)
-                    .zip(self.times.blocks(i, decoder));
-                if let Some((mut refs, mut times)) = blocks {
-                    while hi - i >= LANES {
-                        let (Some(r), Some(t)) = (refs.next(), times.next()) else {
-                            break;
-                        };
-                        // Each lane's predecessor: the block one lane
-                        // later, behind the posting before the block.
-                        let (mut before_r, mut before_t) =
-                            ([(prev >> 32) as u32; LANES], [prev as u32; LANES]);
-                        before_r[1..].copy_from_slice(&r[..LANES - 1]);
-                        before_t[1..].copy_from_slice(&t[..LANES - 1]);
-                        let (mut sorted, mut repeats) = (true, false);
-                        for lane in 0..LANES {
-                            let same = r[lane] == before_r[lane];
-                            sorted &=
-                                r[lane] > before_r[lane] || (same && t[lane] > before_t[lane]);
-                            repeats |= same;
-                        }
-                        if !sorted {
-                            return Err(UNSORTED);
-                        }
-                        if repeats {
-                            for lane in 0..LANES {
-                                streak = if r[lane] == before_r[lane] {
-                                    streak.saturating_add(1)
-                                } else {
-                                    1
-                                };
-                                mult = mult.max(streak);
-                            }
-                        } else {
-                            streak = 1;
-                        }
-                        prev = u64::from(r[LANES - 1]) << 32 | u64::from(t[LANES - 1]);
-                        i += LANES;
+            let (mut mult, mut streak) = (0u32, 0u32);
+            let (mut prev, mut first, mut sorted) = (None::<u64>, None, true);
+            let mut i = lo;
+            self.refs
+                .run(bits[0], hi - lo)
+                .check(decoder, bits[1], |reference| {
+                    let cur = u64::from(reference) << 32 | u64::from(times.get(i));
+                    i += 1;
+                    match prev {
+                        Some(p) if cur <= p => sorted = false,
+                        Some(p) if cur >> 32 == p >> 32 => streak = streak.saturating_add(1),
+                        _ => streak = 1,
                     }
-                }
-            }
-            for i in i..hi {
-                let cur = posting(i);
-                if cur <= prev {
-                    return Err(UNSORTED);
-                }
-                streak = if cur >> 32 == prev >> 32 {
-                    streak.saturating_add(1)
-                } else {
-                    1
-                };
-                mult = mult.max(streak);
-                prev = cur;
+                    mult = mult.max(streak);
+                    first.get_or_insert(reference);
+                    prev = Some(cur);
+                })
+                .map_err(SnapshotError::Corrupt)?;
+            if !sorted {
+                return Err(UNSORTED);
             }
             mults.push(u8::try_from(mult).unwrap_or(u8::MAX));
             // Sorted, so the run's first reference is its smallest and its
             // last one its largest.
-            let (first, last) = ((first >> 32) as u32, (prev >> 32) as u32);
+            let (Some(first), Some(last)) = (first, prev) else {
+                return Err(SnapshotError::Corrupt("a run has no postings"));
+            };
+            let last = (last >> 32) as u32;
             ids = Some(ids.map_or((first, last), |(min, max)| (min.min(first), max.max(last))));
         }
         Ok((mults, ids))
@@ -1164,6 +1193,7 @@ mod mapped {
         read_catalog_head, read_footer, read_index, read_pad, segment_counts,
     };
     use crate::packed::Packed;
+    use crate::refs::Refs;
     use crate::{Catalog, Segment, SnapshotError};
 
     /// Map `path` read-only, with its pages faulted in unless `populate`
@@ -1222,31 +1252,21 @@ mod mapped {
     ) -> Result<(Segment, Ids, usize), SnapshotError> {
         let mut r: &[u8] = map.get(pos..).ok_or(SnapshotError::Truncated)?;
         let head = Head::read(&mut r)?;
-        let (ref_bits, time_bits) = head.widths;
-        let (n_keys, n_post) = segment_counts(head.keys, head.postings)?;
+        let (n_keys, n_post, ref_bits) = segment_counts(&head)?;
         let mut rel = HEADER as u64;
-        let refs = map_packed(map, pos + rel as usize, n_post, ref_bits, &mut r)?;
-        rel += read_pad(&mut r, refs.data().len() as u64)?;
-        let times = map_packed(map, pos + rel as usize, n_post, time_bits, &mut r)?;
+        let times = map_packed(map, pos + rel as usize, n_post, head.time_bits, &mut r)?;
         rel += read_pad(&mut r, times.data().len() as u64)?;
+        let refs = map_packed(map, pos + rel as usize, ref_bits, 1, &mut r)?;
+        rel += read_pad(&mut r, refs.data().len() as u64)?;
         let index = read_index(&mut r, n_keys)?;
         let stored = read_footer(&mut r, &head, &index)?;
         rel += index_len(n_keys as u64) + FOOTER as u64;
-        // The packed arrays are nearly all of the bytes: they are summed
-        // on a core of their own while the runs are checked.
-        let sum = move |refs: &Packed, times: &Packed| {
-            check == Check::Trusted || stored == (packed_sum(refs.data()), packed_sum(times.data()))
+        // The two arrays are nearly all of the bytes: they are summed on a
+        // core of their own while the runs are checked.
+        let sum = move |refs: &Refs, times: &Packed| {
+            check == Check::Trusted || stored == (packed_sum(times.data()), packed_sum(refs.data()))
         };
-        let (keys, offsets, mults) = index;
-        let (seg, ids) = finish_segment(
-            head.widths,
-            n_post,
-            (keys, &offsets),
-            (mults, head.range),
-            (refs, times),
-            check,
-            sum,
-        )?;
+        let (seg, ids) = finish_segment(&head, index, (Refs::from_bits(refs), times), check, sum)?;
         Ok((seg, ids, pos + rel as usize))
     }
 
@@ -1415,20 +1435,38 @@ mod tests {
         );
         // (A span mismatch cannot come from the writer: the last offset is
         // always the posting count; the reader's check is defence only.)
-        let bad_run = Segment::from_arrays(&[1], &[0, 2], &[1, 0], &[0, 0]);
+        // A coded run cannot hold a reference below the one before it (a
+        // gap is never negative), so a run out of order is one whose times
+        // are.
+        let bad_run = Segment::from_arrays(&[1], &[0, 2], &[0, 0], &[1, 0]);
         assert!(matches!(roundtrip(&bad_run), Err(SnapshotError::Corrupt(m)) if m.contains("run")));
         let dup_run = Segment::from_arrays(&[1], &[0, 2], &[0, 0], &[3, 3]);
         assert!(matches!(roundtrip(&dup_run), Err(SnapshotError::Corrupt(m)) if m.contains("run")));
         let good = Segment::from_postings(vec![Posting::new(1, 0, 3), Posting::new(1, 1, 0)]);
         assert_eq!(roundtrip(&good).unwrap(), good);
+        // A run coded wider than it needs: it decodes, but it is not the
+        // coding a writer makes, which is what lets a merge copy a run's
+        // bits and code another again alike.
+        let mut wide = crate::packed::PackedBuilder::with_capacity(0, 1);
+        wide.push_bits(8, 5);
+        wide.push_bits(3, 8);
+        let ref_offsets = [0, wide.len() as u64];
+        let index = (&[0u64, 1][..], &ref_offsets[..], &[1u8][..]);
+        let times = Packed::from_values(&[0]);
+        let wide = Refs::from_bits(wide.finish());
+        let wide = Segment::from_parts(vec![1], index, wide, times, Some((3, 3)));
+        assert!(
+            matches!(roundtrip(&wide), Err(SnapshotError::Corrupt(m)) if m.contains("width")),
+            "{:?}",
+            roundtrip(&wide)
+        );
     }
 
-    /// Runs long enough to be checked eight postings at a time agree with
-    /// the check of one posting at a time: on their multiplicities, with
-    /// streaks that cross blocks, and on a posting out of order or repeated
-    /// at every position of a run.
+    /// Runs that span several blocks of gaps are checked at every
+    /// position: their multiplicities, with streaks that cross blocks, and
+    /// a posting out of order or repeated anywhere in a run.
     #[test]
-    fn long_runs_are_checked_in_blocks() {
+    fn long_runs_are_checked_at_every_position() {
         // Two runs. The second starts below where the first ends, which
         // is valid: the order holds within a run only.
         let streaks = [1u32, 3, 1, 1, 12, 2, 1, 9, 1, 1, 1, 4, 20, 1, 3];
@@ -1448,15 +1486,8 @@ mod tests {
         assert_eq!(back.range_mult(9), Some((n, refs.len(), 20)));
         assert_eq!(good.range_mult(9), back.range_mult(9));
         for at in (1..refs.len()).filter(|&at| at != n) {
-            // The posting at `at` moved before its predecessor, by its
-            // reference and then by its time alone.
-            let (mut r, mut t) = (refs.clone(), times.clone());
-            r[at - 1] = r[at] + 1;
-            let bad = Segment::from_arrays(&[4, 9], &offsets, &r, &times);
-            assert!(
-                matches!(roundtrip(&bad), Err(SnapshotError::Corrupt(m)) if m.contains("run")),
-                "reference out of order at {at}"
-            );
+            // The posting at `at` moved before its predecessor by its time.
+            let mut t = times.clone();
             if refs[at] == refs[at - 1] {
                 t[at] = t[at - 1] - 1;
                 let bad = Segment::from_arrays(&[4, 9], &offsets, &refs, &t);
@@ -1500,11 +1531,12 @@ mod tests {
             assert_eq!(back.range_mult(key), good.range_mult(key), "key {key}");
         }
         for k in [0, 1, n_keys / 2, n_keys - 2, n_keys - 1] {
-            let mut bad = refs.clone();
+            // The run's last posting repeats the one before it.
+            let (mut bad, mut bad_times) = (refs.clone(), times.clone());
             let at = offsets[k as usize + 1] as usize - 1;
-            bad[at] = 0;
-            bad[at - 1] = 1;
-            let bad = Segment::from_arrays(&keys, &offsets, &bad, &times);
+            bad[at] = bad[at - 1];
+            bad_times[at] = bad_times[at - 1];
+            let bad = Segment::from_arrays(&keys, &offsets, &bad, &bad_times);
             assert!(
                 matches!(roundtrip(&bad), Err(SnapshotError::Corrupt(m)) if m.contains("run")),
                 "unsorted run {k}"
@@ -1533,8 +1565,6 @@ mod tests {
             std::env::temp_dir().join(format!("afpindex-parallel-{}.afx", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Segment::map_from(&path).unwrap(), seg);
-        // The first byte of the references, so the arrays still describe
-        // a valid segment.
         // A byte after the end: a file that is more than the snapshot.
         let mut longer = bytes.clone();
         longer.push(0);
@@ -1605,9 +1635,13 @@ mod tests {
         // can produce: the run holds a streak of two and the file says one.
         let keys = [1u32];
         let offsets = [0u64, 2];
-        let refs = Packed::from_values(&[3, 3]);
+        let mut coded = crate::packed::PackedBuilder::with_capacity(0, 1);
+        refs::push_run(&mut coded, &[3, 3]);
+        let ref_offsets = [0, coded.len() as u64];
+        let refs = Refs::from_bits(coded.finish());
         let times = Packed::from_values(&[0, 1]);
-        let lying = Segment::from_parts(keys.to_vec(), &offsets, refs, times, &[1]);
+        let index = (&offsets[..], &ref_offsets[..], &[1u8][..]);
+        let lying = Segment::from_parts(keys.to_vec(), index, refs, times, Some((3, 3)));
         assert!(
             matches!(
                 loaded(&lying, Check::Full),
@@ -1643,25 +1677,17 @@ mod tests {
         assert_eq!(ids, Some(range), "the file's range");
         assert_eq!(trusted.len(), seg.len());
 
-        // A range outside the reference width cannot describe the file.
-        // The width is the largest reference's, so the file itself has to
-        // be edited: this one claims a 2-bit reference for 1-bit postings.
+        // The header is summed, so an edit alone is a checksum error.
         let mut bytes = Vec::new();
         Segment::from_postings(vec![Posting::new(1, 0, 0), Posting::new(1, 1, 0)])
             .write_to(&mut bytes)
             .unwrap();
         bytes[36..40].copy_from_slice(&3u32.to_le_bytes());
-        // The header is summed, so an edit alone is a checksum error.
         assert!(matches!(
             Segment::read_from_trusted(bytes.as_slice()),
             Err(SnapshotError::Checksum)
         ));
-        reseal(&mut bytes);
-        assert!(matches!(
-            Segment::read_from_trusted(bytes.as_slice()),
-            Err(SnapshotError::Corrupt(m)) if m.contains("range")
-        ));
-        // And an inverted one.
+        // An inverted range is refused without a posting read.
         bytes[36..40].copy_from_slice(&1u32.to_le_bytes());
         bytes[32..36].copy_from_slice(&2u32.to_le_bytes());
         reseal(&mut bytes);
@@ -1680,10 +1706,9 @@ mod tests {
             seg.write_to(&mut bytes).unwrap();
             Segment::read_from_trusted(bytes.as_slice())
         };
-        // Unsorted within a run, but its first reference is still below
-        // its last, so the stored range is a range: only the order check
-        // tells this file apart from a valid one.
-        let unsorted = Segment::from_arrays(&[1], &[0, 3], &[0, 2, 1], &[0, 0, 0]);
+        // Unsorted within a run by its times: only the order check tells
+        // this file apart from a valid one.
+        let unsorted = Segment::from_arrays(&[1], &[0, 3], &[0, 0, 1], &[5, 3, 0]);
         assert!(roundtrip(&unsorted).is_err());
         assert_eq!(trusted(&unsorted).unwrap(), unsorted);
         let bad_keys = Segment::from_arrays(&[5, 3], &[0, 1, 2], &[0, 0], &[0, 1]);
@@ -1696,7 +1721,7 @@ mod tests {
         let good = Segment::from_postings((0..50).map(|i| Posting::new(i % 7, i, i)).collect());
         let mut bytes = Vec::new();
         good.write_to(&mut bytes).unwrap();
-        // The first byte of the references.
+        // The first byte of the times.
         let mut flipped = bytes.clone();
         flipped[HEADER] ^= 0x10;
         assert!(matches!(

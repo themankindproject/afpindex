@@ -252,11 +252,13 @@ fn main() {
         let rows = load_rows(snap);
         let t = Instant::now();
         let seg = Segment::from_postings(rows);
+        let (ref_bits, time_bits) = seg.bits();
         eprintln!(
-            "segment: {} postings, {} keys, widths {:?}, heap {:.2} GiB, built in {:.1} s",
+            "segment: {} postings, {} keys, bits per posting {:.2} + {:.2}, heap {:.2} GiB, built in {:.1} s",
             seg.len(),
             seg.key_count(),
-            seg.widths(),
+            ref_bits as f64 / seg.len().max(1) as f64,
+            time_bits as f64 / seg.len().max(1) as f64,
             seg.heap_bytes() as f64 / f64::from(1u32 << 30),
             t.elapsed().as_secs_f64()
         );

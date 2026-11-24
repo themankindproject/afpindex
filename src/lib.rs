@@ -114,6 +114,7 @@ mod packed;
 mod par;
 mod posting;
 mod query;
+mod refs;
 mod search;
 mod segment;
 mod simd;
