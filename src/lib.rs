@@ -136,7 +136,7 @@ pub use error::SearchError;
 #[cfg(feature = "std")]
 pub use error::SnapshotError;
 #[cfg(feature = "std")]
-pub use par::{max_threads, set_max_threads};
+pub use par::{set_max_threads, threads as max_threads};
 pub use posting::Posting;
 pub use query::Query;
 pub use refs::RefCoding;

@@ -54,10 +54,8 @@ impl MergeParts for InMemory {
 
 /// The value of a result that cannot fail, for the in-memory merge.
 pub(crate) fn never<T>(result: Result<T, core::convert::Infallible>) -> T {
-    match result {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
+    let Ok(value) = result;
+    value
 }
 
 /// A searchable set of references: segments, plus which reference ids are
@@ -206,24 +204,10 @@ impl Part {
         self.file = file;
     }
 
-    /// The same part, recorded as segment file `file`.
-    #[cfg(feature = "mmap")]
-    pub(crate) fn with_file(mut self, file: u32) -> Self {
-        self.file = file;
-        self
-    }
-
     /// The segment file of the part, if it has one.
     #[cfg(feature = "mmap")]
     pub(crate) fn file(&self) -> Option<u32> {
         (self.file != NO_FILE).then_some(self.file)
-    }
-
-    /// The same part, stale as `stale` says.
-    #[cfg(feature = "mmap")]
-    pub(crate) fn stale_if(mut self, stale: bool) -> Self {
-        self.stale = stale;
-        self
     }
 }
 
@@ -282,7 +266,6 @@ impl Catalog {
         live: Vec<bool>,
         coding: RefCoding,
     ) -> Self {
-        let live_count = live.iter().filter(|&&l| l).count();
         let parts: Vec<Part> = segments
             .into_iter()
             .filter_map(|(segment, ids)| {
@@ -298,19 +281,12 @@ impl Catalog {
                 })
             })
             .collect();
-        let base_removed = base_removed_of(&parts, &live);
-        Self {
-            parts,
-            live,
-            live_count,
-            coding,
-            base_removed,
-        }
+        Self::from_files(parts, live, coding)
     }
 
-    /// Assemble from parts a manifest validated: segments already placed
-    /// with the file they came from, and the liveness table they share.
-    #[cfg(feature = "mmap")]
+    /// Assemble from parts already validated: segments with the file they
+    /// came from if any, and the liveness table they share.
+    #[cfg(feature = "std")]
     pub(crate) fn from_files(parts: Vec<Part>, live: Vec<bool>, coding: RefCoding) -> Self {
         let live_count = live.iter().filter(|&&l| l).count();
         let base_removed = base_removed_of(&parts, &live);
@@ -393,13 +369,9 @@ impl Catalog {
             return Ok(id);
         }
         let part = Part::new(Segment::from_reference(id, &rows, self.coding), (id, id));
-        match self.merge_in(part, merges) {
-            Ok(()) => Ok(id),
-            Err(e) => {
-                self.take_back(1);
-                Err(e)
-            }
-        }
+        self.merge_in(part, merges)
+            .map(|()| id)
+            .inspect_err(|_| self.take_back(1))
     }
 
     /// Push `part` and merge from the tail, with `merges` carrying the
@@ -410,15 +382,10 @@ impl Catalog {
     fn merge_in<M: MergeParts>(&mut self, part: Part, merges: &mut M) -> Result<(), M::Error> {
         self.parts.push(part);
         let added = self.parts.len() - 1;
-        match merge_tail_in(&mut self.parts, &self.live, self.coding, merges) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // The merge left the parts it joined where they were, so
-                // the one this call added comes off and nothing else moves.
-                self.parts.truncate(added);
-                Err(e)
-            }
-        }
+        // The merge left the parts it joined where they were, so the one
+        // this call added comes off and nothing else moves.
+        merge_tail_in(&mut self.parts, &self.live, self.coding, merges)
+            .inspect_err(|_| self.parts.truncate(added))
     }
 
     /// Add several references, each from its `(hash, time)` rows, and
@@ -488,10 +455,8 @@ impl Catalog {
         self.live_count += count;
         if !rows.is_empty() {
             let part = Part::new(Segment::from_postings_in(rows, self.coding), (first, last));
-            if let Err(e) = self.merge_in(part, merges) {
-                self.take_back(count);
-                return Err(e);
-            }
+            self.merge_in(part, merges)
+                .inspect_err(|_| self.take_back(count))?;
         }
         Ok(first..last + 1)
     }
@@ -650,12 +615,7 @@ impl Catalog {
         &mut self,
         merges: &mut M,
     ) -> Result<(), M::Error> {
-        // The parts are read in place and changed only once the merge
-        // has succeeded, so a merge that fails or panics leaves them whole.
-        let only = merged_from(&self.parts, 1, &self.live, self.coding, merges)?;
-        self.parts.truncate(1);
-        self.parts.extend(only);
-        Ok(())
+        merge_from(&mut self.parts, 1, &self.live, self.coding, merges)
     }
 
     /// Merge everything into one segment, dropping the postings of removed
@@ -669,11 +629,7 @@ impl Catalog {
     /// [`Catalog::compact`], with `merges` deciding where a merge goes. A
     /// merge that fails leaves the catalog as it was.
     pub(crate) fn compact_of<M: MergeParts>(&mut self, merges: &mut M) -> Result<(), M::Error> {
-        // As in `compact_deltas_of`: nothing changes until the merge is done.
-        let only = merged_from(&self.parts, 0, &self.live, self.coding, merges)?;
-        self.parts.clear();
-        self.parts.extend(only);
-        Ok(())
+        merge_from(&mut self.parts, 0, &self.live, self.coding, merges)
     }
 }
 
@@ -709,19 +665,17 @@ impl fmt::Debug for Catalog {
 /// segments are merged. Only segments that may hold postings of removed
 /// references are filtered; the others are copied run by run. `merges`
 /// carries out the merge, in memory or to a file.
-fn merged_from<M: MergeParts>(
-    parts: &[Part],
+fn merge_from<M: MergeParts>(
+    parts: &mut Vec<Part>,
     first: usize,
     live: &[bool],
     coding: RefCoding,
     merges: &mut M,
-) -> Result<Option<Part>, M::Error> {
+) -> Result<(), M::Error> {
     let tail = parts.get(first..).unwrap_or_default();
     match tail {
-        [] => return Ok(None),
-        [only] if !only.stale && only.segment.ref_coding() == coding => {
-            return Ok(Some(only.clone()));
-        }
+        [] => return Ok(()),
+        [only] if !only.stale && only.segment.ref_coding() == coding => return Ok(()),
         _ => {}
     }
     let keep = |reference: u32| live[reference as usize];
@@ -732,7 +686,10 @@ fn merged_from<M: MergeParts>(
     let ids = tail.iter().fold((u32::MAX, 0), |(lo, hi), part| {
         (lo.min(part.ids.0), hi.max(part.ids.1))
     });
-    merges.merge(&sides, ids, coding)
+    let only = merges.merge(&sides, ids, coding)?;
+    parts.truncate(first);
+    parts.extend(only);
+    Ok(())
 }
 
 /// Restore the size invariant from the tail of `parts`: the last segment
@@ -754,9 +711,7 @@ fn merge_tail_in<M: MergeParts>(
     let Some(first) = tail_start(parts) else {
         return Ok(());
     };
-    let only = merged_from(parts, first, live, coding, merges)?;
-    parts.truncate(first);
-    parts.extend(only);
+    merge_from(parts, first, live, coding, merges)?;
     debug_assert!(
         tail_is_settled(parts, first),
         "one merge restores the size rule"

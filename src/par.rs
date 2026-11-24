@@ -33,7 +33,7 @@ static MAX_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// hardware's, so the cap does not change it. Results never depend on the
 /// cap.
 ///
-/// [`max_threads`] reports what a pass would take now.
+/// [`crate::max_threads`] reports what a pass would take now.
 pub fn set_max_threads(n: usize) {
     // Relaxed is enough: a thread that reads the cap is started after the
     // call (or after something that synchronizes with it), and a pass only
@@ -42,14 +42,10 @@ pub fn set_max_threads(n: usize) {
 }
 
 /// The number of threads a pass that uses every core would run on now: the
-/// hardware parallelism, capped by [`set_max_threads`].
+/// hardware parallelism (1 if the platform does not say), capped by
+/// [`set_max_threads`].
 #[must_use]
-pub fn max_threads() -> usize {
-    threads()
-}
-
-/// Hardware threads, capped, or 1 if the platform does not say.
-pub(crate) fn threads() -> usize {
+pub fn threads() -> usize {
     let hardware = hardware();
     match MAX_THREADS.load(Ordering::Relaxed) {
         0 => hardware,
@@ -120,13 +116,10 @@ mod tests {
         assert!(hardware >= 1);
         set_max_threads(1);
         assert_eq!(threads(), 1);
-        assert_eq!(max_threads(), 1);
         set_max_threads(2);
         assert_eq!(threads(), hardware.min(2));
-        assert_eq!(max_threads(), hardware.min(2));
         set_max_threads(0);
         assert_eq!(threads(), hardware);
-        assert_eq!(max_threads(), hardware);
     }
 
     /// Every task runs once, whatever the thread count, and a count of one

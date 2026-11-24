@@ -5,9 +5,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{CatalogStore, Faults, lock_dir, publish, sweep, sync_file, write_file};
+use super::{CatalogStore, Faults, claim_new, publish, sync_file, write_file};
 use crate::catalog::Part;
-use crate::manifest::{self, MANIFEST};
+use crate::manifest;
 use crate::segment::to_file::{Settings, merge_to_file};
 use crate::snapshot::map_segment;
 use crate::{Catalog, Posting, RefCoding, Segment, SnapshotError};
@@ -75,15 +75,7 @@ impl CatalogStore {
     /// another builder has the directory.
     pub fn builder(dir: impl AsRef<Path>) -> Result<CatalogStoreBuilder, SnapshotError> {
         let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        let lock = lock_dir(dir)?;
-        if dir.join(MANIFEST).try_exists()? {
-            return Err(SnapshotError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a catalog manifest is already in this directory",
-            )));
-        }
-        sweep(dir, &[]);
+        let lock = claim_new(dir)?;
         Ok(CatalogStoreBuilder {
             dir: dir.to_path_buf(),
             rows: Vec::new(),
@@ -197,13 +189,16 @@ impl CatalogStoreBuilder {
             sync_file(&self.temp(file))?;
             publish(&self.temp(file), &name)?;
             self.chunks.clear();
-            let mapped = map_segment(&name, true, false).map_err(|e| {
+            let mapped = map_segment(&name, true).map_err(|e| {
                 let _ = fs::remove_file(&name);
                 io::Error::other(e)
             });
             let (segment, ids) = mapped?;
             if let Some(ids) = ids {
-                parts.push(Part::new(segment, ids).with_file(file));
+                parts.push(Part {
+                    file,
+                    ..Part::new(segment, ids)
+                });
             }
         }
         let catalog = Catalog::from_files(parts, alloc::vec![true; n], self.coding);
@@ -217,7 +212,7 @@ impl CatalogStoreBuilder {
             if store.on_disk.is_some() {
                 return Err(e);
             }
-            for file in files_of(&store) {
+            for file in super::files_of(&store.catalog) {
                 let _ = fs::remove_file(self.dir.join(manifest::segment_name(file)));
             }
             return Err(e);
@@ -232,8 +227,7 @@ impl CatalogStoreBuilder {
         }
         let mut segments = Vec::with_capacity(group.len());
         for &file in group {
-            let (segment, _) =
-                map_segment(&self.temp(file), true, false).map_err(io::Error::other)?;
+            let (segment, _) = map_segment(&self.temp(file), true).map_err(io::Error::other)?;
             segments.push(segment);
         }
         let sides: Vec<(&Segment, Option<&KeepAll>)> =
@@ -263,25 +257,6 @@ impl CatalogStoreBuilder {
     fn temp(&self, file: u32) -> PathBuf {
         self.dir.join(manifest::temp_name(file))
     }
-
-    /// Merge with `threads` threads instead of what the machine offers.
-    #[cfg(test)]
-    pub(crate) fn with_threads(mut self, threads: usize) -> Self {
-        self.settings.threads = threads;
-        self
-    }
-
-    /// Make the next file written fail after `bytes`.
-    #[cfg(test)]
-    pub(crate) fn fail_next_write(&mut self, bytes: u64) {
-        self.faults.write = Some(bytes);
-    }
-
-    /// Make the next creation of a file fail.
-    #[cfg(test)]
-    pub(crate) fn fail_next_create(&mut self) {
-        self.faults.create = true;
-    }
 }
 
 impl Drop for CatalogStoreBuilder {
@@ -290,11 +265,6 @@ impl Drop for CatalogStoreBuilder {
             let _ = fs::remove_file(self.temp(file));
         }
     }
-}
-
-/// The segment files of a store's catalog.
-fn files_of(store: &CatalogStore) -> Vec<u32> {
-    super::files_of(&store.catalog)
 }
 
 #[cfg(test)]
@@ -404,7 +374,8 @@ mod tests {
         let scratch = TempDir::new("same");
         for threads in [1usize, 4] {
             let dir = scratch.0.join(format!("threads-{threads}"));
-            let mut builder = CatalogStore::builder(&dir).unwrap().with_threads(threads);
+            let mut builder = CatalogStore::builder(&dir).unwrap();
+            builder.settings.threads = threads;
             builder.chunk_postings(1);
             for (i, rows) in refs.iter().enumerate() {
                 assert_eq!(builder.add(rows.iter().copied()).unwrap(), i as u32);
@@ -484,7 +455,7 @@ mod tests {
             let mut failed = None;
             for (i, rows) in refs.iter().enumerate() {
                 if fault == 0 && i == 20 {
-                    builder.fail_next_write(16);
+                    builder.faults.write = Some(16);
                 }
                 if let Err(e) = builder.add(rows.iter().copied()) {
                     failed = Some(e);
@@ -493,8 +464,8 @@ mod tests {
             }
             match fault {
                 0 => assert!(failed.is_some(), "a chunk write fails"),
-                1 => builder.fail_next_write(64),
-                2 => builder.fail_next_create(),
+                1 => builder.faults.write = Some(64),
+                2 => builder.faults.create = true,
                 3 => builder.faults.stop = Some(Stop::AfterTempManifest),
                 _ => {}
             }

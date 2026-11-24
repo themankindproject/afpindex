@@ -39,7 +39,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use std::io::Write;
 
-use crate::snapshot::{Checksum, pad_len};
+use crate::snapshot::{
+    Checksum, coding_flags, coding_of_flags, live_bitmap, live_of_bitmap, pad_len,
+};
 use crate::{RefCoding, SnapshotError};
 
 /// The first bytes of a manifest.
@@ -51,8 +53,6 @@ const HEADER: usize = 40;
 const ENTRY: usize = 40;
 /// Version of the manifest format.
 const VERSION: u32 = 1;
-/// The flag of a catalog that stores its references as gaps.
-const GAPS: u32 = 1;
 /// Name of the file that names the catalog.
 pub(super) const MANIFEST: &str = "MANIFEST";
 /// Name of a manifest being written.
@@ -108,16 +108,11 @@ impl Manifest {
             ck.word(word);
             w.write_all(&word.to_le_bytes())?;
         }
-        let flags = flags_of(self.ref_coding);
+        let flags = coding_flags(self.ref_coding);
         ck.word(u64::from(self.next_file) | u64::from(flags) << 32);
         w.write_all(&self.next_file.to_le_bytes())?;
         w.write_all(&flags.to_le_bytes())?;
-        let mut bitmap = alloc::vec![0u8; self.live.len().div_ceil(8)];
-        for (i, &live) in self.live.iter().enumerate() {
-            if live {
-                bitmap[i / 8] |= 1 << (i % 8);
-            }
-        }
+        let bitmap = live_bitmap(&self.live);
         ck.words(&bitmap);
         w.write_all(&bitmap)?;
         let pad = pad_len((HEADER + bitmap.len()) as u64);
@@ -137,14 +132,6 @@ impl Manifest {
         }
         w.write_all(&ck.finish().to_le_bytes())?;
         w.flush()
-    }
-}
-
-/// The flags that record `coding`.
-fn flags_of(coding: RefCoding) -> u32 {
-    match coding {
-        RefCoding::Packed => 0,
-        RefCoding::Gaps => GAPS,
     }
 }
 
@@ -206,18 +193,6 @@ fn check_files(entries: &[Entry], next_file: u32) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-/// The coding the flags of a manifest name; a flag this version does not
-/// know is refused.
-fn coding_of(flags: u32) -> Result<RefCoding, SnapshotError> {
-    match flags {
-        0 => Ok(RefCoding::Packed),
-        GAPS => Ok(RefCoding::Gaps),
-        _ => Err(SnapshotError::Corrupt(
-            "a manifest flag this version does not know",
-        )),
-    }
-}
-
 pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
     let head = bytes.get(..HEADER).ok_or(SnapshotError::Truncated)?;
     if head[..4] != *MAGIC {
@@ -234,7 +209,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
     let n_segments = next_word().ok_or(SnapshotError::Truncated)?;
     let next_file = u32::from_le_bytes(head[32..36].try_into().expect("4 bytes"));
     let flags = u32::from_le_bytes(head[36..40].try_into().expect("4 bytes"));
-    let ref_coding = coding_of(flags)?;
+    let ref_coding = coding_of_flags(flags)?;
     if n_segments > MAX_SEGMENTS {
         return Err(SnapshotError::Corrupt("implausible segment count"));
     }
@@ -305,9 +280,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
         return Err(SnapshotError::Checksum);
     }
     check_files(&entries, next_file)?;
-    let live = (0..n_refs)
-        .map(|i| bitmap[i / 8] & (1 << (i % 8)) != 0)
-        .collect();
+    let live = live_of_bitmap(bitmap, n_refs);
     Ok(Manifest {
         generation,
         reference_count,

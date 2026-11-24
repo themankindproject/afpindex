@@ -142,17 +142,7 @@ impl CatalogStore {
     /// As [`CatalogStore::create`].
     pub fn create_from(dir: impl AsRef<Path>, mut catalog: Catalog) -> Result<Self, SnapshotError> {
         let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        let lock = lock_dir(dir)?;
-        if dir.join(MANIFEST).try_exists()? {
-            return Err(SnapshotError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a catalog manifest is already in this directory",
-            )));
-        }
-        // Without a manifest there is no catalog here, so a segment file is
-        // what a store left that never saved.
-        sweep(dir, &[]);
+        let lock = claim_new(dir)?;
         // The segments come from wherever the catalog was, and this
         // directory holds none of them yet.
         for part in catalog.parts_mut() {
@@ -192,14 +182,6 @@ impl CatalogStore {
     pub fn open_trusted(dir: impl AsRef<Path>) -> Result<Self, SnapshotError> {
         let dir = dir.as_ref();
         Self::open_with(dir, true, Some(lock_dir(dir)?))
-    }
-
-    /// Open a directory without its lock, as a store on a file system
-    /// that does not honour locks would: what a test of the other guards
-    /// against a second writer opens.
-    #[cfg(test)]
-    pub(crate) fn open_unlocked(dir: &Path) -> Result<Self, SnapshotError> {
-        Self::open_with(dir, false, None)
     }
 
     /// The lock is taken before the directory is read, so that nothing is
@@ -418,7 +400,7 @@ impl CatalogStore {
         publish(&temp, &name)?;
         // This process wrote the file a moment ago, so it is mapped
         // without a second read of its postings.
-        map_segment(&name, true, false).map_err(|e| {
+        map_segment(&name, true).map_err(|e| {
             let _ = fs::remove_file(&name);
             io::Error::other(e)
         })
@@ -476,32 +458,6 @@ impl CatalogStore {
         self.on_disk = Some(generation);
         self.faults.stop_at(Stop::AfterRename)?;
         sync_dir(&self.dir)
-    }
-
-    /// Merge with `threads` threads instead of what the machine offers;
-    /// what a test runs a merge to a file under.
-    #[cfg(test)]
-    pub(crate) fn with_threads(mut self, threads: usize) -> Self {
-        self.settings.threads = threads;
-        self
-    }
-
-    /// Make the next creation of a file fail.
-    #[cfg(test)]
-    pub(crate) fn fail_next_create(&mut self) {
-        self.faults.create = true;
-    }
-
-    /// Make the next file written fail after `bytes`.
-    #[cfg(test)]
-    pub(crate) fn fail_next_write(&mut self, bytes: u64) {
-        self.faults.write = Some(bytes);
-    }
-
-    /// Stop the next `save` after `at`.
-    #[cfg(test)]
-    pub(crate) fn stop_after(&mut self, at: Stop) {
-        self.faults.stop = Some(at);
     }
 }
 
@@ -588,7 +544,7 @@ fn map_all(
     let mut parts = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
         let path = dir.join(manifest::segment_name(entry.file));
-        let (segment, ids) = match map_segment(&path, trusted, false) {
+        let (segment, ids) = match map_segment(&path, trusted) {
             Ok(mapped) => mapped,
             Err(SnapshotError::Io(e)) if gone(&e) => return Ok(None),
             Err(e) => return Err(e),
@@ -605,11 +561,11 @@ fn map_all(
         // The manifest's reader has checked that the range lies in the id
         // space.
         let stale = manifest.live[ids.0 as usize..=ids.1 as usize].contains(&false);
-        parts.push(
-            Part::new(segment, ids)
-                .with_file(entry.file)
-                .stale_if(stale),
-        );
+        parts.push(Part {
+            stale,
+            file: entry.file,
+            ..Part::new(segment, ids)
+        });
     }
     Ok(Some(parts))
 }
@@ -647,6 +603,22 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<File, SnapshotError> {
         ))),
         Err(TryLockError::Error(e)) => Err(e.into()),
     }
+}
+
+/// Make `dir` if need be, lock it for a new catalog, and clear it of what a
+/// store that never saved left: without a manifest there is no catalog here.
+/// `AlreadyExists` when a manifest is already in `dir`.
+pub(crate) fn claim_new(dir: &Path) -> Result<File, SnapshotError> {
+    fs::create_dir_all(dir)?;
+    let lock = lock_dir(dir)?;
+    if dir.join(MANIFEST).try_exists()? {
+        return Err(SnapshotError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a catalog manifest is already in this directory",
+        )));
+    }
+    sweep(dir, &[]);
+    Ok(lock)
 }
 
 /// An error unless the manifest in `dir` is still at generation `on_disk`,
@@ -798,8 +770,11 @@ impl MergeParts for DirMerger<'_> {
         // file is mapped without another read of its postings. Its range
         // is the one the file holds, which the removals can have made
         // narrower than `ids`.
-        let (segment, held) = map_segment(&name, true, false).map_err(io::Error::other)?;
-        Ok(held.map(|held| Part::new(segment, held).with_file(file)))
+        let (segment, held) = map_segment(&name, true).map_err(io::Error::other)?;
+        Ok(held.map(|held| Part {
+            file,
+            ..Part::new(segment, held)
+        }))
     }
 }
 
@@ -920,6 +895,12 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Open a directory without its lock, as a store on a file system that
+    /// does not honour locks would.
+    fn open_unlocked(dir: &Path) -> Result<CatalogStore, SnapshotError> {
+        CatalogStore::open_with(dir, false, None)
     }
 
     struct Rng(u64);
@@ -1185,7 +1166,7 @@ mod tests {
             }
             store.remove(1);
             let changed = state(store.catalog());
-            store.stop_after(stop);
+            store.faults.stop = Some(stop);
             let err = match store.save() {
                 Ok(()) => panic!("{stop:?}: the save does not stop"),
                 Err(e) => e,
@@ -1257,9 +1238,9 @@ mod tests {
             // save adds none, since the file it fails on is its first.
             let before_files = files(&dir);
             match fault {
-                0 => store.fail_next_create(),
-                1 => store.fail_next_write(16),
-                _ => store.fail_next_write(0),
+                0 => store.faults.create = true,
+                1 => store.faults.write = Some(16),
+                _ => store.faults.write = Some(0),
             }
             let err = store.save().expect_err("the save fails");
             assert_eq!(err.kind(), io::ErrorKind::Other, "fault {fault}");
@@ -1271,7 +1252,7 @@ mod tests {
                 "fault {fault}: the catalog on disk"
             );
             store.save().expect("a save without the fault");
-            let opened = CatalogStore::open_unlocked(&dir).expect("the directory opens");
+            let opened = open_unlocked(&dir).expect("the directory opens");
             assert_eq!(state(opened.catalog()), state(store.catalog()));
         }
     }
@@ -1296,9 +1277,9 @@ mod tests {
             let want = state(store.catalog());
             let before = files(&dir);
             if fault == 0 {
-                store.fail_next_create();
+                store.faults.create = true;
             } else {
-                store.fail_next_write(8);
+                store.faults.write = Some(8);
             }
             let err = store.compact().expect_err("the merge fails");
             assert_eq!(err.kind(), io::ErrorKind::Other, "fault {fault}");
@@ -1330,9 +1311,8 @@ mod tests {
         let mut built = Vec::new();
         for threads in [1usize, 4] {
             let dir = scratch.dir.join(format!("threads-{threads}"));
-            let mut store = CatalogStore::create(&dir)
-                .expect("a fresh directory")
-                .with_threads(threads);
+            let mut store = CatalogStore::create(&dir).expect("a fresh directory");
+            store.settings.threads = threads;
             store.set_spill_postings(0);
             for batch in &calls {
                 store
@@ -1470,7 +1450,7 @@ mod tests {
         let mut first = small_store(&dir, &mut rng, 5, 30);
         first.save().expect("the first save");
         // Without the lock, as on a file system that does not honour it.
-        let mut second = CatalogStore::open_unlocked(&dir).expect("a second store");
+        let mut second = open_unlocked(&dir).expect("a second store");
         second.add(rows(&mut rng, 30)).expect("an addition");
         second.save().expect("the second store saves");
         let before = files(&dir);
@@ -1479,7 +1459,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(files(&dir), before, "the directory");
         // And the directory is still the second store's catalog.
-        let opened = CatalogStore::open_unlocked(&dir).expect("the directory opens");
+        let opened = open_unlocked(&dir).expect("the directory opens");
         assert_same(opened.catalog(), second.catalog(), "the second store's");
     }
 
@@ -1494,7 +1474,7 @@ mod tests {
         let mut first = small_store(&dir, &mut rng, 5, 30);
         first.save().expect("the first save");
         // Without the lock, as on a file system that does not honour it.
-        let mut second = CatalogStore::open_unlocked(&dir).expect("a second store");
+        let mut second = open_unlocked(&dir).expect("a second store");
         second.set_spill_postings(0);
         // An addition and a compaction merge at least once, and every
         // merge of this store writes a file.

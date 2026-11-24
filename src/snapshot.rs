@@ -415,41 +415,20 @@ fn grow<T>(out: &mut Vec<T>, take: usize, remaining: usize) {
     }
 }
 
-fn read_u32s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u32>, SnapshotError> {
+/// Read `n` values of `N` little-endian bytes each, a block at a time.
+fn read_values<R: Read, T, const N: usize>(
+    r: &mut R,
+    n: usize,
+    value: fn([u8; N]) -> T,
+) -> Result<Vec<T>, SnapshotError> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; CHUNK];
     let mut remaining = n;
     while remaining > 0 {
-        let take = remaining.min(CHUNK / 4);
-        r.read_exact(&mut buf[..take * 4])?;
+        let take = remaining.min(CHUNK / N);
+        r.read_exact(&mut buf[..take * N])?;
         grow(&mut out, take, remaining);
-        out.extend(
-            buf[..take * 4]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&c| u32::from_le_bytes(c)),
-        );
-        remaining -= take;
-    }
-    Ok(out)
-}
-
-fn read_u64s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u64>, SnapshotError> {
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; CHUNK];
-    let mut remaining = n;
-    while remaining > 0 {
-        let take = remaining.min(CHUNK / 8);
-        r.read_exact(&mut buf[..take * 8])?;
-        grow(&mut out, take, remaining);
-        out.extend(
-            buf[..take * 8]
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|&c| u64::from_le_bytes(c)),
-        );
+        out.extend(buf[..take * N].as_chunks::<N>().0.iter().map(|&c| value(c)));
         remaining -= take;
     }
     Ok(out)
@@ -490,15 +469,15 @@ impl Index {
 /// offsets stored: each run's is its first posting times the width (one
 /// that overflows saturates, which [`check_index`] refuses).
 fn read_index<R: Read>(r: &mut R, n_keys: usize, layout: Layout) -> Result<Index, SnapshotError> {
-    let keys = read_u32s(r, n_keys)?;
+    let keys = read_values(r, n_keys, u32::from_le_bytes)?;
     read_pad(r, 4 * n_keys as u64)?;
-    let offsets = read_u64s(r, n_keys + 1)?;
+    let offsets = read_values(r, n_keys + 1, u64::from_le_bytes)?;
     let ref_offsets = match layout {
         Layout::Packed(width) => offsets
             .iter()
             .map(|&start| start.saturating_mul(u64::from(width)))
             .collect(),
-        Layout::Gaps => read_u64s(r, n_keys + 1)?,
+        Layout::Gaps => read_values(r, n_keys + 1, u64::from_le_bytes)?,
     };
     let mults = read_u8s(r, n_keys)?;
     read_pad(r, n_keys as u64)?;
@@ -511,18 +490,6 @@ fn read_index<R: Read>(r: &mut R, n_keys: usize, layout: Layout) -> Result<Index
     })
 }
 
-/// Bytes of the keys, the offsets, the reference offsets
-/// ([`stored_ref_offsets`]) and the multiplicities of `n_keys` keys in a
-/// snapshot.
-#[cfg(any(feature = "mmap", test))]
-fn index_len(n_keys: u64, layout: Layout) -> u64 {
-    let offset_arrays = match layout {
-        Layout::Packed(_) => 1,
-        Layout::Gaps => 2,
-    };
-    (4 * n_keys).next_multiple_of(8) + offset_arrays * 8 * (n_keys + 1) + n_keys.next_multiple_of(8)
-}
-
 /// Append exactly `n` bytes from `r` to `out`, which has room for them:
 /// the reader fills the spare capacity itself, with no buffer in between.
 fn read_into<R: Read>(r: &mut R, out: &mut Vec<u8>, n: usize) -> Result<(), SnapshotError> {
@@ -532,24 +499,6 @@ fn read_into<R: Read>(r: &mut R, out: &mut Vec<u8>, n: usize) -> Result<(), Snap
     } else {
         Err(SnapshotError::Truncated)
     }
-}
-
-/// Read `n` bytes, each checksummed as a word of its own (the liveness
-/// bitmap).
-fn read_bytes<R: Read>(r: &mut R, n: usize, ck: &mut Checksum) -> Result<Vec<u8>, SnapshotError> {
-    let mut out = Vec::new();
-    let mut remaining = n;
-    while remaining > 0 {
-        let take = remaining.min(CHUNK);
-        grow(&mut out, take, remaining);
-        let at = out.len();
-        read_into(r, &mut out, take)?;
-        for &b in &out[at..] {
-            ck.word(u64::from(b));
-        }
-        remaining -= take;
-    }
-    Ok(out)
 }
 
 /// Read `n` values of `bits` packed, summed as little-endian 64-bit
@@ -1172,15 +1121,10 @@ impl Catalog {
     pub fn write_to<W: Write>(&self, mut w: W) -> std::io::Result<()> {
         let live = self.live_table();
         let (n_refs, n_segments) = (live.len() as u64, self.segment_count() as u64);
-        let fields = (catalog_flags(self.ref_coding()), 0);
+        let fields = (coding_flags(self.ref_coding()), 0);
         write_header(&mut w, CATALOG_MAGIC, fields, n_refs, n_segments)?;
         let mut ck = checksum_of(fields, n_refs, n_segments);
-        let mut bitmap = vec![0u8; live.len().div_ceil(8)];
-        for (i, &l) in live.iter().enumerate() {
-            if l {
-                bitmap[i / 8] |= 1 << (i % 8);
-            }
-        }
+        let bitmap = live_bitmap(live);
         for &b in &bitmap {
             ck.word(u64::from(b));
         }
@@ -1239,15 +1183,40 @@ fn read_catalog<R: Read>(r: &mut R, check: Check) -> Result<Catalog, SnapshotErr
     Ok(Catalog::from_parts(segments, live, coding))
 }
 
-/// The catalog flag of references stored as gaps.
-const CATALOG_GAPS: u32 = 1;
-
-/// The catalog flags that record `coding`.
-fn catalog_flags(coding: RefCoding) -> u32 {
+/// The flags, of a catalog snapshot and of a manifest, that record `coding`
+/// (bit 0: references coded as gaps).
+pub(crate) fn coding_flags(coding: RefCoding) -> u32 {
     match coding {
         RefCoding::Packed => 0,
-        RefCoding::Gaps => CATALOG_GAPS,
+        RefCoding::Gaps => 1,
     }
+}
+
+/// The coding such flags name; a flag this version does not know is refused.
+pub(crate) fn coding_of_flags(flags: u32) -> Result<RefCoding, SnapshotError> {
+    match flags {
+        0 => Ok(RefCoding::Packed),
+        1 => Ok(RefCoding::Gaps),
+        _ => Err(SnapshotError::Corrupt("a flag this version does not know")),
+    }
+}
+
+/// The liveness bitmap of a catalog: one bit per id, LSB first.
+pub(crate) fn live_bitmap(live: &[bool]) -> Vec<u8> {
+    let mut bitmap = vec![0u8; live.len().div_ceil(8)];
+    for (i, &l) in live.iter().enumerate() {
+        if l {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+    }
+    bitmap
+}
+
+/// The liveness of `n` ids from `bitmap`.
+pub(crate) fn live_of_bitmap(bitmap: &[u8], n: usize) -> Vec<bool> {
+    (0..n)
+        .map(|i| bitmap[i / 8] & (1 << (i % 8)) != 0)
+        .collect()
 }
 
 /// What a catalog snapshot's header holds: the live table, the segment
@@ -1258,16 +1227,7 @@ type CatalogHead = (Vec<bool>, usize, usize, RefCoding);
 /// The catalog header and liveness bitmap.
 fn read_catalog_head<R: Read>(r: &mut R) -> Result<CatalogHead, SnapshotError> {
     let (fields, n_refs, n_segments) = read_header(r, CATALOG_MAGIC)?;
-    if fields.0 & !CATALOG_GAPS != 0 {
-        return Err(SnapshotError::Corrupt(
-            "a catalog flag this version does not know",
-        ));
-    }
-    let coding = if fields.0 & CATALOG_GAPS != 0 {
-        RefCoding::Gaps
-    } else {
-        RefCoding::Packed
-    };
+    let coding = coding_of_flags(fields.0)?;
     if n_refs > u64::from(u32::MAX) {
         return Err(SnapshotError::Corrupt("id space exceeds u32"));
     }
@@ -1276,14 +1236,15 @@ fn read_catalog_head<R: Read>(r: &mut R) -> Result<CatalogHead, SnapshotError> {
     }
     let mut ck = checksum_of(fields, n_refs, n_segments);
     let n_refs = to_usize(n_refs)?;
-    let bitmap = read_bytes(r, n_refs.div_ceil(8), &mut ck)?;
+    let bitmap = read_u8s(r, n_refs.div_ceil(8))?;
+    for &b in &bitmap {
+        ck.word(u64::from(b));
+    }
     let end = read_pad(r, (CATALOG_HEADER + bitmap.len()) as u64)?;
     if read_u64(r)? != ck.finish() {
         return Err(SnapshotError::Checksum);
     }
-    let live = (0..n_refs)
-        .map(|i| bitmap[i / 8] & (1 << (i % 8)) != 0)
-        .collect();
+    let live = live_of_bitmap(&bitmap, n_refs);
     Ok((live, n_segments as usize, end as usize + 8, coding))
 }
 
@@ -1295,8 +1256,8 @@ mod mapped {
     use memmap2::Mmap;
 
     use super::{
-        Check, FOOTER, HEADER, Head, Ids, check_id_space, finish_segment, index_len, packed_sum,
-        read_catalog_head, read_footer, read_index, read_pad, segment_counts,
+        Check, Head, Ids, check_id_space, finish_segment, packed_sum, read_catalog_head,
+        read_footer, read_index, read_pad, segment_counts,
     };
     use crate::packed::Packed;
     use crate::refs::Refs;
@@ -1308,7 +1269,7 @@ mod mapped {
         unsafe_code,
         reason = "mapping a file is the one operation the crate cannot do safely"
     )]
-    fn map_file_with(path: &Path, populate: bool) -> Result<Arc<Mmap>, SnapshotError> {
+    fn map_file(path: &Path, populate: bool) -> Result<Arc<Mmap>, SnapshotError> {
         let file = std::fs::File::open(path)?;
         let mut options = memmap2::MmapOptions::new();
         if populate {
@@ -1320,11 +1281,6 @@ mod mapped {
         // `memmap2` cannot enforce.
         let map = unsafe { options.map(&file)? };
         Ok(Arc::new(map))
-    }
-
-    /// Map `path` read-only with its pages faulted in.
-    fn map_file(path: &Path) -> Result<Arc<Mmap>, SnapshotError> {
-        map_file_with(path, true)
     }
 
     /// Wrap the packed array whose data starts at `start` (where `r` also
@@ -1359,14 +1315,15 @@ mod mapped {
         let mut r: &[u8] = map.get(pos..).ok_or(SnapshotError::Truncated)?;
         let head = Head::read(&mut r)?;
         let (n_keys, n_post, (ref_len, ref_width)) = segment_counts(&head)?;
-        let mut rel = HEADER as u64;
-        let times = map_packed(map, pos + rel as usize, n_post, head.time_bits, &mut r)?;
-        rel += read_pad(&mut r, times.data().len() as u64)?;
-        let refs = map_packed(map, pos + rel as usize, ref_len, ref_width, &mut r)?;
-        rel += read_pad(&mut r, refs.data().len() as u64)?;
+        // Where the reader stands in the file.
+        let at = |r: &[u8]| map.len() - r.len();
+        let times = map_packed(map, at(r), n_post, head.time_bits, &mut r)?;
+        read_pad(&mut r, times.data().len() as u64)?;
+        let refs = map_packed(map, at(r), ref_len, ref_width, &mut r)?;
+        read_pad(&mut r, refs.data().len() as u64)?;
         let index = read_index(&mut r, n_keys, head.refs)?;
         let stored = read_footer(&mut r, &head, &index)?;
-        rel += index_len(n_keys as u64, head.refs) + FOOTER as u64;
+        let end = at(r);
         // The two arrays are nearly all of the bytes: they are summed on a
         // core of their own while the runs are checked.
         let sum = move |refs: &Refs, times: &Packed| {
@@ -1379,11 +1336,11 @@ mod mapped {
             check,
             sum,
         )?;
-        Ok((seg, ids, pos + rel as usize))
+        Ok((seg, ids, end))
     }
 
     pub(super) fn catalog(path: &Path, check: Check) -> Result<Catalog, SnapshotError> {
-        let map = map_file(path)?;
+        let map = map_file(path, true)?;
         let mut head: &[u8] = &map;
         let (live, n_segments, mut pos, coding) = read_catalog_head(&mut head)?;
         let mut segments = Vec::with_capacity(n_segments);
@@ -1395,13 +1352,6 @@ mod mapped {
         }
         at_end(&map, pos)?;
         Ok(Catalog::from_parts(segments, live, coding))
-    }
-
-    pub(super) fn segment(path: &Path, check: Check) -> Result<Segment, SnapshotError> {
-        let map = map_file(path)?;
-        let (seg, _, end) = read_segment_at(&map, 0, check)?;
-        at_end(&map, end)?;
-        Ok(seg)
     }
 
     /// A file is one snapshot and nothing after it: a shorter snapshot
@@ -1423,7 +1373,7 @@ mod mapped {
         check: Check,
         populate: bool,
     ) -> Result<(Segment, Ids), SnapshotError> {
-        let map = map_file_with(path, populate)?;
+        let map = map_file(path, populate)?;
         let (seg, ids, end) = read_segment_at(&map, 0, check)?;
         at_end(&map, end)?;
         Ok((seg, ids))
@@ -1481,7 +1431,7 @@ impl Segment {
     /// As [`Segment::read_from`], plus any error opening or mapping the
     /// file.
     pub fn map_from(path: impl AsRef<std::path::Path>) -> Result<Segment, SnapshotError> {
-        mapped::segment(path.as_ref(), Check::Full)
+        mapped::segment_with(path.as_ref(), Check::Full, true).map(|(seg, _)| seg)
     }
 
     /// Map a snapshot as [`Segment::map_from`] does, without the checks
@@ -1493,21 +1443,19 @@ impl Segment {
     /// As [`Segment::map_from`], except checksum mismatches and unsorted
     /// runs, which go unnoticed.
     pub fn map_from_trusted(path: impl AsRef<std::path::Path>) -> Result<Segment, SnapshotError> {
-        mapped::segment(path.as_ref(), Check::Trusted)
+        mapped::segment_with(path.as_ref(), Check::Trusted, true).map(|(seg, _)| seg)
     }
 }
 
-/// Map the segment snapshot at `path`. A trusted map takes the stored
-/// multiplicities and range, and `populate` says whether the pages are
-/// faulted in.
+/// Map the segment snapshot at `path`, its pages not faulted in. A trusted
+/// map takes the stored multiplicities and range.
 #[cfg(feature = "mmap")]
 pub(crate) fn map_segment(
     path: &std::path::Path,
     trusted: bool,
-    populate: bool,
 ) -> Result<(Segment, Option<(u32, u32)>), SnapshotError> {
     let check = if trusted { Check::Trusted } else { Check::Full };
-    mapped::segment_with(path, check, populate)
+    mapped::segment_with(path, check, false)
 }
 
 #[cfg(test)]
@@ -1846,9 +1794,9 @@ mod tests {
         // The keys, the offsets and the multiplicities are summed by a
         // trusted load too: they are read either way. The last word before
         // the checksums holds the seven multiplicities.
-        let index_at = bytes.len()
-            - FOOTER
-            - index_len(good.key_count() as u64, good.refs().layout()) as usize;
+        let index_at = HEADER
+            + good.times().data().len().next_multiple_of(8)
+            + good.refs().data().len().next_multiple_of(8);
         for at in [index_at, bytes.len() - FOOTER - 8] {
             let mut flipped = bytes.clone();
             flipped[at] ^= 1;
