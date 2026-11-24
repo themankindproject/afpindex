@@ -37,7 +37,10 @@ First release: the engine of the *afpindex* design notes as a library.
   with a per-`(hash, reference)` fanout cap, vote floor, per-survivor
   counting-sort scatter, bins, best bin and noise statistics), and
   `Catalog::search_with` handing out a `Survivor` for callers with their
-  own scoring.
+  own scoring. With `std`, `SearchOptions::threads` lets a search that
+  reads two million postings or more split its runs between threads,
+  each counting into counters of its own that the calling thread then
+  adds up; results do not change.
 - `SearchOptions`, `Candidate`, `Bin` and `NoiseStats` are
   `#[non_exhaustive]`: options are set by assigning fields on
   `SearchOptions::default()`, and `Bin::new` builds bins for

@@ -397,6 +397,7 @@ fields.
 | `offset_tolerance` | `2` | Bins within `±offset_tolerance` frames of the best Δ are left out of the noise statistics. | At 62.5 frames per second, 2 frames is ±32 ms. Raise it if true matches smear over neighbouring bins (resampling, slight drift). Does not change `votes`. |
 | `min_noise_bins` | `10` | With fewer noise bins than this, the noise mean, deviation and max are reported as `0`. | Avoids statistics from a handful of bins. `noise.bins` always counts them. |
 | `max_votes` | `1 << 26` | Most votes the survivors of one search may scatter; the histogram holds 16 bytes per vote and 32 per group, and in the worst case (every posting its own group) 48 bytes per vote: about 1 GiB at the default, up to 3 GiB. Exceeding it returns `TooManyVotes`. | A guard against a query with a floor so low that the histogram would exhaust memory. Lower it on small machines. |
+| `threads` | `1` | Threads one search may run on (`std`): a search that reads two million postings or more splits its runs between them, up to the hardware's thread count. Results do not change. | Leave it at 1 when the server already runs a search per core. Where cores sit idle, 4 took a third off the searches of 5 ms and more on the real clips and left the others as they were; each extra thread keeps its own counters in the scratch (4 bytes per id). |
 
 Together, the query's `max_times_per_hash` and the `fanout` bound the
 votes one `(hash, reference)` pair can cast: `times × min(fanout,
@@ -649,8 +650,10 @@ pub fn search_many(
 }
 ```
 
-A search uses one thread; run as many search threads as hardware
-threads. Two hardware threads of one core share its caches and execution
+A search uses one thread unless `SearchOptions::threads` asks for more
+([section 7](#7-search-options)), which only a search that reads two
+million postings or more takes up; run as many search threads as
+hardware threads. Two hardware threads of one core share its caches and execution
 units: on an `m7i-flex.large` (two hardware threads of one core), two
 threads answered 779 searches per second on the real catalog. Separate
 cores scale further: four laptop cores answered 33,000–34,000 searches per
@@ -658,8 +661,9 @@ second on the synthetic catalog.
 
 ### The threads a build, merge or load takes
 
-A search uses the thread that calls it, but the passes that have work to
-spread do not: a segment's sort, a merge, a large directory's fill and a
+A search uses the thread that calls it, or the threads its options ask
+for, and `set_max_threads` does not change that. The passes that have work
+to spread do not: a segment's sort, a merge, a large directory's fill and a
 large segment's check at load each hand their tasks to up to as many
 threads as the machine has. A server that shares its host with other work,
 or that would rather its background compactions did not take the cores its
@@ -760,7 +764,7 @@ segments are freed when the last search lets go.
 | A posting | Its reference width plus its time width, in bits (`Segment::widths`) |
 | A distinct hash, per segment | 4 bytes of key plus about 20 of directory, or plus about 48 in a segment of fewer than 2<sup>20</sup> keys |
 | An id | 1 byte of liveness table |
-| A `Scratch`, per thread | 4 bytes and a bit per id of the largest catalog it searched, plus buffers that grow with the queries |
+| A `Scratch`, per thread | 4 bytes and a bit per id of the largest catalog it searched, plus buffers that grow with the queries; a search on several threads adds 4 bytes per id for each thread beyond the first |
 | A search's histogram | 16 bytes per survivor vote and 32 bytes per survivor group, while it runs |
 | Building with `CatalogBuilder` | 12 bytes per collected posting, about 20 while `build` runs |
 

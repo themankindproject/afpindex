@@ -49,6 +49,17 @@ pub struct SearchOptions {
     /// votes, up to 3 GiB with the groups). The scratch keeps what a search
     /// grew; [`Scratch::shrink_to_fit`] gives it back.
     pub max_votes: usize,
+    /// Threads one search may run on (`std`). A search that reads many
+    /// postings cuts the reference ids into one range per thread and counts
+    /// each range on a thread of its own, at most as many as the hardware
+    /// has and only when each gets enough postings to be worth a thread;
+    /// the calling thread is one of them. Results do not depend on it.
+    /// Each thread beyond the first keeps buffers of its own in the
+    /// [`Scratch`], as large as a scratch's on one thread. Default 1, which
+    /// suits a server that runs as many searches at once as it has cores;
+    /// more lowers the latency of a large search where cores are idle.
+    /// Without `std` every search runs on the calling thread.
+    pub threads: usize,
 }
 
 impl Default for SearchOptions {
@@ -59,6 +70,7 @@ impl Default for SearchOptions {
             offset_tolerance: 2,
             min_noise_bins: 10,
             max_votes: 1 << 26,
+            threads: 1,
         }
     }
 }
@@ -265,7 +277,9 @@ struct RunLoc {
 /// After the first search on a catalog, [`Catalog::search_with`] on a
 /// query of similar size allocates nothing but the small vector of
 /// segment handles it collects on every search; [`Catalog::search`] also
-/// allocates its result. One scratch serves any number of catalogs.
+/// allocates its result. A search on several threads
+/// ([`SearchOptions::threads`]) also starts its threads and keeps a
+/// scratch per thread beyond the first in this one. One scratch serves any number of catalogs.
 /// Searches leave it clean, including on an error, and so does a panic
 /// inside a visitor. A search that panics part-way, which a damaged
 /// catalog loaded without its checks can cause, leaves counters behind;
@@ -295,6 +309,9 @@ pub struct Scratch {
     /// written, cleared once it has reset them: still set at the next
     /// search only if a search stopped by panicking in between.
     dirty: bool,
+    /// The scratches of the threads of a search that runs on several.
+    #[cfg(feature = "std")]
+    workers: Vec<std::sync::Mutex<Scratch>>,
 }
 
 impl Scratch {
@@ -323,6 +340,23 @@ impl Scratch {
             + self.cursor.capacity() * size_of::<usize>()
             + self.votes.capacity() * size_of::<(i64, u32)>()
             + self.bins.capacity() * size_of::<Bin>()
+            + self.workers_heap_bytes()
+    }
+
+    #[cfg(feature = "std")]
+    fn workers_heap_bytes(&self) -> usize {
+        self.workers.capacity() * size_of::<std::sync::Mutex<Scratch>>()
+            + self
+                .workers
+                .iter()
+                .map(|w| crate::par::lock(w).heap_bytes())
+                .sum::<usize>()
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[expect(clippy::unused_self, reason = "the std build reads the workers")]
+    fn workers_heap_bytes(&self) -> usize {
+        0
     }
 
     fn fit(&mut self, n_refs: usize) {
@@ -333,7 +367,14 @@ impl Scratch {
             self.dirty = false;
         }
         if self.totals.len() < n_refs {
-            self.totals.resize(n_refs, 0);
+            if self.totals.is_empty() {
+                // Zeroed memory from the allocator: pages are taken as
+                // counters in them are first written, so a thread of a
+                // parallel search holds only the pages of its own range.
+                self.totals = alloc::vec![0; n_refs];
+            } else {
+                self.totals.resize(n_refs, 0);
+            }
             self.touched.resize(n_refs.div_ceil(SCAN_BLOCK), 0);
             self.survivor_bits.resize(n_refs.div_ceil(64), 0);
         }
@@ -348,6 +389,141 @@ impl fmt::Debug for Scratch {
             .field("heap_bytes", &self.heap_bytes())
             .finish_non_exhaustive()
     }
+}
+
+/// Postings in `runs`, saturating.
+fn postings_of(runs: &[RunLoc]) -> usize {
+    runs.iter()
+        .fold(0usize, |n, run| n.saturating_add(run.hi - run.lo))
+}
+
+/// The votes the survivors will scatter, or the error when they pass
+/// `options.max_votes`.
+fn vote_count(survivor_totals: &[u32], options: &SearchOptions) -> Result<usize, SearchError> {
+    let n_votes = survivor_totals
+        .iter()
+        .fold(0u64, |acc, &t| acc.saturating_add(u64::from(t)));
+    if n_votes > options.max_votes as u64 {
+        return Err(SearchError::TooManyVotes {
+            votes: n_votes,
+            max: options.max_votes,
+        });
+    }
+    Ok(n_votes as usize)
+}
+
+/// The histogram pass for the survivors `scratch` holds: each survivor
+/// gets a slice of the vote array sized by its exact total (a counting
+/// sort keyed by survivor), its groups are found in the runs, and its
+/// votes are scattered there. The counters and the survivor bits are
+/// zero again at the end.
+fn scatter_phase(
+    segments: &[&Segment],
+    query: &Query,
+    fanout: Option<usize>,
+    scratch: &mut Scratch,
+    n_votes: usize,
+) {
+    let Scratch {
+        totals,
+        survivor_bits,
+        runs,
+        groups,
+        survivors,
+        survivor_totals,
+        slots,
+        cursor,
+        votes,
+        dirty,
+        ..
+    } = scratch;
+    // The zeroed counters hold the survivor indices (plus one) until the
+    // scatter is done.
+    slots.clear();
+    slots.push(0);
+    *dirty = true;
+    for (i, &r) in survivors.iter().enumerate() {
+        totals[r as usize] = i as u32 + 1;
+        survivor_bits[(r >> 6) as usize] |= 1u64 << (r & 63);
+        slots.push(slots[i] + survivor_totals[i] as usize);
+    }
+    // The scatter writes every slot of `votes[..n_votes]` exactly once
+    // (the cursors end at the slice ends), so stale contents need no zero
+    // fill; only grow when a search needs more.
+    if votes.len() < n_votes {
+        votes.resize(n_votes, (0, 0));
+    }
+    let votes = &mut votes[..n_votes];
+    cursor.clear();
+    cursor.extend_from_slice(&slots[..survivors.len()]);
+    simd::run(FindGroups {
+        segments,
+        fanout,
+        runs,
+        survivors,
+        survivor_bits,
+        index: totals,
+        groups,
+    });
+    write_votes(segments, query, groups, cursor, votes);
+    for &r in survivors.iter() {
+        totals[r as usize] = 0;
+        survivor_bits[(r >> 6) as usize] &= !(1u64 << (r & 63));
+    }
+    *dirty = false;
+    debug_assert!(
+        cursor.iter().zip(&slots[1..]).all(|(c, s)| c == s),
+        "scatter count mismatch"
+    );
+}
+
+/// Bin each survivor's votes and hand it to `visit`, in the order of
+/// `survivors`.
+fn emit<F: FnMut(Survivor<'_>)>(
+    votes: &mut [(i64, u32)],
+    slots: &[usize],
+    survivors: &[u32],
+    survivor_totals: &[u32],
+    bins: &mut Vec<Bin>,
+    visit: &mut F,
+) {
+    for (sv, &r) in survivors.iter().enumerate() {
+        bins_of(&mut votes[slots[sv]..slots[sv + 1]], bins);
+        visit(Survivor {
+            reference: r,
+            total_votes: survivor_totals[sv],
+            bins,
+        });
+    }
+}
+
+/// Postings a search reads before it is cut across threads. Starting the
+/// threads and adding their counters together costs a few tenths of a
+/// millisecond; on the real clips that paid only for searches of 5 ms and
+/// more on one thread, about two million postings.
+/// Unit tests lower it so that their small catalogs take the parallel
+/// path.
+#[cfg(feature = "std")]
+const PARALLEL_POSTINGS: usize = if cfg!(test) { 64 } else { 1 << 21 };
+
+/// The threads a search over `runs` runs on, or `None` for one: what the
+/// options ask for, at most the hardware's, and only for a search that
+/// reads enough postings.
+#[cfg(feature = "std")]
+fn parallel_threads(options: &SearchOptions, runs: &[RunLoc]) -> Option<usize> {
+    if options.threads <= 1 {
+        return None;
+    }
+    let postings = postings_of(runs);
+    if postings < PARALLEL_POSTINGS {
+        return None;
+    }
+    // Every thread gets a quarter of the threshold's postings at least.
+    let threads = options
+        .threads
+        .min(crate::par::hardware())
+        .min(postings / (PARALLEL_POSTINGS / 4));
+    (threads > 1).then_some(threads)
 }
 
 /// Query hashes per directory batch. The batch after the one being
@@ -1040,29 +1216,66 @@ impl Catalog {
             return Ok(());
         }
         let n_refs = self.reference_count();
-        scratch.fit(n_refs);
-        let Scratch {
-            totals,
-            touched,
-            survivor_bits,
-            runs,
-            groups,
-            survivors,
-            survivor_totals,
-            slots,
-            cursor,
-            votes,
-            bins,
-            dirty,
-        } = scratch;
-        let totals = &mut totals[..n_refs];
-        let n_blocks = n_refs.div_ceil(SCAN_BLOCK);
+        let floor = options.min_total_votes.max(1);
         // Segments are shared handles; the passes take a view of them. The
         // small vector is the only per-search allocation beyond the scratch.
         let segments: Vec<&Segment> = self.segments().collect();
         let segments: &[&Segment] = &segments;
+        scratch.fit(n_refs);
+        locate(segments, query, &mut scratch.runs);
+        #[cfg(feature = "std")]
+        if let Some(threads) = parallel_threads(options, &scratch.runs) {
+            return self.search_parallel(segments, query, options, scratch, threads, floor, visit);
+        }
+        self.count_phase(segments, fanout, scratch, n_refs, track, floor)?;
+        if scratch.survivors.is_empty() {
+            return Ok(());
+        }
+        let n_votes = vote_count(&scratch.survivor_totals, options)?;
+        scatter_phase(segments, query, fanout, scratch, n_votes);
+        let Scratch {
+            survivors,
+            survivor_totals,
+            slots,
+            votes,
+            bins,
+            ..
+        } = scratch;
+        emit(
+            &mut votes[..n_votes],
+            slots,
+            survivors,
+            survivor_totals,
+            bins,
+            &mut visit,
+        );
+        Ok(())
+    }
 
-        locate(segments, query, runs);
+    /// The totals pass and the survivor scan over the runs `scratch` has
+    /// located, by the path `track` chooses (`None` for the search's own
+    /// choice): the survivors and their totals are left in the scratch,
+    /// and the counters are zero again, error or not.
+    fn count_phase(
+        &self,
+        segments: &[&Segment],
+        fanout: Option<usize>,
+        scratch: &mut Scratch,
+        n_refs: usize,
+        track: Option<bool>,
+        floor: u32,
+    ) -> Result<(), SearchError> {
+        let Scratch {
+            totals,
+            touched,
+            runs,
+            survivors,
+            survivor_totals,
+            dirty,
+            ..
+        } = scratch;
+        let totals = &mut totals[..n_refs];
+        let n_blocks = n_refs.div_ceil(SCAN_BLOCK);
         // The record costs a byte store per posting and spares the scan
         // the blocks nothing wrote. With as many postings as blocks or
         // more, nearly every block is written and the scan has all of them
@@ -1070,13 +1283,7 @@ impl Catalog {
         // blocks left out are worth more than the stores. A short query
         // over a catalog of many references records; a long one over the
         // same catalog does not.
-        let track = track.unwrap_or_else(|| {
-            let postings = runs
-                .iter()
-                .fold(0usize, |n, run| n.saturating_add(run.hi - run.lo));
-            postings < n_blocks
-        });
-        let floor = options.min_total_votes.max(1);
+        let track = track.unwrap_or_else(|| postings_of(runs) < n_blocks);
         *dirty = true;
         let taken = self.count_and_take(
             segments,
@@ -1093,66 +1300,133 @@ impl Catalog {
         // The counters are clean again, whether or not the pass found an
         // overflow.
         *dirty = false;
+        taken
+    }
+
+    /// [`Catalog::search_tracked`] with its totals pass on `threads`
+    /// threads, for runs already located in `scratch`.
+    ///
+    /// The runs are cut into one share per thread of about equal postings,
+    /// and each thread counts its share with the totals pass of a search on
+    /// one thread into counters of its own, marking the blocks it writes.
+    /// The calling thread then adds the marked blocks into the scratch's
+    /// counters, saturating so that an overflow is caught as it is on one
+    /// thread, and the survivor scan, the histogram pass and the visits run
+    /// as they do there. A run is never cut, so no thread looks anything up
+    /// to split the work.
+    #[cfg(feature = "std")]
+    #[expect(clippy::too_many_arguments, reason = "the parts of a search")]
+    fn search_parallel<F>(
+        &self,
+        segments: &[&Segment],
+        query: &Query,
+        options: &SearchOptions,
+        scratch: &mut Scratch,
+        threads: usize,
+        floor: u32,
+        mut visit: F,
+    ) -> Result<(), SearchError>
+    where
+        F: FnMut(Survivor<'_>),
+    {
+        use crate::par::{lock, run_tasks};
+        let n_refs = self.reference_count();
+        let n_blocks = n_refs.div_ceil(SCAN_BLOCK);
+        let fanout = options.fanout;
+        while scratch.workers.len() < threads {
+            scratch
+                .workers
+                .push(std::sync::Mutex::new(Scratch::default()));
+        }
+        // Share `t` is `runs[cuts[t]..cuts[t + 1]]`.
+        let runs: &[RunLoc] = &scratch.runs;
+        let total = postings_of(runs);
+        let mut cuts = Vec::with_capacity(threads + 1);
+        cuts.push(0);
+        let mut seen = 0usize;
+        for (i, run) in runs.iter().enumerate() {
+            if cuts.len() < threads && seen >= total / threads * cuts.len() {
+                cuts.push(i);
+            }
+            seen += run.hi - run.lo;
+        }
+        while cuts.len() <= threads {
+            cuts.push(runs.len());
+        }
+        let workers = &scratch.workers[..threads];
+        run_tasks(threads, threads, |t| {
+            let mut worker = lock(&workers[t]);
+            let worker = &mut *worker;
+            worker.fit(n_refs);
+            worker.dirty = true;
+            totals_pass(
+                Counters::<MarkBlocks> {
+                    totals: &mut worker.totals[..n_refs],
+                    marks: &mut worker.touched[..n_blocks],
+                },
+                segments,
+                fanout,
+                &runs[cuts[t]..cuts[t + 1]],
+            );
+        });
+        let Scratch {
+            totals,
+            touched,
+            survivors,
+            survivor_totals,
+            dirty,
+            workers,
+            ..
+        } = scratch;
+        let (totals, touched) = (&mut totals[..n_refs], &mut touched[..n_blocks]);
+        *dirty = true;
+        for worker in &workers[..threads] {
+            let mut worker = lock(worker);
+            let Scratch {
+                totals: theirs,
+                touched: marked,
+                dirty: their_dirty,
+                ..
+            } = &mut *worker;
+            for (b, mark) in marked[..n_blocks].iter_mut().enumerate() {
+                if *mark == 0 {
+                    continue;
+                }
+                *mark = 0;
+                touched[b] = 1;
+                let lo = b * SCAN_BLOCK;
+                let hi = (lo + SCAN_BLOCK).min(n_refs);
+                for (sum, count) in totals[lo..hi].iter_mut().zip(&mut theirs[lo..hi]) {
+                    *sum = sum.saturating_add(*count);
+                    *count = 0;
+                }
+            }
+            *their_dirty = false;
+        }
+        let taken = self.take_touched(totals, touched, floor, survivors, survivor_totals);
+        *dirty = false;
         taken?;
-        if survivors.is_empty() {
+        if scratch.survivors.is_empty() {
             return Ok(());
         }
-        let n_votes = survivor_totals
-            .iter()
-            .fold(0u64, |acc, &t| acc.saturating_add(u64::from(t)));
-        if n_votes > options.max_votes as u64 {
-            return Err(SearchError::TooManyVotes {
-                votes: n_votes,
-                max: options.max_votes,
-            });
-        }
-        let n_votes = n_votes as usize;
-
-        // Each survivor owns a slice of the vote array sized by its exact
-        // total: a counting sort keyed by survivor. The zeroed counters hold
-        // the survivor indices (plus one) until the scatter is done.
-        slots.clear();
-        slots.push(0);
-        *dirty = true;
-        for (i, &r) in survivors.iter().enumerate() {
-            totals[r as usize] = i as u32 + 1;
-            survivor_bits[(r >> 6) as usize] |= 1u64 << (r & 63);
-            slots.push(slots[i] + survivor_totals[i] as usize);
-        }
-        // The scatter writes every slot of `votes[..n_votes]` exactly once
-        // (the cursors end at the slice ends), so stale contents need no
-        // zero fill; only grow when a search needs more.
-        if votes.len() < n_votes {
-            votes.resize(n_votes, (0, 0));
-        }
-        let votes = &mut votes[..n_votes];
-        cursor.clear();
-        cursor.extend_from_slice(&slots[..survivors.len()]);
-        simd::run(FindGroups {
-            segments,
-            fanout,
-            runs,
+        let n_votes = vote_count(&scratch.survivor_totals, options)?;
+        scatter_phase(segments, query, fanout, scratch, n_votes);
+        let Scratch {
             survivors,
-            survivor_bits,
-            index: totals,
-            groups,
-        });
-        write_votes(segments, query, groups, cursor, votes);
-        for &r in survivors.iter() {
-            totals[r as usize] = 0;
-            survivor_bits[(r >> 6) as usize] &= !(1u64 << (r & 63));
-        }
-        *dirty = false;
-
-        for (sv, &r) in survivors.iter().enumerate() {
-            debug_assert_eq!(cursor[sv], slots[sv + 1], "scatter count mismatch");
-            bins_of(&mut votes[slots[sv]..slots[sv + 1]], bins);
-            visit(Survivor {
-                reference: r,
-                total_votes: survivor_totals[sv],
-                bins,
-            });
-        }
+            survivor_totals,
+            slots,
+            votes,
+            bins,
+            ..
+        } = scratch;
+        emit(
+            &mut votes[..n_votes],
+            slots,
+            survivors,
+            survivor_totals,
+            bins,
+            &mut visit,
+        );
         Ok(())
     }
 
@@ -2283,5 +2557,86 @@ mod tests {
             .search(&query, &options, &mut scratch)
             .expect("search after the panic");
         assert_eq!(got, expected);
+    }
+
+    /// A search on several threads hands out the survivors, totals and
+    /// bins a search on one thread does, in the same order, and fails with
+    /// the same error: over several segments, with removed references, a
+    /// fanout that cuts runs, queries of every size, and every thread
+    /// count from one to seven.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_search_on_several_threads_finds_what_one_finds() {
+        let mut seed = 0x005E_A2C4_u64;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        let mut catalog = Catalog::new();
+        for r in 0..400u32 {
+            // A clip of each reference, and hashes shared by many.
+            let rows: Vec<(u32, u32)> = (0..60)
+                .map(|i| {
+                    (
+                        if i % 5 == 0 { next(30) } else { next(3_000) },
+                        i * 3 + r % 7,
+                    )
+                })
+                .collect();
+            catalog.add(rows);
+            if r % 37 == 0 {
+                catalog.remove(r / 2);
+            }
+        }
+        assert!(catalog.segment_count() > 1);
+        let collect = |options: &SearchOptions, query: &Query, scratch: &mut Scratch| {
+            let mut out = Vec::new();
+            let result = catalog.search_with(query, options, scratch, |s| {
+                out.push((s.reference, s.total_votes, s.bins.to_vec()));
+            });
+            result.map(|()| out)
+        };
+        let mut one = Scratch::new();
+        let mut many = Scratch::new();
+        for q in 0..12u32 {
+            let r = next(400);
+            let mut pairs: Vec<(u32, u32)> = (0..(20 + q * 9)).map(|i| (next(3_000), i)).collect();
+            pairs.extend((0..40).map(|i| (next(30), i + 1_000)));
+            pairs.push((r, 0));
+            let query = Query::from_pairs(pairs, Some(8));
+            for (fanout, floor) in [(Some(64), 2), (Some(2), 3), (None, 1)] {
+                let mut options = SearchOptions {
+                    fanout,
+                    min_total_votes: floor,
+                    ..SearchOptions::default()
+                };
+                let want = collect(&options, &query, &mut one).expect("one thread");
+                for threads in [2, 3, 7] {
+                    options.threads = threads;
+                    let got = collect(&options, &query, &mut many).expect("several threads");
+                    assert_eq!(got, want, "query {q}, {threads} threads, fanout {fanout:?}");
+                }
+                options.threads = 1;
+                // The bound on the votes holds over all the ranges at once.
+                let votes: u64 = want.iter().map(|s| u64::from(s.1)).sum();
+                if votes > 1 {
+                    options.max_votes = (votes - 1) as usize;
+                    let one_err = collect(&options, &query, &mut one).expect_err("too many");
+                    options.threads = 4;
+                    let many_err = collect(&options, &query, &mut many).expect_err("too many");
+                    assert_eq!(one_err, many_err);
+                }
+            }
+        }
+        // The scratches are clean: a search on one thread with the scratch
+        // that served several finds the same.
+        let query = Query::from_pairs((0..300).map(|i| (next(3_000), i)), None);
+        let options = SearchOptions::default();
+        assert_eq!(
+            collect(&options, &query, &mut many).unwrap(),
+            collect(&options, &query, &mut Scratch::new()).unwrap()
+        );
     }
 }

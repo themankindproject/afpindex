@@ -28,9 +28,10 @@ static MAX_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// The setting is process-wide, and it applies from the next pass on:
 /// `set_max_threads(1)` keeps every sort, merge, directory fill and load
 /// on the calling thread, which is how a server can compact in the
-/// background without taking the cores its searches run on. Searches
-/// themselves run on the thread that calls them, so the cap does not
-/// change them. Results never depend on the cap.
+/// background without taking the cores its searches run on. A search
+/// takes the threads its `SearchOptions::threads` asks for, at most the
+/// hardware's, so the cap does not change it. Results never depend on the
+/// cap.
 ///
 /// [`max_threads`] reports what a pass would take now.
 pub fn set_max_threads(n: usize) {
@@ -60,7 +61,7 @@ pub(crate) fn threads() -> usize {
 /// takes dozens of system calls (the affinity mask and the cgroup's CPU
 /// quota), tens of microseconds that a small merge of `Catalog::add`
 /// would otherwise pay every time.
-fn hardware() -> usize {
+pub(crate) fn hardware() -> usize {
     static HARDWARE: OnceLock<usize> = OnceLock::new();
     *HARDWARE.get_or_init(|| thread::available_parallelism().map_or(1, NonZeroUsize::get))
 }

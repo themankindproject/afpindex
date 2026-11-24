@@ -29,6 +29,7 @@ by about 10 %, so compare columns within one table only.
 - [Survivor blocks, run weights and the overflow bound](#survivor-blocks-run-weights-and-the-overflow-bound)
 - [Packing a build on every core](#packing-a-build-on-every-core)
 - [Warming the references of a mapped catalog](#warming-the-references-of-a-mapped-catalog)
+- [One search on several threads](#one-search-on-several-threads)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -790,6 +791,39 @@ Asking the kernel instead (`madvise` with `MADV_WILLNEED` over the
 references) was tried first and left out: on this kernel it read the
 first 128 KiB of the range and no more, and the first pass took as long
 as with nothing.
+
+## One search on several threads
+
+`SearchOptions::threads` lets a large search split its totals pass. The
+runs are cut into one share per thread of about equal postings, each
+thread counts its share into counters of its own with the pass a search
+on one thread runs, marking the blocks it writes, and the calling thread
+adds the marked blocks together, then takes the survivors and runs the
+histogram pass as on one thread.
+
+Cutting the reference ids instead, so that every thread took its range
+of every run, was built first and left out: finding where each run
+crosses a range is a binary search per run and thread whose probes wait
+on one another, and every search got slower, twice as slow at the median.
+
+Starting the threads and adding their counters costs a few tenths of a
+millisecond. On the real catalog, warm, on the laptop (4 cores, 8
+hardware threads), each clip searched alternately on one thread and on
+several, best of seven, candidates identical. With the split taken from
+262,144 postings on, searches of 0.5 to 2 ms on one thread got 20 to 46 %
+slower; with it taken from 2,097,152 postings on:
+
+| one-thread time of the clip | 2 threads | 4 threads | 8 threads |
+|---|---|---|---|
+| under 0.5 ms | 0 % | +1 % | 0 % |
+| 0.5 to 2 ms | 0 % | 0 % | 0 % |
+| 2 to 5 ms | −1 % | −4 % | −3 % |
+| 5 ms and more (12 or 13 clips) | −21 % | −35 % | −37 % |
+| all 104 clips, summed | −10 % | −18 % | −18 % |
+
+The gain stops well short of the thread count: the histogram pass stays
+on one thread, and the totals pass waits on memory, which the threads
+share.
 
 ## Allocators and huge pages
 
