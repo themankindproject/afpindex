@@ -1224,7 +1224,7 @@ impl Segment {
     /// saturating at 255, and `ids` the smallest and largest reference).
     /// The offsets and multiplicities go into the directory and are not
     /// kept.
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub(crate) fn from_parts(
         keys: Vec<u32>,
         index: (&[u64], &[u64], &[u8]),
@@ -1319,7 +1319,7 @@ impl Segment {
     }
 
     /// The smallest and the largest reference, if there is a posting.
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     #[inline]
     pub(crate) fn ids(&self) -> Option<(u32, u32)> {
         self.ids
@@ -1432,7 +1432,7 @@ impl Segment {
         self.table = Table::build(index, &self.pages, slots, self.refs.layout());
     }
 
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     #[inline]
     pub(crate) fn refs(&self) -> &Refs {
         &self.refs

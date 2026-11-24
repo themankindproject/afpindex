@@ -76,7 +76,7 @@ pub(crate) const fn max_run_bits(n: u64) -> u64 {
 }
 
 /// The least bits a run takes: its width field.
-#[cfg(any(feature = "std", test))]
+#[cfg(feature = "std")]
 pub(crate) const MIN_RUN_BITS: u64 = WIDTH_BITS as u64;
 
 /// An upper bound on the bits of `runs` runs holding `postings` references
@@ -223,7 +223,7 @@ impl Refs {
     }
 
     /// The bytes of the stream, without the slack.
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub(crate) fn data(&self) -> &[u8] {
         self.bits.data()
     }
@@ -372,7 +372,7 @@ impl<'a> Run<'a> {
     /// Decode the run, refusing a gap coding that is not canonical or does
     /// not end exactly at bit `end` (see [`Coded::check`]). A packed run
     /// is the values its offsets say, which its caller has checked.
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     #[inline(always)]
     pub(crate) fn check<D: Decoder>(
         &self,
