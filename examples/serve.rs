@@ -214,15 +214,14 @@ fn write_for(served: &RwLock<Arc<Catalog>>, w: &Writes, time: Duration) -> Writt
         add = !add;
         if let Some(due) = w.policy.and_then(|p| next.compaction_due(&p)) {
             let c0 = Instant::now();
-            match due {
-                Compaction::Deltas => {
-                    next.compact_deltas();
-                    out.deltas += 1;
-                }
-                Compaction::Full => {
-                    next.compact();
-                    out.fulls += 1;
-                }
+            // A full compaction for anything but the deltas, including what a
+            // later version may call for.
+            if due == Compaction::Deltas {
+                next.compact_deltas();
+                out.deltas += 1;
+            } else {
+                next.compact();
+                out.fulls += 1;
             }
             out.compactions.push(c0.elapsed().as_secs_f64() * 1e3);
         }

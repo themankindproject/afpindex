@@ -8,7 +8,7 @@
 //! lets the old ones go.
 //!
 //! ```text
-//! 0   "AFCM"            4   version u32 = 2
+//! 0   "AFCM"            4   version u32 = 1
 //! 8   generation u64    16  reference_count u64
 //! 24  segment_count u64 32  next_file u32
 //! 36  flags u32         (bit 0: the catalog stores references as gaps)
@@ -50,7 +50,7 @@ const HEADER: usize = 40;
 /// Bytes of one segment entry.
 const ENTRY: usize = 40;
 /// Version of the manifest format.
-const VERSION: u32 = 2;
+const VERSION: u32 = 1;
 /// The flag of a catalog that stores its references as gaps.
 const GAPS: u32 = 1;
 /// Name of the file that names the catalog.
@@ -375,10 +375,10 @@ mod tests {
         bad_magic[0] = b'X';
         assert!(matches!(read(&bad_magic), Err(SnapshotError::BadMagic)));
         let mut later = bytes;
-        later[4] = 3;
+        later[4] = 2;
         assert!(matches!(
             read(&later),
-            Err(SnapshotError::UnsupportedVersion(3))
+            Err(SnapshotError::UnsupportedVersion(2))
         ));
         // A flag this version does not know.
         let mut flagged = sample();

@@ -1,10 +1,10 @@
 //! Snapshot files (`std`): little-endian arrays behind a small header,
 //! every section 8-byte aligned, closed by checksums.
 //!
-//! Segment snapshot, version 6:
+//! Segment snapshot, version 1:
 //!
 //! ```text
-//! 0   "AFIX"            4   version u32 = 6
+//! 0   "AFIX"            4   version u32 = 1
 //! 8   time_bits u32     12  layout u32         (the reference width, or u32::MAX: gaps)
 //! 16  key_count u64     24  posting_count u64
 //! 32  min_ref u32       36  max_ref u32      (both 0 without postings)
@@ -53,10 +53,10 @@
 //! one before it, so one chain runs at the latency of a multiply; four
 //! run side by side, and a load or a write sums at memory speed.
 //!
-//! Catalog snapshot, version 6 (the segments' format gave it the number):
+//! Catalog snapshot, version 1:
 //!
 //! ```text
-//! 0   "AFCT"            4   version u32 = 6
+//! 0   "AFCT"            4   version u32 = 1
 //! 8   flags u32         12  reserved u32 = 0   (flags bit 0: references coded as gaps)
 //! 16  reference_count u64   24  segment_count u64
 //! 32  live bitmap, one bit per id, LSB first, ceil(n / 8) bytes (zero-padded to 8)
@@ -81,7 +81,7 @@ use crate::{Catalog, Segment, SnapshotError};
 
 pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"AFIX";
 const CATALOG_MAGIC: [u8; 4] = *b"AFCT";
-const VERSION: u32 = 6;
+const VERSION: u32 = 1;
 /// Bytes before the first array of a segment snapshot.
 pub(crate) const HEADER: usize = 48;
 /// Bytes of the four checksums that close a segment snapshot.

@@ -4,7 +4,7 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-25
 
 First release: the engine of the *afpindex* design notes as a library.
 
@@ -67,7 +67,7 @@ First release: the engine of the *afpindex* design notes as a library.
   the histogram pass, both detected after the totals pass and before any
   histogram work.
 - `std` feature: `Catalog::write_to` / `read_from` and `Segment::write_to`
-  / `read_from` snapshot files (format version 6), 8-byte aligned, the
+  / `read_from` snapshot files (format version 1), 8-byte aligned, the
   postings first and every section with a checksum of its own (the
   two arrays summed in four interleaved lanes),
   closed by one over the header words and the section checksums;

@@ -783,7 +783,8 @@ impl Served {
     fn publish(current: &RwLock<Arc<Catalog>>, mut next: Catalog) {
         match next.compaction_due(&CompactionPolicy::default()) {
             Some(Compaction::Deltas) => next.compact_deltas(),
-            Some(Compaction::Full) => next.compact(),
+            // `Compaction::Full`, or whatever a later version calls for.
+            Some(_) => next.compact(),
             None => {}
         }
         *current.write().expect("lock poisoned") = Arc::new(next);
@@ -1028,16 +1029,16 @@ anyway).
 
 ### The format
 
-Both formats are version 6: little-endian arrays behind a header, every
+Both formats are version 1: little-endian arrays behind a header, every
 section 8-byte aligned, closed by checksums. References and times are
 stored as they are in memory, so a file is about the size of the
-catalog, references packed or coded as gaps as the catalog holds them. A file of an earlier version is refused with
-`SnapshotError::UnsupportedVersion`: there is no reader for it, so write
-the catalog out again with the current version.
+catalog, references packed or coded as gaps as the catalog holds them. A
+file of another version is refused with
+`SnapshotError::UnsupportedVersion`: this crate has no reader for it.
 
 ```text
 Segment snapshot
-0   "AFIX"            4   version u32 = 6
+0   "AFIX"            4   version u32 = 1
 8   time_bits u32     12  layout u32  (the reference width 0–32, or u32::MAX: gaps)
 16  key_count u64     24  posting_count u64
 32  min_ref u32       36  max_ref u32      (both 0 without postings)
@@ -1054,7 +1055,7 @@ Segment snapshot
     checksum u64 of the header and the three checksums before it
 
 Catalog snapshot
-0   "AFCT"            4   version u32 = 6
+0   "AFCT"            4   version u32 = 1
 8   flags u32         12  reserved u32 = 0   (flags bit 0: the catalog codes references as gaps)
 16  reference_count u64   24  segment_count u64
 32  live bitmap, one bit per id, LSB first              (zero-padded to 8)
@@ -1160,7 +1161,7 @@ pub fn directory_tour(dir: &Path) -> usize {
 The layout:
 
 ```text
-0   "AFCM"            4   version u32 = 2
+0   "AFCM"            4   version u32 = 1
 8   generation u64    16  reference_count u64
 24  segment_count u64 32  next_file u32
 36  flags u32         (bit 0: the catalog codes references as gaps)

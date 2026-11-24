@@ -21,7 +21,7 @@ fn sample() -> Segment {
 
 /// Byte offsets of the keys, the offsets, the multiplicities, the coded
 /// references, the times, the end of the references' data, and the four
-/// checksums in a segment snapshot (version 6: the times first, then the
+/// checksums in a segment snapshot (version 1: the times first, then the
 /// coded references, the keys, the two offsets and the multiplicities).
 fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize, usize) {
     let k = seg.key_count();
@@ -101,8 +101,8 @@ fn corruption_of(seg: &Segment) {
         Segment::read_from(bad.as_slice()),
         Err(SnapshotError::UnsupportedVersion(9))
     ));
-    // Earlier versions are not read: there is no reader for them.
-    for version in [2u8, 3, 4, 5] {
+    // No other version is read, a later one or none at all.
+    for version in [0u8, 2] {
         let mut bad = good.clone();
         bad[4] = version;
         assert!(matches!(
@@ -458,17 +458,17 @@ fn full_width_references_and_times_round_trip() {
 type Fingerprint = (usize, u64);
 
 /// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
-/// snapshots (format version 6), references packed and coded as gaps.
+/// snapshots (format version 1), references packed and coded as gaps.
 const GOLDEN: [(RefCoding, Fingerprint, Fingerprint); 2] = [
     (
         RefCoding::Packed,
-        (96_960, 14_242_011_734_919_917_638),
-        (32_096, 9_762_890_450_843_162_370),
+        (96_960, 1_463_847_483_902_720_414),
+        (32_096, 8_595_667_794_029_778_045),
     ),
     (
         RefCoding::Gaps,
-        (141_368, 5_637_219_941_371_129_125),
-        (48_912, 1_996_736_645_012_667_181),
+        (141_368, 15_643_221_215_204_798_549),
+        (48_912, 11_881_422_705_215_068_046),
     ),
 ];
 

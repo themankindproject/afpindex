@@ -153,6 +153,7 @@ impl Default for CompactionPolicy {
 
 /// The compaction [`Catalog::compaction_due`] calls for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compaction {
     /// [`Catalog::compact_deltas`]: merge every segment but the largest.
     Deltas,
