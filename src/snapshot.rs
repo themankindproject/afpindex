@@ -1,10 +1,10 @@
 //! Snapshot files (`std`): little-endian arrays behind a small header,
 //! every section 8-byte aligned, closed by checksums.
 //!
-//! Segment snapshot, version 4:
+//! Segment snapshot, version 5:
 //!
 //! ```text
-//! 0   "AFIX"            4   version u32 = 4
+//! 0   "AFIX"            4   version u32 = 5
 //! 8   ref_bits u32      12  time_bits u32
 //! 16  key_count u64     24  posting_count u64
 //! 32  min_ref u32       36  max_ref u32      (both 0 without postings)
@@ -13,7 +13,7 @@
 //!     keys    u32 × key_count                             (zero-padded to 8)
 //!     offsets u64 × (key_count + 1)
 //!     mults   u8  × key_count                             (zero-padded to 8)
-//!     checksum u64 of refs, as little-endian 64-bit words
+//!     checksum u64 of refs, as little-endian 64-bit words in four lanes
 //!     checksum u64 of times, likewise
 //!     checksum u64 of the keys and the offsets as values, then the
 //!     multiplicities as little-endian 64-bit words
@@ -36,10 +36,16 @@
 //! only once the last posting is. A reader likewise sums the two arrays
 //! apart, on two cores.
 //!
-//! Catalog snapshot, version 4 (the segments' format gave it the number):
+//! The packed arrays, nearly all of a file, are summed in four lanes:
+//! word `i` goes into lane `i % 4`, and the lanes are folded together at
+//! the end. Each lane is a chain of multiplications that waits for the
+//! one before it, so one chain runs at the latency of a multiply; four
+//! run side by side, and a load or a write sums at memory speed.
+//!
+//! Catalog snapshot, version 5 (the segments' format gave it the number):
 //!
 //! ```text
-//! 0   "AFCT"            4   version u32 = 4
+//! 0   "AFCT"            4   version u32 = 5
 //! 8   flags u32 = 0     12  reserved u32 = 0
 //! 16  reference_count u64   24  segment_count u64
 //! 32  live bitmap, one bit per id, LSB first, ceil(n / 8) bytes (zero-padded to 8)
@@ -62,7 +68,7 @@ use crate::{Catalog, Segment, SnapshotError};
 
 pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"AFIX";
 const CATALOG_MAGIC: [u8; 4] = *b"AFCT";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// Bytes before the first array of a segment snapshot.
 pub(crate) const HEADER: usize = 40;
 /// Bytes of the four checksums that close a segment snapshot.
@@ -89,7 +95,13 @@ impl Checksum {
 
     #[inline]
     pub(crate) fn word(&mut self, w: u64) {
-        self.0 = (self.0.rotate_left(29) ^ w).wrapping_mul(Self::PRIME);
+        self.0 = Self::mix(self.0, w);
+    }
+
+    /// One step of a chain: the state after `w`.
+    #[inline]
+    fn mix(state: u64, w: u64) -> u64 {
+        (state.rotate_left(29) ^ w).wrapping_mul(Self::PRIME)
     }
 
     /// Fold in `bytes` as little-endian 64-bit words, the last one
@@ -97,11 +109,10 @@ impl Checksum {
     /// calls must be cut at multiples of 8.
     pub(crate) fn words(&mut self, bytes: &[u8]) {
         let mut state = Self(self.0);
-        let mut words = bytes.chunks_exact(8);
-        for w in &mut words {
-            state.word(u64::from_le_bytes(w.try_into().expect("8 bytes")));
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &w in words {
+            state.word(u64::from_le_bytes(w));
         }
-        let rest = words.remainder();
         if !rest.is_empty() {
             let mut last = [0u8; 8];
             last[..rest.len()].copy_from_slice(rest);
@@ -118,11 +129,83 @@ impl Checksum {
     }
 }
 
-/// The checksum of a section whose bytes arrive in pieces cut anywhere:
-/// what [`Checksum::words`] gives for all of them at once.
+/// Lanes of a [`WordSum`].
+const SUM_LANES: usize = 4;
+
+/// The checksum of a packed array: its bytes as little-endian 64-bit
+/// words, the last one zero-padded, word `i` folded into lane `i % 4` by
+/// the step of [`Checksum`]; the lanes and the word count are then
+/// folded into one [`Checksum`]. Which lane a word goes into depends on
+/// its place in the array only, so bytes fed in several calls give the
+/// sum of all of them at once, as long as every call but the last feeds
+/// whole words.
+pub(crate) struct WordSum {
+    lanes: [u64; SUM_LANES],
+    /// Words folded in so far.
+    words: u64,
+}
+
+impl WordSum {
+    pub(crate) fn new() -> Self {
+        let seed = Checksum::new().0;
+        Self {
+            lanes: core::array::from_fn(|i| seed.wrapping_add(i as u64)),
+            words: 0,
+        }
+    }
+
+    #[inline]
+    fn word(&mut self, w: u64) {
+        let lane = &mut self.lanes[(self.words % SUM_LANES as u64) as usize];
+        *lane = Checksum::mix(*lane, w);
+        self.words += 1;
+    }
+
+    /// Fold in `bytes`, which start at a word boundary of the array.
+    pub(crate) fn words(&mut self, mut bytes: &[u8]) {
+        let le = |w: &[u8]| u64::from_le_bytes(w.try_into().expect("8 bytes"));
+        // One word at a time until the next word goes into the first lane.
+        while !self.words.is_multiple_of(SUM_LANES as u64) && bytes.len() >= 8 {
+            self.word(le(&bytes[..8]));
+            bytes = &bytes[8..];
+        }
+        // Then a word per lane at a time, the lanes in registers.
+        let mut lanes = self.lanes;
+        let (blocks, tail) = bytes.as_chunks::<{ 8 * SUM_LANES }>();
+        for block in blocks {
+            let (block, _) = block.as_chunks::<8>();
+            for (lane, &w) in lanes.iter_mut().zip(block) {
+                *lane = Checksum::mix(*lane, u64::from_le_bytes(w));
+            }
+        }
+        self.lanes = lanes;
+        self.words += (blocks.len() * SUM_LANES) as u64;
+        let (words, rest) = tail.as_chunks::<8>();
+        for &w in words {
+            self.word(u64::from_le_bytes(w));
+        }
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.word(u64::from_le_bytes(last));
+        }
+    }
+
+    pub(crate) fn finish(self) -> u64 {
+        let mut ck = Checksum::new();
+        for lane in self.lanes {
+            ck.word(lane);
+        }
+        ck.word(self.words);
+        ck.finish()
+    }
+}
+
+/// The checksum of a packed array whose bytes arrive in pieces cut
+/// anywhere: what [`WordSum::words`] gives for all of them at once.
 #[cfg(feature = "mmap")]
 pub(crate) struct ByteSum {
-    sum: Checksum,
+    sum: WordSum,
     /// The bytes of a word that is not whole yet.
     carry: [u8; 8],
     held: usize,
@@ -132,7 +215,7 @@ pub(crate) struct ByteSum {
 impl ByteSum {
     pub(crate) fn new() -> Self {
         Self {
-            sum: Checksum::new(),
+            sum: WordSum::new(),
             carry: [0; 8],
             held: 0,
         }
@@ -147,7 +230,7 @@ impl ByteSum {
             if self.held < 8 {
                 return;
             }
-            self.sum.word(u64::from_le_bytes(self.carry));
+            self.sum.words(&self.carry);
             self.held = 0;
         }
         let whole = bytes.len() - bytes.len() % 8;
@@ -160,7 +243,7 @@ impl ByteSum {
     pub(crate) fn finish(mut self) -> u64 {
         if self.held > 0 {
             self.carry[self.held..].fill(0);
-            self.sum.word(u64::from_le_bytes(self.carry));
+            self.sum.words(&self.carry);
         }
         self.sum.finish()
     }
@@ -222,7 +305,7 @@ pub(crate) fn index_sum(keys: &[u32], offsets: &[u64], mults: &[u8]) -> u64 {
 
 /// The checksum of a packed array's bytes.
 fn packed_sum(bytes: &[u8]) -> u64 {
-    let mut ck = Checksum::new();
+    let mut ck = WordSum::new();
     ck.words(bytes);
     ck.finish()
 }
@@ -314,8 +397,10 @@ fn read_u32s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u32>, SnapshotError> {
         grow(&mut out, take, remaining);
         out.extend(
             buf[..take * 4]
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c)),
         );
         remaining -= take;
     }
@@ -332,8 +417,10 @@ fn read_u64s<R: Read>(r: &mut R, n: usize) -> Result<Vec<u64>, SnapshotError> {
         grow(&mut out, take, remaining);
         out.extend(
             buf[..take * 8]
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))),
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&c| u64::from_le_bytes(c)),
         );
         remaining -= take;
     }
@@ -409,7 +496,7 @@ fn read_packed<R: Read>(
     r: &mut R,
     n: usize,
     bits: u32,
-    mut ck: Option<&mut Checksum>,
+    mut ck: Option<&mut WordSum>,
 ) -> Result<Packed, SnapshotError> {
     if bits > u32::BITS {
         return Err(SnapshotError::Corrupt("a width exceeds 32 bits"));
@@ -483,9 +570,9 @@ impl Head {
         let mut ck = checksum_of(self.widths, self.keys, self.postings);
         ck.word(range_word(self.range));
         let mut out = [0u8; FOOTER];
-        for (sum, bytes) in sums.iter().zip(out.chunks_exact_mut(8)) {
+        for (sum, bytes) in sums.iter().zip(out.as_chunks_mut::<8>().0) {
             ck.word(*sum);
-            bytes.copy_from_slice(&sum.to_le_bytes());
+            *bytes = sum.to_le_bytes();
         }
         out[24..].copy_from_slice(&ck.finish().to_le_bytes());
         out
@@ -608,7 +695,7 @@ fn read_segment<R: Read>(r: &mut R, check: Check) -> Result<(Segment, Ids), Snap
     let (ref_bits, time_bits) = head.widths;
     let (n_keys, n_post) = segment_counts(head.keys, head.postings)?;
     let full = check == Check::Full;
-    let (mut refs_sum, mut times_sum) = (Checksum::new(), Checksum::new());
+    let (mut refs_sum, mut times_sum) = (WordSum::new(), WordSum::new());
     let refs = read_packed(r, n_post, ref_bits, full.then_some(&mut refs_sum))?;
     read_pad(r, refs.data().len() as u64)?;
     let times = read_packed(r, n_post, time_bits, full.then_some(&mut times_sum))?;
@@ -1174,12 +1261,28 @@ mod mapped {
             segments.push((seg, ids));
             pos = next;
         }
+        at_end(&map, pos)?;
         Ok(Catalog::from_parts(segments, live))
     }
 
     pub(super) fn segment(path: &Path, check: Check) -> Result<Segment, SnapshotError> {
         let map = map_file(path)?;
-        read_segment_at(&map, 0, check).map(|(seg, _, _)| seg)
+        let (seg, _, end) = read_segment_at(&map, 0, check)?;
+        at_end(&map, end)?;
+        Ok(seg)
+    }
+
+    /// A file is one snapshot and nothing after it: a shorter snapshot
+    /// written over a longer file without cutting it, or a file someone
+    /// appended to, is refused rather than read as its first part.
+    fn at_end(map: &Mmap, end: usize) -> Result<(), SnapshotError> {
+        if end == map.len() {
+            Ok(())
+        } else {
+            Err(SnapshotError::Corrupt(
+                "bytes after the end of the snapshot",
+            ))
+        }
     }
 
     /// The segment at `path` and the range of its references.
@@ -1189,7 +1292,9 @@ mod mapped {
         populate: bool,
     ) -> Result<(Segment, Ids), SnapshotError> {
         let map = map_file_with(path, populate)?;
-        read_segment_at(&map, 0, check).map(|(seg, ids, _)| (seg, ids))
+        let (seg, ids, end) = read_segment_at(&map, 0, check)?;
+        at_end(&map, end)?;
+        Ok((seg, ids))
     }
 }
 
@@ -1430,6 +1535,20 @@ mod tests {
         assert_eq!(Segment::map_from(&path).unwrap(), seg);
         // The first byte of the references, so the arrays still describe
         // a valid segment.
+        // A byte after the end: a file that is more than the snapshot.
+        let mut longer = bytes.clone();
+        longer.push(0);
+        std::fs::write(&path, &longer).unwrap();
+        let got = Segment::map_from(&path);
+        assert!(matches!(got, Err(SnapshotError::Corrupt(_))), "{got:?}");
+        let mut catalog = Vec::new();
+        crate::Catalog::from_segment(seg.clone())
+            .write_to(&mut catalog)
+            .unwrap();
+        catalog.extend_from_slice(&[0; 8]);
+        std::fs::write(&path, &catalog).unwrap();
+        let got = crate::Catalog::map_from(&path);
+        assert!(matches!(got, Err(SnapshotError::Corrupt(_))), "{got:?}");
         bytes[HEADER] ^= 0x10;
         std::fs::write(&path, &bytes).unwrap();
         let got = Segment::map_from(&path);
@@ -1678,5 +1797,46 @@ mod tests {
         b.word(1);
         assert_ne!(a.finish(), b.finish());
         assert_ne!(Checksum::new().finish(), 0);
+    }
+
+    /// The sum of a packed array is the same however its bytes arrive:
+    /// cut at any word boundary into `WordSum`, or anywhere into
+    /// `ByteSum`, and it moves when any byte does.
+    #[test]
+    fn lane_sums_do_not_depend_on_the_cuts() {
+        let bytes: Vec<u8> = (0..1_003u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let whole = packed_sum(&bytes);
+        for cuts in [
+            &[0usize][..],
+            &[8],
+            &[8, 16],
+            &[24, 40, 64, 1_000],
+            &[32, 96, 104],
+        ] {
+            let mut sum = WordSum::new();
+            let mut at = 0;
+            for &cut in cuts {
+                sum.words(&bytes[at..cut]);
+                at = cut;
+            }
+            sum.words(&bytes[at..]);
+            assert_eq!(sum.finish(), whole, "cut at {cuts:?}");
+        }
+        #[cfg(feature = "mmap")]
+        for step in [1usize, 3, 7, 8, 13, 31, 32, 33, 500] {
+            let mut sum = ByteSum::new();
+            for piece in bytes.chunks(step) {
+                sum.feed(piece);
+            }
+            assert_eq!(sum.finish(), whole, "pieces of {step}");
+        }
+        for i in [0usize, 7, 8, 31, 32, 1_002] {
+            let mut changed = bytes.clone();
+            changed[i] ^= 1;
+            assert_ne!(packed_sum(&changed), whole, "byte {i}");
+        }
+        assert_ne!(packed_sum(&bytes[..1_000]), packed_sum(&bytes[..1_002]));
     }
 }

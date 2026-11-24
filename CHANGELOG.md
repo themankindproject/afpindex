@@ -47,8 +47,9 @@ First release: the engine of the *afpindex* design notes as a library.
   the histogram pass, both detected after the totals pass and before any
   histogram work.
 - `std` feature: `Catalog::write_to` / `read_from` and `Segment::write_to`
-  / `read_from` snapshot files (format version 4), 8-byte aligned, the
-  packed postings first and every section with a checksum of its own,
+  / `read_from` snapshot files (format version 5), 8-byte aligned, the
+  packed postings first and every section with a checksum of its own (the
+  packed arrays summed in four interleaved lanes),
   closed by one over the header words and the section checksums;
   references and times are stored packed, as in memory. A segment stores
   each run's multiplicity and its reference range next to the arrays,
@@ -79,9 +80,12 @@ First release: the engine of the *afpindex* design notes as a library.
   then deletes what the manifest no longer names, so a crash at any point
   leaves the catalog of the last `save` that returned. `map_dir` reads a
   directory without writing to it and without faulting its pages in. A
-  store removes only its own segment and temporary files, never writes a
-  segment file over an existing one, and refuses to save over a manifest
-  another writer replaced.
+  store (and a builder) holds an exclusive lock on the directory's `LOCK`
+  file while it lives, so a second one fails to open instead of removing
+  the first one's unsaved files. A store removes only its own segment and
+  temporary files, never writes a segment file over an existing one, and
+  refuses to save over a manifest another writer replaced, which guards a
+  file system that does not honour the lock.
 - `CatalogStore::builder` (`mmap`): a bulk build into a catalog directory
   in bounded memory. Rows are sorted a chunk at a time into temporary
   segment files, which `finish` merges eight at a time straight to files
@@ -101,7 +105,10 @@ First release: the engine of the *afpindex* design notes as a library.
   whose swaps do not wait for one another and which skips the hash bits a
   bucket's rows agree on, so a build holds no buffer beyond the rows and
   the segment's arrays; with `std`, the buckets are sorted on every core,
-  and so is a large directory filled, a stretch of regions per thread.
+  a build of a million postings or more is packed on every core in pieces
+  cut at hash boundaries (joined as a merge's pieces are, for the same
+  segment), and a large directory is filled a stretch of regions per
+  thread.
 - Searches arranged for memory-level parallelism without `unsafe`: the
   lookup, totals and histogram passes load their next batch of lines (32
   directory slots, every line of the next 16 runs, 32 vote groups) before
@@ -131,7 +138,7 @@ First release: the engine of the *afpindex* design notes as a library.
   which took 2.8 % of the instructions off 600 single additions of 3,000
   rows each; the same goes for a segment built from rows.
 - `no_std + alloc` core with no `unsafe` code by default; `libm` is the
-  only dependency. Minimum Rust version 1.87.
+  only dependency. Minimum Rust version 1.89.
 - Examples: `quickstart` (build, search, add, remove), `bench`
   (synthetic catalog, latency and throughput), `lifecycle` (build,
   additions, compactions, snapshots, query grouping, searches), `replay`

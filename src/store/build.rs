@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{CatalogStore, Faults, publish, sweep, write_file};
+use super::{CatalogStore, Faults, lock_dir, publish, sweep, sync_file, write_file};
 use crate::catalog::Part;
 use crate::manifest::{self, MANIFEST};
 use crate::segment::to_file::{Settings, merge_to_file};
@@ -58,6 +58,8 @@ pub struct CatalogStoreBuilder {
     next_file: u32,
     settings: Settings,
     faults: Faults,
+    /// The directory's lock, handed to the store `finish` returns.
+    lock: Option<std::fs::File>,
 }
 
 impl CatalogStore {
@@ -66,11 +68,13 @@ impl CatalogStore {
     ///
     /// # Errors
     ///
-    /// As [`CatalogStore::create`]: an I/O error, or `AlreadyExists` when
-    /// a manifest is already in `dir`.
+    /// As [`CatalogStore::create`]: an I/O error, `AlreadyExists` when a
+    /// manifest is already in `dir`, and `WouldBlock` when a store or
+    /// another builder has the directory.
     pub fn builder(dir: impl AsRef<Path>) -> Result<CatalogStoreBuilder, SnapshotError> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        let lock = lock_dir(dir)?;
         if dir.join(MANIFEST).try_exists()? {
             return Err(SnapshotError::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -87,6 +91,7 @@ impl CatalogStore {
             next_file: 0,
             settings: Settings::default(),
             faults: Faults::default(),
+            lock: Some(lock),
         })
     }
 }
@@ -140,7 +145,9 @@ impl CatalogStoreBuilder {
         }
         let file = self.take_file();
         let path = self.temp(file);
-        write_file(&mut self.faults, &path, |out| segment.write_to(out))?;
+        // A chunk is merged and deleted, or synced in `finish` when it is
+        // the only one, so it is written without a sync of its own.
+        write_file(&mut self.faults, &path, false, |out| segment.write_to(out))?;
         self.chunks.push(file);
         Ok(())
     }
@@ -174,6 +181,9 @@ impl CatalogStoreBuilder {
         let mut parts = Vec::new();
         if let Some(&file) = self.chunks.first() {
             let name = self.dir.join(manifest::segment_name(file));
+            // The chunks and the merges between them were written without
+            // a sync; the one file the manifest will name is synced here.
+            sync_file(&self.temp(file))?;
             publish(&self.temp(file), &name)?;
             self.chunks.clear();
             let mapped = map_segment(&name, true, false).map_err(|e| {
@@ -186,7 +196,8 @@ impl CatalogStoreBuilder {
             }
         }
         let catalog = Catalog::from_files(parts, alloc::vec![true; n]);
-        let mut store = CatalogStore::new(&self.dir, catalog, None, self.next_file);
+        let mut store =
+            CatalogStore::new(&self.dir, catalog, None, self.next_file, self.lock.take());
         store.settings = self.settings;
         store.faults = core::mem::take(&mut self.faults);
         if let Err(e) = store.save() {
@@ -219,6 +230,7 @@ impl CatalogStoreBuilder {
         self.faults.create()?;
         let settings = Settings {
             fail_after: self.faults.write().or(self.settings.fail_after),
+            sync: false,
             ..self.settings
         };
         let file = self.take_file();
@@ -337,6 +349,8 @@ mod tests {
                 entries
                     .flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
+                    // The lock file is the store's, not the catalog's.
+                    .filter(|name| name != crate::manifest::LOCK)
                     .collect()
             })
             .unwrap_or_default();

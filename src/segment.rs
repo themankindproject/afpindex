@@ -682,19 +682,37 @@ impl Segment {
     ///
     /// Sorts the rows in place (a radix sort on the hash, so close to linear
     /// time), drops exact duplicates, and copies them into the segment's
-    /// arrays: about `8n` bytes of arrays allocated while the `12n`-byte
+    /// packed arrays (the bits of a reference and a time per posting, about
+    /// `4n` bytes at the usual widths) and its keys, while the `12n`-byte
     /// `rows` are still alive. The rows are freed before the directory is
-    /// built.
+    /// built. With `std`, a million rows or more are sorted and packed on
+    /// every core.
     #[must_use]
     pub fn from_postings(mut rows: Vec<Posting>) -> Self {
         crate::sort::sort_postings(&mut rows);
+        // A large input is packed on every core, in pieces cut at hash
+        // boundaries; the result is the same segment.
+        #[cfg(feature = "std")]
+        let mut rows = match parallel::pack_sorted(rows) {
+            Ok(segment) => return segment,
+            Err(rows) => rows,
+        };
         rows.dedup();
-        let (max_ref, max_time) = rows
-            .iter()
-            .fold((0, 0), |(r, t), p| (r.max(p.reference), t.max(p.time)));
+        // The widths and the number of distinct hashes in one pass, so the
+        // key arrays are allocated once at their final size.
+        let (mut max_ref, mut max_time, mut keys) = (0, 0, 0usize);
+        let mut prev = None;
+        for p in &rows {
+            max_ref = max_ref.max(p.reference);
+            max_time = max_time.max(p.time);
+            if prev != Some(p.hash) {
+                keys += 1;
+                prev = Some(p.hash);
+            }
+        }
         let mut out = Writer::with_capacity(
             rows.len(),
-            0,
+            keys,
             Packed::bits_for(max_ref),
             Packed::bits_for(max_time),
         );

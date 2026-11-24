@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 
 /// The cap [`set_max_threads`] set, or 0 for none.
@@ -49,11 +49,20 @@ pub fn max_threads() -> usize {
 
 /// Hardware threads, capped, or 1 if the platform does not say.
 pub(crate) fn threads() -> usize {
-    let hardware = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let hardware = hardware();
     match MAX_THREADS.load(Ordering::Relaxed) {
         0 => hardware,
         cap => hardware.min(cap),
     }
+}
+
+/// The hardware parallelism, asked once per process. On Linux the answer
+/// takes dozens of system calls (the affinity mask and the cgroup's CPU
+/// quota), tens of microseconds that a small merge of `Catalog::add`
+/// would otherwise pay every time.
+fn hardware() -> usize {
+    static HARDWARE: OnceLock<usize> = OnceLock::new();
+    *HARDWARE.get_or_init(|| thread::available_parallelism().map_or(1, NonZeroUsize::get))
 }
 
 /// Run `task(i)` for every `i` in `0..tasks` on up to `threads` threads,

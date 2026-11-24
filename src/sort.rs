@@ -193,7 +193,7 @@ mod parallel {
 
     /// Sort the buckets of `rows` on every core: the buckets are cut into
     /// contiguous ranges holding about equal shares of the rows, and each
-    /// range is a task of the shared worker pool. The calling thread works
+    /// range is a task that [`run_tasks`] hands out. The calling thread works
     /// too, so a thread that cannot be spawned costs nothing but
     /// parallelism.
     pub(super) fn sort_buckets(rows: &mut [Posting], start: &[usize], shift: u32) {

@@ -2,12 +2,11 @@
 name         = "afpindex"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.87"
+rust-version = "1.89"
 description  = "Exact in-memory inverted index for landmark audio fingerprints: sorted postings, a radix directory and a two-pass vote search"
 license      = "MIT"
 documentation = "https://docs.rs/afpindex"
 repository   = "https://github.com/themankindproject/afpindex"
-homepage     = "https://github.com/themankindproject/afpindex"
 readme       = "README.md"
 keywords     = ["audio", "fingerprint", "inverted-index", "search", "no-std"]
 categories   = ["multimedia::audio", "data-structures", "no-std"]

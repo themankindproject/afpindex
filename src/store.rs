@@ -4,12 +4,12 @@
 //! manifest's layout is in [`crate::manifest`].
 
 use alloc::vec::Vec;
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{MergeParts, NO_FILE, Part};
-use crate::manifest::{self, Entry, MANIFEST, Manifest};
+use crate::manifest::{self, Entry, LOCK, MANIFEST, Manifest};
 use crate::segment::to_file::{Settings, merge_to_file};
 use crate::snapshot::map_segment;
 use crate::{Catalog, Segment, SnapshotError};
@@ -37,6 +37,7 @@ const RETRIES: usize = 8;
 /// the catalog:
 ///
 /// ```text
+/// <dir>/LOCK               held locked by the store that writes the directory
 /// <dir>/MANIFEST           the segments, the id space, the removals
 /// <dir>/seg-<8 hex>.afs    one segment snapshot per segment, immutable
 /// <dir>/seg-<8 hex>.tmp    a segment being written
@@ -77,10 +78,21 @@ const RETRIES: usize = 8;
 /// A store is the only writer of its directory, and the directory is the
 /// store's: [`CatalogStore::open`] and [`CatalogStore::save`] remove the
 /// segment and temporary files (the names above) that the manifest does
-/// not name, and leave files of any other name alone. Two things stand in
-/// the way of a second writer, neither of them a lock: `save` refuses to
-/// replace a manifest whose generation is not the one this store last read
-/// or wrote, and no segment file is ever written over another.
+/// not name, and leave files of any other name alone.
+///
+/// A store holds an exclusive lock on `LOCK` from the moment it is created
+/// or opened until it is dropped, and a second store on the directory, in
+/// this process or another, fails to open with a `WouldBlock` error
+/// instead of removing the files the first one has not saved yet. The
+/// operating system releases the lock when the process ends, so a crash
+/// leaves none behind. [`Catalog::map_dir`] takes no lock.
+///
+/// The lock is advisory and some network file systems do not honour it.
+/// Two more things stand in the way of a second writer there: `save`
+/// refuses to replace a manifest whose generation is not the one this
+/// store last read or wrote (it reads the generation when it starts and
+/// again right before the manifest's rename), and no segment file is ever
+/// written over another.
 #[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
 #[derive(Debug)]
 pub struct CatalogStore {
@@ -97,6 +109,11 @@ pub struct CatalogStore {
     settings: Settings,
     /// Failures a test asks for.
     faults: Faults,
+    /// The lock on the directory's `LOCK` file, held as long as the store
+    /// is; `None` only for a test of what stands in the way of a second
+    /// writer without it.
+    #[expect(dead_code, reason = "held for the lock, which goes with the handle")]
+    lock: Option<File>,
 }
 
 impl CatalogStore {
@@ -105,9 +122,10 @@ impl CatalogStore {
     ///
     /// # Errors
     ///
-    /// [`SnapshotError::Io`] when the directory cannot be made or read, and
-    /// an `AlreadyExists` error when a manifest is already in `dir`:
-    /// taking over a catalog is [`CatalogStore::open`]'s job.
+    /// [`SnapshotError::Io`] when the directory cannot be made or read, an
+    /// `AlreadyExists` error when a manifest is already in `dir` (taking
+    /// over a catalog is [`CatalogStore::open`]'s job), and a `WouldBlock`
+    /// error when another store holds the directory's lock.
     pub fn create(dir: impl AsRef<Path>) -> Result<Self, SnapshotError> {
         Self::create_from(dir, Catalog::new())
     }
@@ -125,6 +143,7 @@ impl CatalogStore {
     pub fn create_from(dir: impl AsRef<Path>, mut catalog: Catalog) -> Result<Self, SnapshotError> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        let lock = lock_dir(dir)?;
         if dir.join(MANIFEST).try_exists()? {
             return Err(SnapshotError::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -139,7 +158,7 @@ impl CatalogStore {
         for part in catalog.parts_mut() {
             part.file = NO_FILE;
         }
-        Ok(Self::new(dir, catalog, None, 0))
+        Ok(Self::new(dir, catalog, None, 0, Some(lock)))
     }
 
     /// Open the catalog of `dir` and take over as its writer.
@@ -155,9 +174,11 @@ impl CatalogStore {
     ///
     /// [`SnapshotError`] when the manifest is missing or does not read, a
     /// segment file is missing or is not the segment its entry describes,
-    /// or a checksum or structural check fails.
+    /// or a checksum or structural check fails, and a `WouldBlock` I/O
+    /// error when another store holds the directory's lock.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, SnapshotError> {
-        Self::open_with(dir.as_ref(), false)
+        let dir = dir.as_ref();
+        Self::open_with(dir, false, Some(lock_dir(dir)?))
     }
 
     /// Open `dir` as [`CatalogStore::open`] does, without the checks that
@@ -169,10 +190,21 @@ impl CatalogStore {
     /// As [`CatalogStore::open`], except checksum mismatches in the
     /// segments and unsorted runs, which go unnoticed.
     pub fn open_trusted(dir: impl AsRef<Path>) -> Result<Self, SnapshotError> {
-        Self::open_with(dir.as_ref(), true)
+        let dir = dir.as_ref();
+        Self::open_with(dir, true, Some(lock_dir(dir)?))
     }
 
-    fn open_with(dir: &Path, trusted: bool) -> Result<Self, SnapshotError> {
+    /// Open a directory without its lock, as a store on a file system
+    /// that does not honour locks would: what a test of the other guards
+    /// against a second writer opens.
+    #[cfg(test)]
+    pub(crate) fn open_unlocked(dir: &Path) -> Result<Self, SnapshotError> {
+        Self::open_with(dir, false, None)
+    }
+
+    /// The lock is taken before the directory is read, so that nothing is
+    /// swept from under a store that holds it.
+    fn open_with(dir: &Path, trusted: bool, lock: Option<File>) -> Result<Self, SnapshotError> {
         let (catalog, manifest) = load(dir, trusted)?;
         sweep(dir, &files_of(&catalog));
         Ok(Self::new(
@@ -180,10 +212,17 @@ impl CatalogStore {
             catalog,
             Some(manifest.generation),
             manifest.next_file,
+            lock,
         ))
     }
 
-    fn new(dir: &Path, catalog: Catalog, on_disk: Option<u64>, next_file: u32) -> Self {
+    fn new(
+        dir: &Path,
+        catalog: Catalog,
+        on_disk: Option<u64>,
+        next_file: u32,
+        lock: Option<File>,
+    ) -> Self {
         Self {
             dir: dir.to_path_buf(),
             catalog,
@@ -192,6 +231,7 @@ impl CatalogStore {
             spill: SPILL,
             settings: Settings::default(),
             faults: Faults::default(),
+            lock,
         }
     }
 
@@ -325,12 +365,11 @@ impl CatalogStore {
     /// store's catalog unchanged; the segment files it finished stay for
     /// the next `save`, which does not write them again.
     pub fn save(&mut self) -> io::Result<()> {
-        if disk_generation(&self.dir)? != self.on_disk {
-            return Err(io::Error::other(
-                "another writer saved this catalog directory",
-            ));
-        }
+        unchanged(&self.dir, self.on_disk)?;
         self.write_segments()?;
+        // The renames of the segment files are made durable before a
+        // manifest names them.
+        sync_dir(&self.dir)?;
         let entries = self.entries()?;
         self.put_manifest(entries)?;
         self.faults.stop_at(Stop::BeforeDeletions)?;
@@ -368,7 +407,7 @@ impl CatalogStore {
     ) -> io::Result<(Segment, Option<(u32, u32)>)> {
         let name = self.dir.join(manifest::segment_name(file));
         let temp = self.dir.join(manifest::temp_name(file));
-        write_file(&mut self.faults, &temp, |out| segment.write_to(out))?;
+        write_file(&mut self.faults, &temp, true, |out| segment.write_to(out))?;
         publish(&temp, &name)?;
         // This process wrote the file a moment ago, so it is mapped
         // without a second read of its postings.
@@ -412,10 +451,13 @@ impl CatalogStore {
             entries,
         };
         let temp = self.dir.join(manifest::MANIFEST_TEMP);
-        write_file(&mut self.faults, &temp, |out| manifest.write(out))?;
+        write_file(&mut self.faults, &temp, true, |out| manifest.write(out))?;
+        // The generation is read again right before the rename: writing the
+        // segments can take long enough for another writer to save.
         let renamed = self
             .faults
             .stop_at(Stop::AfterTempManifest)
+            .and_then(|()| unchanged(&self.dir, self.on_disk))
             .and_then(|()| fs::rename(&temp, self.dir.join(MANIFEST)));
         if let Err(e) = renamed {
             let _ = fs::remove_file(&temp);
@@ -518,6 +560,23 @@ fn map_all(
     trusted: bool,
 ) -> Result<Option<Vec<Part>>, SnapshotError> {
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+    // Every file is looked at before any is mapped: a full check of the
+    // ones before a missing or cut file would be wasted, and on a large
+    // catalog it takes seconds. Segment files never change once named, so
+    // what holds here holds for the mapping below.
+    for entry in &manifest.entries {
+        let path = dir.join(manifest::segment_name(entry.file));
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() == entry.bytes => {}
+            Ok(_) => {
+                return Err(SnapshotError::Corrupt(
+                    "a segment file is not the length its manifest entry declares",
+                ));
+            }
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
     let mut parts = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
         let path = dir.join(manifest::segment_name(entry.file));
@@ -526,13 +585,7 @@ fn map_all(
             Err(SnapshotError::Io(e)) if gone(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let bytes = match fs::metadata(&path) {
-            Ok(meta) => meta.len(),
-            Err(e) if gone(&e) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let fits = bytes == entry.bytes
-            && segment.key_count() as u64 == entry.keys
+        let fits = segment.key_count() as u64 == entry.keys
             && segment.len() as u64 == entry.postings
             && ids == entry.ids;
         if !fits {
@@ -569,6 +622,37 @@ fn disk_generation(dir: &Path) -> io::Result<Option<u64>> {
         .ok_or_else(|| io::Error::other("not a catalog manifest"))
 }
 
+/// Take the write lock of `dir`: an exclusive lock on its `LOCK` file,
+/// held for as long as the returned handle is.
+pub(crate) fn lock_dir(dir: &Path) -> Result<File, SnapshotError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LOCK))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(SnapshotError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "another store has this catalog directory open",
+        ))),
+        Err(TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// An error unless the manifest in `dir` is still at generation `on_disk`,
+/// the one this store last read or wrote.
+fn unchanged(dir: &Path, on_disk: Option<u64>) -> io::Result<()> {
+    if disk_generation(dir)? == on_disk {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "another writer saved this catalog directory",
+        ))
+    }
+}
+
 /// The segment files the parts of `catalog` have.
 fn files_of(catalog: &Catalog) -> Vec<u32> {
     catalog.parts().iter().filter_map(Part::file).collect()
@@ -596,11 +680,12 @@ fn sweep(dir: &Path, keep: &[u32]) {
     }
 }
 
-/// Create `path`, write it with `fill` and sync it; the file is removed
-/// again when any of that fails.
+/// Create `path`, write it with `fill` and, when it must be `durable`,
+/// sync it; the file is removed again when any of that fails.
 fn write_file(
     faults: &mut Faults,
     path: &Path,
+    durable: bool,
     fill: impl FnOnce(&mut BufWriter<Sink>) -> io::Result<()>,
 ) -> io::Result<()> {
     faults.create()?;
@@ -609,7 +694,10 @@ fn write_file(
         let mut out = BufWriter::with_capacity(BUFFER, Sink::new(file, after));
         fill(&mut out)?;
         let sink = out.into_inner().map_err(io::IntoInnerError::into_error)?;
-        sink.file.sync_all()
+        if durable {
+            sink.file.sync_all()?;
+        }
+        Ok(())
     });
     if written.is_err() {
         let _ = fs::remove_file(path);
@@ -632,6 +720,12 @@ fn publish(temp: &Path, name: &Path) -> io::Result<()> {
         let _ = fs::remove_file(temp);
     }
     renamed
+}
+
+/// Sync a file written without a sync of its own. Opened for writing,
+/// which some platforms need to flush a file.
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 /// Sync a directory entry, where the platform has directory handles.
@@ -858,10 +952,13 @@ mod tests {
     }
 
     /// The files of a directory by name, with their lengths.
+    /// The files of `dir` and their lengths, without the lock file, which is
+    /// the store's and not the catalog's.
     fn files(dir: &Path) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = std::fs::read_dir(dir)
             .expect("the directory")
             .flatten()
+            .filter(|e| e.file_name() != LOCK)
             .map(|e| {
                 (
                     e.file_name().to_string_lossy().into_owned(),
@@ -1165,7 +1262,7 @@ mod tests {
                 "fault {fault}: the catalog on disk"
             );
             store.save().expect("a save without the fault");
-            let opened = CatalogStore::open(&dir).expect("the directory opens");
+            let opened = CatalogStore::open_unlocked(&dir).expect("the directory opens");
             assert_eq!(state(opened.catalog()), state(store.catalog()));
         }
     }
@@ -1318,8 +1415,44 @@ mod tests {
         Catalog::map_dir(&dir).expect("the repaired directory");
     }
 
-    /// A second store on the same directory makes the first one's next
-    /// save fail, and changes nothing.
+    /// A store or builder on a directory another store holds is refused,
+    /// and the files the holder has not saved yet survive the attempt;
+    /// once the holder is gone the directory opens.
+    #[test]
+    fn a_held_directory_refuses_a_second_store() {
+        let mut rng = Rng(0x10C4_ED00);
+        let scratch = TempDir::new("held");
+        let dir = scratch.dir.join("store");
+        let mut first = small_store(&dir, &mut rng, 5, 30);
+        first.save().expect("the first save");
+        // Every merge writes a file, so the addition leaves one unsaved.
+        first.set_spill_postings(0);
+        first.add(rows(&mut rng, 30)).expect("an addition");
+        let unsaved = files(&dir);
+        let attempts = [
+            ("open", CatalogStore::open(&dir).map(drop)),
+            ("open_trusted", CatalogStore::open_trusted(&dir).map(drop)),
+            ("create", CatalogStore::create(&dir).map(drop)),
+            ("builder", CatalogStore::builder(&dir).map(drop)),
+        ];
+        for (what, attempt) in attempts {
+            match attempt {
+                Err(SnapshotError::Io(e)) => {
+                    assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{what}");
+                }
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+        assert_eq!(files(&dir), unsaved, "the holder's files");
+        first.save().expect("the holder saves");
+        let saved = state(first.catalog());
+        drop(first);
+        let reopened = CatalogStore::open(&dir).expect("the directory is free");
+        assert_eq!(state(reopened.catalog()), saved);
+    }
+
+    /// A second store on the same directory, where the lock does not hold
+    /// it off, makes the first one's next save fail, and changes nothing.
     #[test]
     fn a_second_writer_makes_the_first_save_fail() {
         let mut rng = Rng(0xB0B0_1234);
@@ -1327,7 +1460,8 @@ mod tests {
         let dir = scratch.dir.join("store");
         let mut first = small_store(&dir, &mut rng, 5, 30);
         first.save().expect("the first save");
-        let mut second = CatalogStore::open(&dir).expect("a second store");
+        // Without the lock, as on a file system that does not honour it.
+        let mut second = CatalogStore::open_unlocked(&dir).expect("a second store");
         second.add(rows(&mut rng, 30)).expect("an addition");
         second.save().expect("the second store saves");
         let before = files(&dir);
@@ -1336,7 +1470,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(files(&dir), before, "the directory");
         // And the directory is still the second store's catalog.
-        let opened = CatalogStore::open(&dir).expect("the directory opens");
+        let opened = CatalogStore::open_unlocked(&dir).expect("the directory opens");
         assert_same(opened.catalog(), second.catalog(), "the second store's");
     }
 
@@ -1350,7 +1484,8 @@ mod tests {
         let dir = scratch.dir.join("store");
         let mut first = small_store(&dir, &mut rng, 5, 30);
         first.save().expect("the first save");
-        let mut second = CatalogStore::open(&dir).expect("a second store");
+        // Without the lock, as on a file system that does not honour it.
+        let mut second = CatalogStore::open_unlocked(&dir).expect("a second store");
         second.set_spill_postings(0);
         // An addition and a compaction merge at least once, and every
         // merge of this store writes a file.
@@ -1391,8 +1526,8 @@ mod tests {
         let mut store = small_store(&dir, &mut rng, 8, 30);
         store.compact().expect("a compaction");
         store.save().expect("a save");
-        let opened = CatalogStore::open(&dir).expect("the directory opens");
-        assert_same(opened.catalog(), store.catalog(), "the new store's");
+        let opened = Catalog::map_dir(&dir).expect("the directory opens");
+        assert_same(&opened, store.catalog(), "the new store's");
         assert_eq!(files(&dir).len(), 2, "the manifest and one segment");
     }
 
@@ -1494,6 +1629,7 @@ mod tests {
         let mut store = CatalogStore::create(&dir).expect("a fresh directory");
         store.add(rows(&mut rng, 20)).expect("an addition");
         store.save().expect("the save");
+        drop(store);
         let err = CatalogStore::create(&dir).expect_err("the catalog is there");
         assert!(matches!(err, SnapshotError::Io(e) if e.kind() == io::ErrorKind::AlreadyExists));
         CatalogStore::create_from(&dir, Catalog::new()).expect_err("and stays there");
@@ -1532,6 +1668,7 @@ mod tests {
         store.compact().expect("the compaction");
         assert_eq!(store.catalog().segment_count(), 0);
         store.save().expect("the save");
+        drop(store);
         let opened = CatalogStore::open(&dir).expect("the directory opens");
         assert_eq!(opened.catalog().segment_count(), 0);
         assert_eq!(opened.catalog().reference_count(), 6);

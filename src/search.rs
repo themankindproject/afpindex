@@ -42,8 +42,12 @@ pub struct SearchOptions {
     /// (`NoiseStats::bins` still counts them). Default 10.
     pub min_noise_bins: usize,
     /// Most votes the survivors of one search may scatter in total; the
-    /// histogram pass holds 16 bytes per vote. Exceeding it returns
-    /// [`SearchError::TooManyVotes`]. Default `1 << 26` (about 1 GiB).
+    /// histogram pass holds 16 bytes per vote and 32 per group of a
+    /// survivor's postings in one run, so 48 bytes per vote at worst, when
+    /// every posting is a group of its own. Exceeding it returns
+    /// [`SearchError::TooManyVotes`]. Default `1 << 26` (about 1 GiB of
+    /// votes, up to 3 GiB with the groups). The scratch keeps what a search
+    /// grew; [`Scratch::shrink_to_fit`] gives it back.
     pub max_votes: usize,
 }
 
@@ -246,6 +250,8 @@ struct RunLoc {
     hi: usize,
     /// Most postings any one reference has in the run (saturating).
     mult: u8,
+    /// Query times of the hash: the vote weight of a posting.
+    weight: u32,
 }
 
 /// Per-thread buffers a search reuses.
@@ -261,7 +267,10 @@ struct RunLoc {
 /// segment handles it collects on every search; [`Catalog::search`] also
 /// allocates its result. One scratch serves any number of catalogs.
 /// Searches leave it clean, including on an error, and so does a panic
-/// inside a visitor.
+/// inside a visitor. A search that panics part-way, which a damaged
+/// catalog loaded without its checks can cause, leaves counters behind;
+/// the scratch remembers that, and the next search clears every counter
+/// before it counts.
 #[derive(Default)]
 pub struct Scratch {
     /// Vote total per reference during the totals pass; survivor index
@@ -282,6 +291,10 @@ pub struct Scratch {
     cursor: Vec<usize>,
     votes: Vec<(i64, u32)>,
     bins: Vec<Bin>,
+    /// Set while a search may have counters, marks or survivor bits
+    /// written, cleared once it has reset them: still set at the next
+    /// search only if a search stopped by panicking in between.
+    dirty: bool,
 }
 
 impl Scratch {
@@ -313,6 +326,12 @@ impl Scratch {
     }
 
     fn fit(&mut self, n_refs: usize) {
+        if self.dirty {
+            self.totals.fill(0);
+            self.touched.fill(0);
+            self.survivor_bits.fill(0);
+            self.dirty = false;
+        }
         if self.totals.len() < n_refs {
             self.totals.resize(n_refs, 0);
             self.touched.resize(n_refs.div_ceil(SCAN_BLOCK), 0);
@@ -359,6 +378,10 @@ const RING: usize = 64;
 /// votes and are not located.
 fn locate(segments: &[&Segment], query: &Query, runs: &mut Vec<RunLoc>) {
     runs.clear();
+    // A hash keeps no times only when the cap is zero, and then none does.
+    if query.is_empty() {
+        return;
+    }
     let hashes = query.hashes();
     let n = hashes.len();
     for (si, seg) in segments.iter().enumerate() {
@@ -368,9 +391,6 @@ fn locate(segments: &[&Segment], query: &Query, runs: &mut Vec<RunLoc>) {
             seg.touch_directory(&hashes[end..(end + LOOKUP_BATCH).min(n)]);
             for (i, &hash) in hashes[k..end].iter().enumerate() {
                 let qi = k + i;
-                if query.times(qi).is_empty() {
-                    continue;
-                }
                 if let Some((lo, hi, mult)) = seg.range_mult(hash) {
                     runs.push(RunLoc {
                         segment: si as u32,
@@ -378,6 +398,7 @@ fn locate(segments: &[&Segment], query: &Query, runs: &mut Vec<RunLoc>) {
                         lo,
                         hi,
                         mult,
+                        weight: u32::try_from(query.times(qi).len()).unwrap_or(u32::MAX),
                     });
                 }
             }
@@ -466,36 +487,39 @@ impl<'a, M: Marks> Counters<'a, M> {
 fn totals_pass<'a, M: Marks>(
     counters: Counters<'a, M>,
     segments: &'a [&'a Segment],
-    query: &'a Query,
     fanout: Option<usize>,
     runs: &'a [RunLoc],
 ) {
+    // No reference has more than `mult` postings in a run (unless that is
+    // saturated), and no more than `fanout` of them vote, so a counter
+    // gains at most this much from each run.
+    let cap = fanout.unwrap_or(usize::MAX);
     let bound = runs.iter().fold(0u64, |b, run| {
-        b.saturating_add((run.hi - run.lo) as u64 * u64::from(query_count(query, run)))
+        let most = if run.mult == u8::MAX {
+            usize::MAX
+        } else {
+            usize::from(run.mult)
+        };
+        let per_reference = (run.hi - run.lo).min(cap).min(most) as u64;
+        b.saturating_add(per_reference.saturating_mul(u64::from(run.weight)))
     });
     if u32::try_from(bound).is_ok() {
         simd::run(CountPlain {
             segments,
-            query,
             fanout,
             runs,
             counters,
         });
     } else {
-        count_direct(segments, query, fanout, runs, counters);
+        count_direct(segments, fanout, runs, counters);
     }
-}
-
-/// Query times of a run's hash, as a vote weight.
-fn query_count(query: &Query, run: &RunLoc) -> u32 {
-    u32::try_from(query.times(run.hash as usize).len()).unwrap_or(u32::MAX)
 }
 
 /// The body of [`for_each_run`], and of its copy inside a block-decoding
 /// pass.
 macro_rules! for_each_run {
-    ($segments:expr, $query:expr, $runs:expr, $reach:expr, $visit:expr) => {{
-        let (segments, query, runs): (&[&Segment], &Query, &[RunLoc]) = ($segments, $query, $runs);
+    ($segments:expr, $runs:expr, $reach:expr, $visit:expr) => {{
+        let (segments, runs): (&[&Segment], &[RunLoc]) = ($segments, $runs);
         let mut visit = $visit;
         let n = runs.len();
         let touch = |from: usize, to: usize| {
@@ -512,7 +536,7 @@ macro_rules! for_each_run {
                     segments[run.segment as usize].refs(),
                     run.lo,
                     run.hi,
-                    query_count(query, run),
+                    run.weight,
                     run.mult,
                 );
             }
@@ -524,12 +548,11 @@ macro_rules! for_each_run {
 /// is loaded while the batch before it is visited.
 fn for_each_run(
     segments: &[&Segment],
-    query: &Query,
     runs: &[RunLoc],
     visit: impl FnMut(&Packed, usize, usize, u32, u8),
 ) {
     // One value at a time reads 8 bytes from the byte a value starts in.
-    for_each_run!(segments, query, runs, Packed::SLACK, visit);
+    for_each_run!(segments, runs, Packed::SLACK, visit);
 }
 
 /// The plain totals pass over one run: `$whole` reads a run in which
@@ -595,7 +618,6 @@ fn whole_below(fanout: Option<usize>) -> usize {
 /// The totals pass with plain adds.
 struct CountPlain<'a, M: Marks> {
     segments: &'a [&'a Segment],
-    query: &'a Query,
     fanout: Option<usize>,
     runs: &'a [RunLoc],
     counters: Counters<'a, M>,
@@ -612,13 +634,12 @@ impl<M: Marks> Pass for CountPlain<'_, M> {
     fn run<D: Decoder>(self, decoder: D) {
         let Self {
             segments,
-            query,
             fanout,
             runs,
             mut counters,
         } = self;
         if !D::BLOCKS {
-            return count_plain(segments, query, fanout, runs, counters);
+            return count_plain(segments, fanout, runs, counters);
         }
         let CounterParts { totals, marks } = counters.parts();
         let each = |refs: &Packed,
@@ -643,7 +664,6 @@ impl<M: Marks> Pass for CountPlain<'_, M> {
         // A block reads a window from the byte its first value starts in.
         for_each_run!(
             segments,
-            query,
             runs,
             simd::WINDOW - 1,
             count_run!(fanout, whole_below(fanout), totals, marks, each)
@@ -654,7 +674,6 @@ impl<M: Marks> Pass for CountPlain<'_, M> {
 /// Count every run with plain adds, decoding each run as a stream.
 fn count_plain<M: Marks>(
     segments: &[&Segment],
-    query: &Query,
     fanout: Option<usize>,
     runs: &[RunLoc],
     mut counters: Counters<'_, M>,
@@ -673,7 +692,6 @@ fn count_plain<M: Marks>(
     };
     for_each_run(
         segments,
-        query,
         runs,
         count_run!(fanout, whole_below(fanout), totals, marks, each),
     );
@@ -684,13 +702,12 @@ fn count_plain<M: Marks>(
 /// `i − fanout` has the same reference.
 fn count_direct<M: Marks>(
     segments: &[&Segment],
-    query: &Query,
     fanout: Option<usize>,
     runs: &[RunLoc],
     mut counters: Counters<'_, M>,
 ) {
     let CounterParts { totals, marks } = counters.parts();
-    for_each_run(segments, query, runs, |refs, lo, hi, qc, _| match fanout {
+    for_each_run(segments, runs, |refs, lo, hi, qc, _| match fanout {
         Some(f) => {
             let head = lo + (hi - lo).min(f);
             for i in lo..head {
@@ -777,27 +794,28 @@ fn first_not_below<D: Decoder>(
     r: u32,
     decoder: D,
 ) -> usize {
-    if hi - lo >= Packed::BLOCK_MIN && hi - lo <= SCAN {
-        if let Some(mut blocks) = refs.blocks(lo, decoder) {
-            while lo < hi {
-                let Some(block) = blocks.next() else {
-                    return refs.partition_point(lo, hi, |x| x < r);
-                };
-                let n = (hi - lo).min(LANES);
-                // Ascending, so the entries below `r` are the block's
-                // first ones and their count is where `r` belongs.
-                let below = block
-                    .iter()
-                    .enumerate()
-                    .filter(|&(lane, &x)| lane < n && x < r)
-                    .count();
-                lo += below;
-                if below < n {
-                    break;
-                }
+    if hi - lo >= Packed::BLOCK_MIN
+        && hi - lo <= SCAN
+        && let Some(mut blocks) = refs.blocks(lo, decoder)
+    {
+        while lo < hi {
+            let Some(block) = blocks.next() else {
+                return refs.partition_point(lo, hi, |x| x < r);
+            };
+            let n = (hi - lo).min(LANES);
+            // Ascending, so the entries below `r` are the block's
+            // first ones and their count is where `r` belongs.
+            let below = block
+                .iter()
+                .enumerate()
+                .filter(|&(lane, &x)| lane < n && x < r)
+                .count();
+            lo += below;
+            if below < n {
+                break;
             }
-            return lo;
         }
+        return lo;
     }
     refs.partition_point(lo, hi, |x| x < r)
 }
@@ -1035,6 +1053,7 @@ impl Catalog {
             cursor,
             votes,
             bins,
+            dirty,
         } = scratch;
         let totals = &mut totals[..n_refs];
         let n_blocks = n_refs.div_ceil(SCAN_BLOCK);
@@ -1058,9 +1077,9 @@ impl Catalog {
             postings < n_blocks
         });
         let floor = options.min_total_votes.max(1);
-        self.count_and_take(
+        *dirty = true;
+        let taken = self.count_and_take(
             segments,
-            query,
             fanout,
             runs,
             totals,
@@ -1070,7 +1089,11 @@ impl Catalog {
             floor,
             survivors,
             survivor_totals,
-        )?;
+        );
+        // The counters are clean again, whether or not the pass found an
+        // overflow.
+        *dirty = false;
+        taken?;
         if survivors.is_empty() {
             return Ok(());
         }
@@ -1090,6 +1113,7 @@ impl Catalog {
         // the survivor indices (plus one) until the scatter is done.
         slots.clear();
         slots.push(0);
+        *dirty = true;
         for (i, &r) in survivors.iter().enumerate() {
             totals[r as usize] = i as u32 + 1;
             survivor_bits[(r >> 6) as usize] |= 1u64 << (r & 63);
@@ -1118,6 +1142,7 @@ impl Catalog {
             totals[r as usize] = 0;
             survivor_bits[(r >> 6) as usize] &= !(1u64 << (r & 63));
         }
+        *dirty = false;
 
         for (sv, &r) in survivors.iter().enumerate() {
             debug_assert_eq!(cursor[sv], slots[sv + 1], "scatter count mismatch");
@@ -1139,7 +1164,6 @@ impl Catalog {
     fn count_and_take(
         &self,
         segments: &[&Segment],
-        query: &Query,
         fanout: Option<usize>,
         runs: &[RunLoc],
         totals: &mut [u32],
@@ -1159,7 +1183,6 @@ impl Catalog {
                     marks: &mut touched[..n_blocks],
                 },
                 segments,
-                query,
                 fanout,
                 runs,
             );
@@ -1174,7 +1197,6 @@ impl Catalog {
             totals_pass(
                 Counters::<ScanAll> { totals, marks: () },
                 segments,
-                query,
                 fanout,
                 runs,
             );
@@ -1200,12 +1222,7 @@ impl Catalog {
         survivor_totals.clear();
         let mut scratch = SurvivorScan::new(survivors, survivor_totals);
         for (b, block) in totals.chunks_mut(SCAN_BLOCK).enumerate() {
-            let any = block.iter().fold(0u32, |m, &t| m | t);
-            if any == 0 {
-                continue;
-            }
-            self.collect_block(b, block, any, floor, &mut scratch);
-            block.fill(0);
+            self.drain_block(b, block, floor, &mut scratch);
         }
         scratch.finish()
     }
@@ -1231,8 +1248,8 @@ impl Catalog {
         // `k` marks block `8 * w + k / 8`.
         let whole = touched.len() / size_of::<u64>() * size_of::<u64>();
         let (words, rest) = touched.split_at_mut(whole);
-        for (w, word) in words.chunks_exact_mut(size_of::<u64>()).enumerate() {
-            let mut set = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+        for (w, word) in words.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let mut set = u64::from_le_bytes(*word);
             if set == 0 {
                 continue;
             }
@@ -1266,11 +1283,26 @@ impl Catalog {
         let lo = b * SCAN_BLOCK;
         assert!(lo < totals.len(), "block {b} is past the counters");
         let hi = (lo + SCAN_BLOCK).min(totals.len());
-        let block = &mut totals[lo..hi];
-        let any = block.iter().fold(0u32, |m, &t| m | t);
-        if any != 0 {
-            self.collect_block(b, block, any, floor, scan);
-            block.fill(0);
+        self.drain_block(b, &mut totals[lo..hi], floor, scan);
+    }
+
+    /// Collect the survivors of block `b` and zero it. A full block is
+    /// an array of known length, so the zeroing is plain stores.
+    #[inline]
+    fn drain_block(&self, b: usize, block: &mut [u32], floor: u32, scan: &mut SurvivorScan<'_>) {
+        if block.len() == SCAN_BLOCK {
+            let block: &mut [u32; SCAN_BLOCK] = block.try_into().expect("a full block");
+            let any = block.iter().fold(0u32, |m, &t| m | t);
+            if any != 0 {
+                self.collect_block(b, block, any, floor, scan);
+                *block = [0; SCAN_BLOCK];
+            }
+        } else {
+            let any = block.iter().fold(0u32, |m, &t| m | t);
+            if any != 0 {
+                self.collect_block(b, block, any, floor, scan);
+                block.fill(0);
+            }
         }
     }
 
@@ -1561,7 +1593,6 @@ mod tests {
             let (mut scalar, mut picked) = (vec![0u32; n_refs], vec![0u32; n_refs]);
             let pass = |totals| CountPlain {
                 segments: &segments,
-                query: &query,
                 fanout,
                 runs: &runs,
                 counters: Counters::<ScanAll> { totals, marks: () },
@@ -1703,7 +1734,6 @@ mod tests {
                 marks: &mut touched,
             },
             &segments,
-            query,
             options.fanout,
             &runs,
         );
@@ -2216,5 +2246,42 @@ mod tests {
         let blocks = n.div_ceil(SCAN_BLOCK);
         assert_eq!(scratch.touched[..blocks], alloc::vec![0u8; blocks]);
         assert!(scratch.survivor_bits.iter().all(|&b| b == 0));
+    }
+
+    /// A search that panics in the totals pass, as one over a damaged
+    /// catalog loaded without its checks does, leaves counters behind; the
+    /// next search on the same scratch still counts from zero.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_panic_in_the_totals_pass_does_not_leak_into_the_next_search() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        // References 0 to 39 in a catalog that says it holds ten ids: what
+        // a flipped bit in a trusted snapshot can give.
+        let rows: Vec<Posting> = (0..40u32).map(|r| Posting::new(1, r, 0)).collect();
+        let damaged = Catalog::from_parts(
+            vec![(Segment::from_postings(rows), Some((0, 9)))],
+            vec![true; 10],
+        );
+        let mut healthy = Catalog::new();
+        for _ in 0..10 {
+            healthy.add([(1, 0), (2, 0)]);
+        }
+        let query = Query::from_pairs([(1, 0), (2, 0)], None);
+        let options = SearchOptions {
+            min_total_votes: 1,
+            ..SearchOptions::default()
+        };
+        let expected = healthy
+            .search(&query, &options, &mut Scratch::new())
+            .expect("healthy search");
+        let mut scratch = Scratch::new();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            damaged.search(&query, &options, &mut scratch)
+        }));
+        assert!(outcome.is_err(), "the damaged catalog panics");
+        let got = healthy
+            .search(&query, &options, &mut scratch)
+            .expect("search after the panic");
+        assert_eq!(got, expected);
     }
 }

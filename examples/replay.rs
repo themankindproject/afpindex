@@ -28,15 +28,19 @@ type Clip = (String, usize, Query, SearchOptions);
 
 fn read_u32s(p: &Path) -> Vec<u32> {
     let b = std::fs::read(p).unwrap();
-    b.chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| u32::from_le_bytes(c))
         .collect()
 }
 
 fn read_u64s(p: &Path) -> Vec<u64> {
     let b = std::fs::read(p).unwrap();
-    b.chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+    b.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&c| u64::from_le_bytes(c))
         .collect()
 }
 
@@ -68,12 +72,16 @@ fn load_rows(snap: &Path) -> Vec<Posting> {
         let m = chunk.min(n - i);
         rf.read_exact(&mut rb[..m * 4]).unwrap();
         tf.read_exact(&mut tb[..m * 4]).unwrap();
-        for (rc, tc) in rb[..m * 4].chunks_exact(4).zip(tb[..m * 4].chunks_exact(4)) {
+        let (refs, times) = (
+            rb[..m * 4].as_chunks::<4>().0,
+            tb[..m * 4].as_chunks::<4>().0,
+        );
+        for (&rc, &tc) in refs.iter().zip(times) {
             while offsets[k + 1] as usize <= i {
                 k += 1;
             }
-            let r = u32::from_le_bytes(rc.try_into().unwrap());
-            let tm = u32::from_le_bytes(tc.try_into().unwrap());
+            let r = u32::from_le_bytes(rc);
+            let tm = u32::from_le_bytes(tc);
             rows.push(Posting::new(keys[k], r, tm));
             i += 1;
         }
@@ -220,7 +228,9 @@ fn main() {
         let cat = if mmap {
             map_catalog(&afc, trusted)
         } else {
-            let file = BufReader::with_capacity(1 << 23, File::open(&afc).unwrap());
+            // The reader reads in large blocks of its own; a `BufReader`
+            // would only copy every byte once more.
+            let file = File::open(&afc).unwrap();
             if trusted {
                 Catalog::read_from_trusted(file).unwrap()
             } else {

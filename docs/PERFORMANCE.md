@@ -26,6 +26,8 @@ by about 10 %, so compare columns within one table only.
 - [Trusted loads](#trusted-loads)
 - [Merging straight into a file](#merging-straight-into-a-file)
 - [A catalog in a directory](#a-catalog-in-a-directory)
+- [Survivor blocks, run weights and the overflow bound](#survivor-blocks-run-weights-and-the-overflow-bound)
+- [Packing a build on every core](#packing-a-build-on-every-core)
 - [Allocators and huge pages](#allocators-and-huge-pages)
 - [Reproducing](#reproducing)
 
@@ -698,6 +700,71 @@ The piece of a merge holds whole runs, so the memory of a merge to a file
 is also bounded from below by the longest run among its inputs: a hash
 with many postings is merged inside one piece whatever the threshold.
 
+
+## Survivor blocks, run weights and the overflow bound
+
+Three changes to a search, measured with `examples/profile.rs` under
+callgrind, `simd` and `mmap` build, 120 searches each, against the tree
+before them on the same host; every run returned the same candidates:
+
+| catalog | before | after | change |
+|---|---|---|---|
+| 120,000 references, 133 postings per hash, 750-row query | 177,601,905 | 169,580,776 | −4.5 % |
+| 20,000 references, 17 per hash, 800-row query | 81,206,438 | 77,062,145 | −5.1 % |
+| the same after 300 additions, 6 segments | 121,603,812 | 108,129,298 | −11.1 % |
+| 2,000,000 references, 30-row query | 21,270,841 | 14,815,695 | −30.3 % |
+| 2,000,000 references, 800-row query | 277,582,552 | 224,067,784 | −19.3 % |
+
+**Whole blocks of counters.** The survivor scan reduced and cleared each
+block of 64 counters through a slice of unknown length, which compiles to
+a loop that is not unrolled and a call to `memset`: about 230
+instructions per block. A full block is now taken as an array, so both
+are straight-line code. That is most of the gain on the catalog of two
+million references, whose short queries write a few hundred blocks.
+
+**Run weights.** A hash's vote weight, its number of query times, was
+looked up again for every run in every segment, and every lookup first
+tested whether the hash kept any time at all. A hash keeps none only when
+the per-hash cap is zero, and then none does, so one test before the
+lookups replaces the one per lookup, and the weight is stored with the
+run when it is located. The lookups are the part of a search that grows
+with the number of segments, hence the 11 % with six.
+
+**The overflow bound.** The totals pass counts with plain adds when no
+counter can overflow, and with saturating adds, four times the
+instructions and no vector decoding, when one might. The bound summed
+each run's postings times its weight, ignoring that a reference gains at
+most `min(multiplicity, fanout)` postings from a run; a query that
+repeats a hash of a long run could take the slow path for counters that
+reach a hundred thousand. The bound now takes the multiplicity and the
+fanout into account. None of the runs above reached the slow path, so
+the table does not show it.
+
+Checked and left out: masking the counter index (`totals[r & (n - 1)]`
+on a power-of-two array) to drop the bounds check of the totals pass,
+4 instructions per posting and a quarter of a search; LLVM keeps the
+check in a standalone build of the loop, and removing it takes `unsafe`. An interpolation guess for a survivor's group in a run was
+estimated at 3 % at most (the binary search is 9 % of a search on the
+real-like catalog) and not built.
+
+## Packing a build on every core
+
+`Segment::from_postings` sorted on every core, but after the sort it
+removed duplicates, found the widths and packed every row on one thread.
+Under callgrind, a build of 6 M postings (`profile build 20000 300
+360000`) spent 1.59 G instructions in `from_postings`, of which 0.75 G
+were the bucket sort that runs on every core: the other half ran on one.
+
+A build of a million rows or more now cuts the sorted rows at hash
+boundaries, as a merge cuts its sources, finds the widths and each
+piece's distinct hashes in one pass on every core, packs each piece on
+its own, and copies the pieces into place with the join of the parallel
+merge. A run and its duplicates, which the sort put side by side, stay in
+one piece, so the result is the segment one thread builds, byte for byte;
+the snapshots written by the two builds of the synthetic catalog of 60 M
+postings have the same checksum. The pieces in flight add about 2 % to
+the peak of a build. Wall-clock numbers for this belong to the AWS host
+and are not measured yet.
 
 ## Allocators and huge pages
 

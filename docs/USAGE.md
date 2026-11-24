@@ -252,7 +252,8 @@ pub fn build(references: &[Vec<(u32, u32)>]) -> Catalog {
 
 The builder collects postings (12 bytes each, up to twice that while its
 vector grows) and sorts them once, in place, with a radix sort on the hash; with `std`, the buckets of that
-sort are sorted on every core. The segment's arrays (about 8 bytes per
+sort are sorted on every core, and a build of a million postings or more
+is then packed on every core too, in pieces cut at hash boundaries. The segment's arrays (about 8 bytes per
 posting before packing) are allocated while the collected rows are still
 alive, so peak memory is about 20 bytes per posting during `build`, then
 drops to the packed size. 60 M postings build in 2.4–2.7 s; the real
@@ -395,7 +396,7 @@ fields.
 | `min_total_votes` | `1` | The vote floor: a reference needs this many votes in total to survive. `0` and `1` are equivalent. | The most important knob. Too low and chance matches pay for histograms (slow, many weak candidates); too high and short or noisy true matches are lost. Use `vote_floor`. |
 | `offset_tolerance` | `2` | Bins within `±offset_tolerance` frames of the best Δ are left out of the noise statistics. | At 62.5 frames per second, 2 frames is ±32 ms. Raise it if true matches smear over neighbouring bins (resampling, slight drift). Does not change `votes`. |
 | `min_noise_bins` | `10` | With fewer noise bins than this, the noise mean, deviation and max are reported as `0`. | Avoids statistics from a handful of bins. `noise.bins` always counts them. |
-| `max_votes` | `1 << 26` | Most votes the survivors of one search may scatter; the histogram holds 16 bytes per vote (default about 1 GiB). Exceeding it returns `TooManyVotes`. | A guard against a query with a floor so low that the histogram would exhaust memory. Lower it on small machines. |
+| `max_votes` | `1 << 26` | Most votes the survivors of one search may scatter; the histogram holds 16 bytes per vote and 32 per group, and in the worst case (every posting its own group) 48 bytes per vote: about 1 GiB at the default, up to 3 GiB. Exceeding it returns `TooManyVotes`. | A guard against a query with a floor so low that the histogram would exhaust memory. Lower it on small machines. |
 
 Together, the query's `max_times_per_hash` and the `fanout` bound the
 votes one `(hash, reference)` pair can cast: `times × min(fanout,
@@ -692,7 +693,10 @@ removes the cap makes every other thread's compactions and loads run
 single-threaded while the cap holds. Set it once, before work starts; a
 process that wants different caps for different kinds of work has to
 serialize the changes itself. `set_max_threads(1)` keeps every sort,
-merge, directory fill and load on the calling thread.
+merge, directory fill and load on the calling thread. The hardware
+parallelism itself is asked once per process (on Linux that takes dozens
+of system calls), so a CPU quota changed while the process runs is not
+seen: set a cap to follow it.
 
 The cap changes only how many threads a pass takes, never what it
 computes: the same segment, the same loaded catalog and the same
@@ -801,7 +805,7 @@ maps them.
 
 ```rust
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufWriter;
 use std::path::Path;
 
 use afpindex::{Catalog, SnapshotError};
@@ -824,7 +828,7 @@ pub fn save(catalog: &Catalog, path: &Path) -> std::io::Result<()> {
 
 /// Read a snapshot into memory.
 pub fn load(path: &Path) -> Result<Catalog, SnapshotError> {
-    Catalog::read_from(BufReader::with_capacity(1 << 23, File::open(path)?))
+    Catalog::read_from(File::open(path)?)
 }
 
 /// Map a snapshot instead (`mmap` feature).
@@ -839,14 +843,17 @@ next `add` returns the id it would have returned before. Call `compact`
 first to leave removed postings out. `Segment::write_to`, `read_from` and
 `map_from` do the same for one segment.
 
-Use a large buffer (8 MiB above): the reader and writer move gigabytes.
+Give the writer a large buffer (8 MiB above): it moves gigabytes. The
+reader reads in large blocks of its own straight into the catalog's
+arrays, so hand it the file itself: a `BufReader` around it only adds a
+copy of every byte.
 
 ### What a load checks
 
 Reading verifies, before the catalog is usable:
 
 - the magic (`AFCT` for a catalog, `AFIX` for a segment) and the format
-  version (3);
+  version (5);
 - a checksum over the header and every array;
 - that the arrays describe a valid segment: keys ascending, offsets
   consistent, each run sorted by `(reference, time)` without duplicates,
@@ -929,7 +936,7 @@ anyway).
 
 ### The format
 
-Both formats are version 4: little-endian arrays behind a header, every
+Both formats are version 5: little-endian arrays behind a header, every
 section 8-byte aligned, closed by checksums. References and times are
 stored packed as they are in memory, so a file is about the size of the
 catalog. A file of an earlier version is refused with
@@ -938,7 +945,7 @@ the catalog out again with the current version.
 
 ```text
 Segment snapshot
-0   "AFIX"            4   version u32 = 4
+0   "AFIX"            4   version u32 = 5
 8   ref_bits u32      12  time_bits u32
 16  key_count u64     24  posting_count u64
 32  min_ref u32       36  max_ref u32      (both 0 without postings)
@@ -947,13 +954,13 @@ Segment snapshot
     keys    u32 × key_count                             (zero-padded to 8)
     offsets u64 × (key_count + 1)
     mults   u8  × key_count                             (zero-padded to 8)
-    checksum u64 of refs
-    checksum u64 of times
+    checksum u64 of refs, in four lanes
+    checksum u64 of times, in four lanes
     checksum u64 of keys, offsets and mults
     checksum u64 of the header and the three checksums before it
 
 Catalog snapshot
-0   "AFCT"            4   version u32 = 4
+0   "AFCT"            4   version u32 = 5
 8   flags u32 = 0     12  reserved u32 = 0
 16  reference_count u64   24  segment_count u64
 32  live bitmap, one bit per id, LSB first              (zero-padded to 8)
@@ -967,7 +974,10 @@ side by side, each summed as it is written, and the counts and the index
 are known, and written, only once the last posting is. A load checks the
 last checksum and the index's on every load, trusted or not, since they
 read no posting; a full load also sums the two packed arrays, on two
-cores of a mapped file.
+cores of a mapped file. The packed arrays are summed in four interleaved
+lanes (word `i` of an array goes into lane `i % 4`), so that the sum
+runs at memory speed rather than at the latency of one multiplication
+per word.
 
 `mults` is, per key, what the directory records of its run: the most
 postings any one reference has in it, saturating at 255. `min_ref` and
@@ -1117,11 +1127,17 @@ per distinct hash each); neither grows with the number of postings.
 directory, and the directory is the store's: `open` and `save` remove the
 segment and temporary files (the names above) that the manifest does not
 name, which is what a crash or a replaced segment leaves behind. Files of
-any other name are left alone. Nothing locks the directory. Two things
-stand in the way of a second writer instead: `save` refuses to replace a
-manifest whose generation is not the one this store read or wrote last,
-and a store never writes a segment file over an existing one, so the
-store that comes second gets an error and the catalog on disk stays whole.
+any other name are left alone. A store, and a builder, hold an exclusive
+lock on the directory's `LOCK` file for as long as they live, so a second
+one, in the same process or another, fails to open with a `WouldBlock`
+error rather than removing the files the first has not saved yet. The
+lock goes with the process, so a crash leaves none behind; a new process
+in a rolling deploy waits for the old one to drop its store (or exit)
+before it opens the directory. `map_dir` takes no lock. Where locks are
+not honoured (some network file systems), two more guards hold: `save`
+refuses to replace a manifest whose generation is not the one this store
+read or wrote last, and a store never writes a segment file over an
+existing one.
 
 **The pages are not faulted in.** `map_dir` and the store map their
 segments without asking the kernel to populate them, so opening a catalog
@@ -1227,7 +1243,7 @@ clean.
 | Variant | Cause | What to do |
 |---|---|---|
 | `TotalsOverflow { reference }` | A live reference's total reached `u32::MAX` | Cap the query's times per hash, lower the fanout, or split the query. Only absurd queries get here (billions of votes). |
-| `TooManyVotes { votes, max }` | The survivors would scatter more than `max_votes` votes (16 bytes each) | Raise the floor (usually the floor is far too low), lower the fanout, or raise `max_votes` if the memory is there |
+| `TooManyVotes { votes, max }` | The survivors would scatter more than `max_votes` votes (16 to 48 bytes each) | Raise the floor (usually the floor is far too low), lower the fanout, or raise `max_votes` if the memory is there |
 
 ```rust
 use afpindex::{Candidate, Catalog, Query, Scratch, SearchError, SearchOptions};
@@ -1315,7 +1331,7 @@ Segments are shared through `Arc` on targets with atomic pointers and
 is tested on 32-bit x86, where `Catalog::from_segment` with the id
 `u32::MAX` would not fit `usize` and panics.
 
-**Minimum Rust version** 1.87 for the library. `examples/audiofp.rs`
+**Minimum Rust version** 1.89 for the library. `examples/audiofp.rs`
 needs 1.93 (its dev-dependency `audiofp` does).
 
 ---

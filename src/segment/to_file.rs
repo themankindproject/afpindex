@@ -72,20 +72,27 @@ pub(crate) struct Written {
 /// use to reach the error paths.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Settings {
-    /// Threads the pieces merge on.
+    /// Threads the pieces merge on, or 0 for what [`crate::par::threads`]
+    /// says when the merge starts, so that a cap set after a store opened
+    /// still holds for its merges.
     pub(crate) threads: usize,
     /// Postings of input a piece holds at most.
     pub(crate) piece: usize,
     /// Bytes a handle writes before it fails, or `None` to write.
     pub(crate) fail_after: Option<u64>,
+    /// Sync the file before the merge returns. A file that is merged again
+    /// and deleted, as a bulk build's intermediate files are, needs no
+    /// sync: only the one a manifest will name must be durable.
+    pub(crate) sync: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            threads: crate::par::threads(),
+            threads: 0,
             piece: PIECE,
             fail_after: None,
+            sync: true,
         }
     }
 }
@@ -252,7 +259,9 @@ fn write_pieces<F: Fn(u32) -> bool + Sync>(
     head.seek_to(0)?;
     head.put(&header.bytes())?;
     head.flush()?;
-    head.sync()?;
+    if settings.sync {
+        head.sync()?;
+    }
     Ok(Written { ids, held: high })
 }
 
@@ -316,12 +325,16 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
     gate: &Gate,
     settings: Settings,
 ) -> std::io::Result<()> {
-    let threads = settings.threads.max(1);
+    let threads = match settings.threads {
+        0 => crate::par::threads(),
+        n => n,
+    };
     let window = WINDOW * threads;
     let failure: Mutex<Option<std::io::Error>> = Mutex::new(None);
     let merged = slots::<Piece>(plan.pieces);
     plan.deal(threads);
     run_tasks(threads, plan.pieces, |piece| {
+        let _stop = StopOnUnwind(gate);
         // Wait for the piece to come within the window; the piece the file
         // waits for is always within it, so a thread holding a piece always
         // makes progress.
@@ -374,6 +387,21 @@ fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
         return Err(std::io::Error::other("a piece of the merge is missing"));
     }
     Ok(())
+}
+
+/// Stops the merge when the thread of a piece unwinds, and wakes the
+/// threads waiting for room: the piece it held never reaches the file, so
+/// they would otherwise wait for it forever and the merge would never
+/// return to propagate the panic.
+struct StopOnUnwind<'a>(&'a Gate);
+
+impl Drop for StopOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            lock(&self.0.writer).stop = true;
+            self.0.wake.notify_all();
+        }
+    }
 }
 
 /// A handle on the file being written, buffered, with a byte count a test
@@ -674,6 +702,7 @@ mod tests {
             threads,
             piece,
             fail_after: None,
+            sync: false,
         }
     }
 
@@ -949,6 +978,7 @@ mod tests {
                 threads: 2,
                 piece: 500,
                 fail_after: Some(limit),
+                sync: true,
             };
             let err = merge_to_file(&sides, &path, settings).expect_err("the write fails");
             assert_eq!(err.kind(), std::io::ErrorKind::Other, "{limit}");
@@ -958,5 +988,46 @@ mod tests {
         let path = scratch.path("fine.afs");
         merge_to_file(&sides, &path, Settings::default()).expect("the merge writes");
         assert!(path.exists());
+    }
+
+    /// A piece whose merge panics stops the others, the panic reaches the
+    /// caller and the file is removed, on every thread count: the threads
+    /// waiting for room behind the lost piece are woken rather than left
+    /// to wait for it.
+    #[test]
+    fn a_panicking_piece_stops_the_merge() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for threads in [1usize, 2, 4] {
+            let (done, outcome) = std::sync::mpsc::channel();
+            let scratch = Scratch::new("panicking-piece");
+            let path = scratch.path("panic.afs");
+            let worker_path = path.clone();
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x5EED_0FA1_1000_0001);
+                let a = segment(&mut rng, 20_000, 2_000, 500, 5_000);
+                let calls = AtomicUsize::new(0);
+                // Fails a few pieces in, with many pieces of 32 postings
+                // still to come, so other threads are waiting for room.
+                let failing = |_: u32| {
+                    assert!(
+                        calls.fetch_add(1, Ordering::Relaxed) != 2_000,
+                        "a keep that fails"
+                    );
+                    true
+                };
+                let keep: Keep<'_> = &failing;
+                let sides: Vec<(&Segment, Option<&Keep<'_>>)> = vec![(&a, Some(&keep))];
+                let merged = catch_unwind(AssertUnwindSafe(|| {
+                    merge_to_file(&sides, &worker_path, settings(threads, 32))
+                }));
+                let _ = done.send(merged.is_err());
+            });
+            let panicked = outcome
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the merge returns instead of waiting forever");
+            assert!(panicked, "{threads} threads: the panic reaches the caller");
+            assert!(!path.exists(), "{threads} threads: the file is removed");
+        }
     }
 }

@@ -506,19 +506,12 @@ impl Catalog {
         &mut self,
         merges: &mut M,
     ) -> Result<(), M::Error> {
-        let mut parts = core::mem::take(&mut self.parts);
-        match merged_from(&parts, 1, &self.live, merges) {
-            Ok(only) => {
-                parts.truncate(1);
-                parts.extend(only);
-                self.parts = parts;
-                Ok(())
-            }
-            Err(e) => {
-                self.parts = parts;
-                Err(e)
-            }
-        }
+        // The parts are read in place and changed only once the merge
+        // has succeeded, so a merge that fails or panics leaves them whole.
+        let only = merged_from(&self.parts, 1, &self.live, merges)?;
+        self.parts.truncate(1);
+        self.parts.extend(only);
+        Ok(())
     }
 
     /// Merge everything into one segment, dropping the postings of removed
@@ -532,19 +525,11 @@ impl Catalog {
     /// [`Catalog::compact`], with `merges` deciding where a merge goes. A
     /// merge that fails leaves the catalog as it was.
     pub(crate) fn compact_of<M: MergeParts>(&mut self, merges: &mut M) -> Result<(), M::Error> {
-        let mut parts = core::mem::take(&mut self.parts);
-        match merged_from(&parts, 0, &self.live, merges) {
-            Ok(only) => {
-                parts.clear();
-                parts.extend(only);
-                self.parts = parts;
-                Ok(())
-            }
-            Err(e) => {
-                self.parts = parts;
-                Err(e)
-            }
-        }
+        // As in `compact_deltas_of`: nothing changes until the merge is done.
+        let only = merged_from(&self.parts, 0, &self.live, merges)?;
+        self.parts.clear();
+        self.parts.extend(only);
+        Ok(())
     }
 }
 
@@ -967,5 +952,36 @@ mod tests {
             ]
         );
         assert_eq!(cat.posting_count(), 104);
+    }
+
+    /// A compaction that panics part-way, as one over a damaged catalog
+    /// loaded without its checks does, leaves the segments where they
+    /// were instead of a catalog with none.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_panicking_compaction_leaves_the_segments_in_place() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        // References 0 to 39 in a catalog of ten ids, one of them removed,
+        // so the merge filters and reads past the liveness table.
+        let rows: Vec<crate::Posting> = (0..40u32).map(|r| crate::Posting::new(1, r, 0)).collect();
+        let mut live = alloc::vec![true; 10];
+        live[3] = false;
+        let mut catalog = Catalog::from_parts(
+            alloc::vec![(Segment::from_postings(rows), Some((0, 9)))],
+            live,
+        );
+        let postings = catalog.posting_count();
+        for compaction in [Catalog::compact, Catalog::compact_deltas] {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // `compact_deltas` leaves the first segment alone, so give
+                // it a second one to merge.
+                catalog.parts.push(catalog.parts[0].clone());
+                compaction(&mut catalog);
+            }));
+            assert!(outcome.is_err(), "the damaged catalog panics");
+            assert_eq!(catalog.segment_count(), 2);
+            assert_eq!(catalog.posting_count(), 2 * postings);
+            catalog.parts.truncate(1);
+        }
     }
 }

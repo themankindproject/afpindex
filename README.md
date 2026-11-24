@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/afpindex/badge.svg)](https://docs.rs/afpindex)
 [![License](https://img.shields.io/crates/l/afpindex)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/themankindproject/afpindex/ci.yml?branch=main&label=CI)](https://github.com/themankindproject/afpindex/actions/workflows/ci.yml)
-![Rust Version](https://img.shields.io/badge/rust-1.87%2B-blue)
+![Rust Version](https://img.shields.io/badge/rust-1.89%2B-blue)
 
 Exact in-memory inverted index for landmark audio fingerprints: **hundreds of millions of postings**, **exact vote counts**, **sub-millisecond median searches**, **catalogs that change while they serve**, and **snapshots you can map instead of read**.
 
@@ -149,7 +149,7 @@ without blocking the searches running on the original.
 
 ```rust
 catalog.write_to(std::io::BufWriter::new(std::fs::File::create("catalog.afx")?))?;
-let catalog = Catalog::read_from(std::io::BufReader::new(std::fs::File::open("catalog.afx")?))?;
+let catalog = Catalog::read_from(std::fs::File::open("catalog.afx")?)?;
 let catalog = Catalog::map_from("catalog.afx")?;   // `mmap` feature
 ```
 
@@ -316,7 +316,7 @@ cargo fmt --all -- --check
 
 CI runs `fmt`, `clippy` and the docs on the latest stable Rust, the tests
 on Ubuntu, macOS, Windows and 32-bit x86, `no_std` builds for
-`thumbv7em-none-eabi` and `wasm32`, and checks the library on Rust 1.87.
+`thumbv7em-none-eabi` and `wasm32`, and checks the library on Rust 1.89.
 For performance changes, follow
 [Reproducing](docs/PERFORMANCE.md#reproducing).
 

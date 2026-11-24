@@ -29,6 +29,7 @@ use super::{
     MAX_POSTINGS, REGION_SLOTS, Segment, Slot, Writer, build_table, merge_sources, place, postings,
     slot_of, widths,
 };
+use crate::Posting;
 use crate::packed::Packed;
 use crate::par::{lock, run_tasks, slots, threads};
 
@@ -51,8 +52,13 @@ const ROOM: &str = "room for every piece";
 pub(super) fn merge_all<F: Fn(u32) -> bool + Sync>(
     sides: &[(&Segment, Option<&F>)],
 ) -> Option<Segment> {
+    // The size first: asking for the threads costs more than a small
+    // merge's test.
+    if postings(sides) < MERGE_MIN {
+        return None;
+    }
     let threads = threads();
-    if threads <= 1 || postings(sides) < MERGE_MIN {
+    if threads <= 1 {
         return None;
     }
     // Several pieces per thread: a slow piece holds the rest up less, and
@@ -61,6 +67,116 @@ pub(super) fn merge_all<F: Fn(u32) -> bool + Sync>(
     // costs little against merging.
     let pieces = (threads * 8).min(postings(sides) >> 16).max(1);
     Some(merge_in_pieces(sides, threads, pieces))
+}
+
+/// The rest of [`Segment::from_postings`] once `rows` are sorted, on every
+/// core, or the rows back for an input too small to be worth it or a
+/// single core.
+pub(super) fn pack_sorted(rows: Vec<Posting>) -> Result<Segment, Vec<Posting>> {
+    if rows.len() < MERGE_MIN {
+        return Err(rows);
+    }
+    let threads = threads();
+    if threads <= 1 {
+        return Err(rows);
+    }
+    // As many pieces as a merge of this size takes.
+    let pieces = (threads * 8).min(rows.len() >> 16).max(1);
+    Ok(pack_in_pieces(rows, threads, pieces))
+}
+
+/// [`pack_sorted`] in up to `pieces` pieces on up to `threads` threads,
+/// whatever the size.
+///
+/// The sorted rows are cut at hash boundaries, so a run and the duplicates
+/// in it, which the sort put side by side, are in one piece. A first pass
+/// finds the widths and every piece's distinct hashes; a second packs
+/// each piece as a merge's piece is packed and copies it into the joined
+/// arrays as soon as the pieces before it are, with the merge's join. The
+/// rows go before the directory is built, as they do on one thread.
+fn pack_in_pieces(rows: Vec<Posting>, threads: usize, pieces: usize) -> Segment {
+    let bounds = hash_cuts(&rows, pieces);
+    let n = bounds.len() - 1;
+    let piece = |i: usize| &rows[bounds[i]..bounds[i + 1]];
+    // The largest reference and time and the distinct hashes of a piece.
+    let counted = slots::<(u32, u32, usize)>(n);
+    run_tasks(threads, n, |i| {
+        let (mut max_ref, mut max_time, mut keys) = (0, 0, 0usize);
+        let mut prev = None;
+        for p in piece(i) {
+            max_ref = max_ref.max(p.reference);
+            max_time = max_time.max(p.time);
+            if prev != Some(p.hash) {
+                keys += 1;
+                prev = Some(p.hash);
+            }
+        }
+        *lock(&counted[i]) = Some((max_ref, max_time, keys));
+    });
+    let counted: Vec<(u32, u32, usize)> = counted
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .expect("every piece is counted")
+        })
+        .collect();
+    let (max_ref, max_time, keys) = counted
+        .iter()
+        .fold((0, 0, 0), |(r, t, k), c| (r.max(c.0), t.max(c.1), k + c.2));
+    let (ref_bits, time_bits) = (Packed::bits_for(max_ref), Packed::bits_for(max_time));
+    let mut out = Output::with_capacity(keys, rows.len(), ref_bits, time_bits);
+    let packed = slots::<Parts>(n);
+    let joined = Mutex::new(out.joined());
+    run_tasks(threads, n, |i| {
+        let rows = piece(i);
+        let mut writer = Writer::with_capacity(rows.len(), counted[i].2, ref_bits, time_bits);
+        for run in rows.chunk_by(|a, b| a.hash == b.hash) {
+            // Exact duplicates are neighbours in a sorted run; the first
+            // of each is kept, as `Vec::dedup` keeps it.
+            let pairs = run
+                .iter()
+                .enumerate()
+                .filter(move |&(k, p)| k == 0 || run[k - 1] != *p)
+                .map(|(_, p)| (p.reference, p.time));
+            writer.push_run(run[0].hash, pairs);
+        }
+        *lock(&packed[i]) = Some(writer.into_parts());
+        loop {
+            let next = lock(&joined).place_next(&packed);
+            match next {
+                Some((place, parts)) => place.fill(parts),
+                None => break,
+            }
+        }
+    });
+    let joined = joined.into_inner().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(joined.next, n, "every piece is joined");
+    let done = joined.finish();
+    drop(rows);
+    out.into_segment(done)
+}
+
+/// Where sorted `rows` are cut into about `pieces` pieces of about equal
+/// rows, each cut at the start of a hash's run: the first bound is 0, the
+/// last the length, and none is repeated.
+fn hash_cuts(rows: &[Posting], pieces: usize) -> Vec<usize> {
+    let mut bounds = vec![0];
+    for i in 1..pieces {
+        let target = (rows.len() as u128 * i as u128 / pieces as u128) as usize;
+        let last = bounds[bounds.len() - 1];
+        if target <= last || target >= rows.len() {
+            continue;
+        }
+        // Back to the first row of the hash the target falls in.
+        let hash = rows[target].hash;
+        let cut = rows[last..target].partition_point(|p| p.hash < hash) + last;
+        if cut > last {
+            bounds.push(cut);
+        }
+    }
+    bounds.push(rows.len());
+    bounds
 }
 
 /// Where the pieces start in one source: the index of each piece's first
@@ -280,18 +396,23 @@ struct Output {
 }
 
 impl Output {
-    fn with_room<F>(sides: &[(&Segment, Option<&F>)], ref_bits: u32, time_bits: u32) -> Self {
-        let keys: usize = sides.iter().map(|&(s, _)| s.keys.len()).sum();
-        let room = postings(sides);
+    /// Room for `keys` distinct hashes and `postings` postings at the
+    /// given widths.
+    fn with_capacity(keys: usize, postings: usize, ref_bits: u32, time_bits: u32) -> Self {
         Self {
             keys: vec![0; keys],
             starts: vec![0; keys + 1],
             mults: vec![0; keys],
-            refs: vec![0; Packed::data_len(room, ref_bits) + Packed::SLACK],
-            times: vec![0; Packed::data_len(room, time_bits) + Packed::SLACK],
+            refs: vec![0; Packed::data_len(postings, ref_bits) + Packed::SLACK],
+            times: vec![0; Packed::data_len(postings, time_bits) + Packed::SLACK],
             ref_bits,
             time_bits,
         }
+    }
+
+    fn with_room<F>(sides: &[(&Segment, Option<&F>)], ref_bits: u32, time_bits: u32) -> Self {
+        let keys: usize = sides.iter().map(|&(s, _)| s.keys.len()).sum();
+        Self::with_capacity(keys, postings(sides), ref_bits, time_bits)
     }
 
     /// The arrays to place the pieces in.
@@ -525,8 +646,11 @@ pub(super) fn place_by_region(
     by_region: &[Slot],
     region_starts: &[usize],
 ) -> bool {
+    if table.len() < TABLE_MIN {
+        return false;
+    }
     let threads = threads();
-    if threads <= 1 || table.len() < TABLE_MIN {
+    if threads <= 1 {
         return false;
     }
     place_in_stretches(table, by_region, region_starts, threads, threads * 4);
@@ -783,5 +907,56 @@ mod tests {
         }
         // The crowded regions did send probes across stretches.
         assert!(late > 0);
+    }
+
+    /// Packing sorted rows in pieces gives the segment, byte for byte, that
+    /// packing them on one thread gives: with duplicates, a hash whose run
+    /// spans many cuts, rows that arrive sorted, and every width from 0 to
+    /// 32 bits.
+    #[test]
+    fn packing_in_pieces_agrees_with_one_thread() {
+        let mut rng = Rng(0x7AC4_5EED_0000_0001);
+        let mut sets: Vec<Vec<Posting>> = Vec::new();
+        // Random rows with duplicates among them.
+        let mut random: Vec<Posting> = (0..30_000)
+            .map(|_| {
+                Posting::new(
+                    rng.below(2_000) as u32,
+                    rng.below(700) as u32,
+                    rng.below(9_000) as u32,
+                )
+            })
+            .collect();
+        random.extend_from_within(..3_000);
+        sets.push(random);
+        // One hash holds most rows, so cuts fall inside its run.
+        sets.push(
+            (0..20_000u32)
+                .map(|i| Posting::new(if i % 10 == 0 { i } else { 77 }, i % 300, i))
+                .collect(),
+        );
+        // Already sorted, a posting per hash.
+        sets.push((0..10_000u32).map(|i| Posting::new(i, i, i)).collect());
+        // The widest values, and the narrowest.
+        sets.push(
+            (0..5_000u32)
+                .map(|i| Posting::new(i % 97, u32::MAX - i % 3, u32::MAX - i))
+                .collect(),
+        );
+        sets.push((0..5_000u32).map(|i| Posting::new(i % 50, 0, 0)).collect());
+        for (s, rows) in sets.into_iter().enumerate() {
+            let want = Segment::from_postings(rows.clone());
+            let mut want_bytes = Vec::new();
+            want.write_to(&mut want_bytes).expect("writing to memory");
+            for (threads, pieces) in [(1, 1), (2, 3), (4, 16), (3, 64)] {
+                let mut sorted = rows.clone();
+                crate::sort::sort_postings(&mut sorted);
+                let got = pack_in_pieces(sorted, threads, pieces);
+                let mut got_bytes = Vec::new();
+                got.write_to(&mut got_bytes).expect("writing to memory");
+                assert_eq!(got, want, "set {s}, {threads} threads, {pieces} pieces");
+                assert_eq!(got_bytes, want_bytes, "set {s}: bytes");
+            }
+        }
     }
 }

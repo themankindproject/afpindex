@@ -140,17 +140,17 @@ impl Packed {
             return;
         }
         let word = |i: usize| u64::from_le_bytes(src[i..i + 8].try_into().expect("8 bytes"));
-        let mut words = dst.chunks_exact_mut(8);
+        let (words, rest) = dst.as_chunks_mut::<8>();
         let mut i = at;
-        for out in &mut words {
+        for out in words {
             // The 8 bytes from `i` hold all but the top `shift` bits of
             // this word; the byte after them holds the rest. The slack
             // keeps both loads in bounds.
             let w = word(i) >> shift | u64::from(src[i + 8]) << (64 - shift);
-            out.copy_from_slice(&w.to_le_bytes());
+            *out = w.to_le_bytes();
             i += 8;
         }
-        for out in words.into_remainder() {
+        for out in rest {
             *out = (src[i] >> shift) | (src[i + 1] << (8 - shift));
             i += 1;
         }
@@ -424,9 +424,10 @@ impl Packed {
         mut hi: usize,
         pred: impl Fn(u32) -> bool,
     ) -> usize {
+        let view = self.view();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if pred(self.get(mid)) {
+            if pred(view.get(mid)) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -591,9 +592,9 @@ impl PackedBuilder {
         let mut block = [0u8; BLOCK];
         while steps > 0 {
             let n = steps.min(BLOCK / 4);
-            for out in block[..4 * n].chunks_exact_mut(4) {
+            for out in block[..4 * n].as_chunks_mut::<4>().0 {
                 acc |= (src.window(bit) & u64::from(u32::MAX)) << fill;
-                out.copy_from_slice(&(acc as u32).to_le_bytes());
+                *out = (acc as u32).to_le_bytes();
                 acc >>= u32::BITS;
                 bit += u64::from(u32::BITS);
             }

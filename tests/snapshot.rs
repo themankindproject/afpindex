@@ -17,7 +17,7 @@ fn sample() -> Segment {
 }
 
 /// Byte offsets of the five arrays, the end of the times data, and the
-/// four checksums in a segment snapshot (version 4: the packed arrays
+/// four checksums in a segment snapshot (version 5: the packed arrays
 /// first, then the keys, the offsets and the multiplicities). References
 /// and times are packed at the width of their largest value.
 fn layout(seg: &Segment) -> (usize, usize, usize, usize, usize, usize, usize) {
@@ -86,7 +86,7 @@ fn corruption_is_reported_not_trusted() {
         Err(SnapshotError::UnsupportedVersion(9))
     ));
     // Earlier versions are not read: there is no reader for them.
-    for version in [2u8, 3] {
+    for version in [2u8, 3, 4] {
         let mut bad = good.clone();
         bad[4] = version;
         assert!(matches!(
@@ -364,9 +364,9 @@ fn full_width_references_and_times_round_trip() {
 }
 
 /// Length and FNV-1a hash of the fixed catalog's and the fixed segment's
-/// snapshots (format version 4).
-const CATALOG_GOLDEN: (usize, u64) = (96_936, 876_163_766_861_378_146);
-const SEGMENT_GOLDEN: (usize, u64) = (32_088, 12_768_993_118_344_369_857);
+/// snapshots (format version 5).
+const CATALOG_GOLDEN: (usize, u64) = (96_936, 6_927_546_800_028_242_596);
+const SEGMENT_GOLDEN: (usize, u64) = (32_088, 1_898_618_898_607_066_370);
 
 /// FNV-1a over `bytes`.
 fn fnv1a(bytes: &[u8]) -> u64 {

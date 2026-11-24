@@ -54,6 +54,9 @@ const VERSION: u32 = 1;
 pub(super) const MANIFEST: &str = "MANIFEST";
 /// Name of a manifest being written.
 pub(super) const MANIFEST_TEMP: &str = "MANIFEST.tmp";
+/// The file a store holds locked for as long as it writes the directory.
+/// It stays when the store goes; only the lock on it is released.
+pub(super) const LOCK: &str = "LOCK";
 /// Bytes of a manifest up to the end of its generation.
 pub(super) const GENERATION_END: usize = 16;
 /// A segment count no real catalog reaches; a larger one is a corrupt file
@@ -170,6 +173,24 @@ pub(super) fn generation(head: &[u8; GENERATION_END]) -> Option<u64> {
 }
 
 /// Read a manifest from `bytes`, the whole file's contents.
+/// Refuse file ids a store did not give: a store gives each file the next
+/// id and never reuses one, so an id at or past the next is not one of its
+/// own, and one file named twice would be mapped twice and its postings
+/// counted twice.
+fn check_files(entries: &[Entry], next_file: u32) -> Result<(), SnapshotError> {
+    if entries.iter().any(|e| e.file >= next_file) {
+        return Err(SnapshotError::Corrupt(
+            "a segment file id at or past the next one",
+        ));
+    }
+    let mut files: Vec<u32> = entries.iter().map(|e| e.file).collect();
+    files.sort_unstable();
+    if files.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(SnapshotError::Corrupt("a segment file named twice"));
+    }
+    Ok(())
+}
+
 pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
     let head = bytes.get(..HEADER).ok_or(SnapshotError::Truncated)?;
     if head[..4] != *MAGIC {
@@ -179,11 +200,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
     if version != VERSION {
         return Err(SnapshotError::UnsupportedVersion(version));
     }
-    let mut words = head[8..32].chunks_exact(8);
-    let mut next_word = || {
-        let chunk = words.next()?;
-        Some(u64::from_le_bytes(chunk.try_into().expect("8 bytes")))
-    };
+    let mut words = head[8..32].as_chunks::<8>().0.iter();
+    let mut next_word = || words.next().map(|&w| u64::from_le_bytes(w));
     let generation = next_word().ok_or(SnapshotError::Truncated)?;
     let reference_count = next_word().ok_or(SnapshotError::Truncated)?;
     let n_segments = next_word().ok_or(SnapshotError::Truncated)?;
@@ -223,7 +241,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
         ))?;
     let body = bytes.get(after..end).ok_or(SnapshotError::Truncated)?;
     let mut entries = Vec::with_capacity(n_segments as usize);
-    for entry in body.chunks_exact(ENTRY) {
+    for entry in body.as_chunks::<ENTRY>().0 {
         let word = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().expect("8 bytes"));
         let file = u32::from_le_bytes(entry[0..4].try_into().expect("4 bytes"));
         let (bytes, keys, postings) = (word(8), word(16), word(24));
@@ -257,6 +275,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
     if u64::from_le_bytes(stored.try_into().expect("8 bytes")) != ck.finish() {
         return Err(SnapshotError::Checksum);
     }
+    check_files(&entries, next_file)?;
     let live = (0..n_refs)
         .map(|i| bitmap[i / 8] & (1 << (i % 8)) != 0)
         .collect();
@@ -352,6 +371,22 @@ mod tests {
         assert!(
             matches!(read(&bytes), Err(SnapshotError::Corrupt(m)) if m.contains("without postings"))
         );
+    }
+
+    /// Every file id is one the store gave out (below the next one) and
+    /// names one segment only.
+    #[test]
+    fn refuses_file_ids_a_store_did_not_give() {
+        let mut m = sample();
+        m.entries[1].file = 9;
+        let mut bytes = Vec::new();
+        m.write(&mut bytes).unwrap();
+        assert!(matches!(read(&bytes), Err(SnapshotError::Corrupt(m)) if m.contains("next one")));
+        let mut m = sample();
+        m.entries[1].file = 3;
+        let mut bytes = Vec::new();
+        m.write(&mut bytes).unwrap();
+        assert!(matches!(read(&bytes), Err(SnapshotError::Corrupt(m)) if m.contains("twice")));
     }
 
     #[test]
