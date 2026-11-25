@@ -1,11 +1,11 @@
-# Using afpindex
+# Using hashtally
 
 The [README](../README.md) covers installation and a first search. This
 guide is the reference for everything after that: what the index stores,
 what a search computes and costs, how to read and act on its results, how
 a catalog changes while it serves, what it holds in memory, how snapshots
 work, and how to run it in production. The API itself is documented on
-[docs.rs](https://docs.rs/afpindex); measurements are in
+[docs.rs](https://docs.rs/hashtally); measurements are in
 [PERFORMANCE.md](PERFORMANCE.md).
 
 Every Rust example here is a complete function or type, compiled as a
@@ -45,7 +45,7 @@ follows from that.
 | Term | Meaning |
 |---|---|
 | **reference** | One indexed recording (a track, an ad, an episode), identified by a dense `u32` id |
-| **posting** | One row of a reference: `(hash, reference, time)` ([`Posting`](https://docs.rs/afpindex/latest/afpindex/struct.Posting.html)) |
+| **posting** | One row of a reference: `(hash, reference, time)` ([`Posting`](https://docs.rs/hashtally/latest/hashtally/struct.Posting.html)) |
 | **run** | All postings of one hash in one segment, grouped by reference, times ascending |
 | **segment** | An immutable, sorted, packed set of postings with a directory from hash to run |
 | **catalog** | A list of segments plus the table of which ids are live |
@@ -190,7 +190,7 @@ The catalog stores no names. Keep your own table from id to whatever
 identifies a recording, and persist it next to the snapshot:
 
 ```rust
-use afpindex::Catalog;
+use hashtally::Catalog;
 
 /// A catalog plus the name of every id it assigned, removed ones included.
 #[derive(Default)]
@@ -238,7 +238,7 @@ id has postings ([section 12](#12-memory)).
 ### All at once: `CatalogBuilder`
 
 ```rust
-use afpindex::Catalog;
+use hashtally::Catalog;
 
 /// Build a catalog from every reference's rows with one sort.
 pub fn build(references: &[Vec<(u32, u32)>]) -> Catalog {
@@ -279,7 +279,7 @@ references that arrive while the catalog serves
 ## 5. Queries
 
 ```rust
-use afpindex::Query;
+use hashtally::Query;
 
 /// Group a clip's rows by hash, keeping the first 64 times of each hash.
 pub fn query_of(clip_rows: Vec<(u32, u32)>) -> Query {
@@ -315,7 +315,7 @@ votes and are hard to tell from chance at any floor.
 ## 6. Searching
 
 ```rust
-use afpindex::{Candidate, Catalog, Query, Scratch, SearchError, SearchOptions, vote_floor};
+use hashtally::{Candidate, Catalog, Query, Scratch, SearchError, SearchOptions, vote_floor};
 
 /// Search one clip with the options used on the real catalog.
 pub fn search_clip(
@@ -332,7 +332,7 @@ pub fn search_clip(
 
 - The catalog is borrowed (`&self`): any number of threads search one
   catalog at the same time.
-- A [`Scratch`](https://docs.rs/afpindex/latest/afpindex/struct.Scratch.html)
+- A [`Scratch`](https://docs.rs/hashtally/latest/hashtally/struct.Scratch.html)
   holds the per-search buffers. Keep one per thread and reuse it: after
   the first search, `search_with` allocates nothing for a query of similar
   size, and `search` allocates only its result. One scratch serves any
@@ -406,7 +406,7 @@ postings)`, at most 64 × 64 with the usual values.
 ### `vote_floor`
 
 ```rust
-use afpindex::vote_floor;
+use hashtally::vote_floor;
 
 /// The floor used on the real catalog: 2 % of the clip's rows, at least 16.
 pub fn floor_for(rows: usize) -> u32 {
@@ -461,7 +461,7 @@ large share of `total_votes`. A starting point to calibrate on labelled
 data:
 
 ```rust
-use afpindex::Candidate;
+use hashtally::Candidate;
 
 /// A first rule to calibrate: enough votes in the best bin, standing well
 /// above that reference's other bins.
@@ -501,7 +501,7 @@ broadcast speed-up) drifts by a frame every so often, spreading its votes
 over neighbouring bins. Summing a window of bins recovers them:
 
 ```rust
-use afpindex::{Catalog, Query, Scratch, SearchError, SearchOptions};
+use hashtally::{Catalog, Query, Scratch, SearchError, SearchOptions};
 
 /// For each survivor, the most votes in any window of Δ at most `2 * half_width`
 /// frames wide: `(reference, first Δ of that window, votes in it)`.
@@ -542,7 +542,7 @@ or scoring with weights per Δ.
 ## 10. Changing a catalog
 
 ```rust
-use afpindex::Catalog;
+use hashtally::Catalog;
 
 /// The whole life of a reference in a live catalog.
 pub fn lifecycle(catalog: &mut Catalog, rows: Vec<(u32, u32)>) {
@@ -644,7 +644,7 @@ deltas (8). It costs a few comparisons, so ask after every change.
 `&self`; each thread owns a `Scratch`:
 
 ```rust
-use afpindex::{Candidate, Catalog, Query, Scratch, SearchError, SearchOptions};
+use hashtally::{Candidate, Catalog, Query, Scratch, SearchError, SearchOptions};
 
 /// Search many queries on `threads` threads, results in query order.
 pub fn search_many(
@@ -694,7 +694,7 @@ or that would rather its background compactions did not take the cores its
 searches run on, can cap that process-wide:
 
 ```rust
-use afpindex::{Catalog, max_threads, set_max_threads};
+use hashtally::{Catalog, max_threads, set_max_threads};
 
 /// Cap the passes of this process once, before it serves: a host with 8
 /// hardware threads can leave a core for something else out of process,
@@ -742,7 +742,7 @@ writer that changes a private copy and publishes it:
 ```rust
 use std::sync::{Arc, RwLock};
 
-use afpindex::{Catalog, Compaction, CompactionPolicy};
+use hashtally::{Catalog, Compaction, CompactionPolicy};
 
 /// The catalog searches read, swapped whole by a single writer.
 pub struct Served {
@@ -901,7 +901,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use afpindex::{Catalog, SnapshotError};
+use hashtally::{Catalog, SnapshotError};
 
 /// Write a snapshot so that a crash leaves either the old file or the new one.
 pub fn save(catalog: &Catalog, path: &Path) -> std::io::Result<()> {
@@ -981,7 +981,7 @@ range are stored in the file (see [The format](#the-format)).
 ```rust
 use std::path::Path;
 
-use afpindex::{Catalog, SnapshotError};
+use hashtally::{Catalog, SnapshotError};
 
 /// Map a snapshot this service wrote and has loaded with every check before.
 pub fn restart(path: &Path) -> Result<Catalog, SnapshotError> {
@@ -1133,7 +1133,7 @@ a save writes it. `Catalog::map_dir` reads the directory without writing to
 it and without faulting its pages in.
 
 ```rust
-use afpindex::{Catalog, CatalogStore, Query, Scratch, SearchOptions};
+use hashtally::{Catalog, CatalogStore, Query, Scratch, SearchOptions};
 use std::path::Path;
 
 /// Build a catalog in a directory, save it, reopen it, and search it.
@@ -1190,7 +1190,7 @@ recover those changes keeps its own log of additions and replays it from
 there:
 
 ```rust
-use afpindex::CatalogStore;
+use hashtally::CatalogStore;
 use std::path::Path;
 
 /// Replay a log of additions from the last durable state.
@@ -1224,7 +1224,7 @@ catalog is the one `CatalogBuilder` builds from the same calls. A build
 that fails or is dropped leaves nothing in the directory.
 
 ```rust
-use afpindex::CatalogStore;
+use hashtally::CatalogStore;
 use std::path::Path;
 
 /// Build a catalog directory from references too many to hold at once.
@@ -1286,7 +1286,7 @@ own: for an offline batch job that builds once and serves many times, for
 ids you assign yourself, or to inspect what the index holds.
 
 ```rust
-use afpindex::{Catalog, Posting, RefCoding, Segment};
+use hashtally::{Catalog, Posting, RefCoding, Segment};
 
 /// Build, inspect, filter and merge segments, then serve one as a catalog.
 pub fn segment_tour() -> Catalog {
@@ -1346,7 +1346,7 @@ segments through `segment_count()`, `segment(i)` (largest first) and
 ```rust
 use std::collections::{BTreeMap, BTreeSet};
 
-use afpindex::Catalog;
+use hashtally::Catalog;
 
 /// Hashes with more than `max_postings` postings across the catalog's segments.
 pub fn common_hashes(catalog: &Catalog, max_postings: usize) -> BTreeSet<u32> {
@@ -1386,7 +1386,7 @@ clean.
 | `TooManyVotes { votes, max }` | The survivors would scatter more than `max_votes` votes (16 to 48 bytes each) | Raise the floor (usually the floor is far too low), lower the fanout, or raise `max_votes` if the memory is there |
 
 ```rust
-use afpindex::{Candidate, Catalog, Query, Scratch, SearchError, SearchOptions};
+use hashtally::{Candidate, Catalog, Query, Scratch, SearchError, SearchOptions};
 
 /// Search, treating an over-broad query as "no match" rather than a failure.
 pub fn search_or_nothing(
@@ -1460,7 +1460,7 @@ all work; snapshots need `std`.
 
 ```toml
 [dependencies]
-afpindex = { version = "0.1", default-features = false }
+hashtally = { version = "0.1", default-features = false }
 ```
 
 Segments are shared through `Arc` on targets with atomic pointers and

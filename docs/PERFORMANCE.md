@@ -119,7 +119,7 @@ directory](#a-sparser-directory-for-small-segments).
 
 ## Real data
 
-`examples/replay.rs` runs the crate over the catalog of the *afpindex*
+`examples/replay.rs` runs the crate over the catalog of the *hashtally*
 design notes (7 November 2026): 499.4 M postings from 120,329 production
 references, 3.66 M distinct hashes (136 postings per hash on average), and
 the 104 real clips the notes compared with the production ClickHouse query.

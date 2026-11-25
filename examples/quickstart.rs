@@ -1,6 +1,6 @@
 //! Build a small catalog, search it, add and remove a reference.
 
-use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
+use hashtally::{Catalog, Query, Scratch, SearchOptions, vote_floor};
 
 fn main() {
     // Three references of 200 rows each; reference 2 shares its first 120

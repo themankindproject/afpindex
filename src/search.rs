@@ -12,7 +12,7 @@ use crate::{Catalog, Query, SearchError, Segment};
 /// Start from [`SearchOptions::default`] and assign the fields to change:
 ///
 /// ```
-/// # use afpindex::SearchOptions;
+/// # use hashtally::SearchOptions;
 /// let mut options = SearchOptions::default();
 /// options.min_total_votes = 84;
 /// ```
@@ -21,7 +21,7 @@ use crate::{Catalog, Query, SearchError, Segment};
 /// be built with a literal, even one that fills the rest from the default:
 ///
 /// ```compile_fail,E0639
-/// let options = afpindex::SearchOptions { min_total_votes: 84, ..Default::default() };
+/// let options = hashtally::SearchOptions { min_total_votes: 84, ..Default::default() };
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]

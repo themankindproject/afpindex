@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use afpindex::{Catalog, Query, Scratch, SearchOptions};
+use hashtally::{Catalog, Query, Scratch, SearchOptions};
 
 mod support;
 use support::{MAX_TIME, Rng, rows_of};
@@ -279,7 +279,7 @@ fn make_pairs(n: usize, shape: &Shape) -> Vec<Vec<(u32, u32)>> {
 
 #[cfg(feature = "mmap")]
 fn map_snapshot(bytes: &[u8], catalog: &Catalog) {
-    let path = std::env::temp_dir().join(format!("afpindex-lifecycle-{}.afc", std::process::id()));
+    let path = std::env::temp_dir().join(format!("hashtally-lifecycle-{}.afc", std::process::id()));
     std::fs::write(&path, bytes).expect("writing the snapshot file");
     let (mapped, t) = timed(|| Catalog::map_from(&path).expect("a valid snapshot"));
     println!(

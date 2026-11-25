@@ -11,8 +11,8 @@
 //! cargo +nightly fuzz run store      # a changed file in a saved directory, mapped and opened
 //! ```
 
-use afpindex::{Catalog, Query, RefCoding, Scratch, SearchOptions};
 use arbitrary::Arbitrary;
+use hashtally::{Catalog, Query, RefCoding, Scratch, SearchOptions};
 
 /// A catalog of a few references, added in batches so it has several
 /// segments, some removed, perhaps compacted.
@@ -141,5 +141,5 @@ fn search(catalog: &Catalog, rows: &[(u32, u32)]) {
 /// A file of its own for this process under the system's temporary
 /// directory.
 pub fn temp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("afpindex-fuzz-{name}-{}", std::process::id()))
+    std::env::temp_dir().join(format!("hashtally-fuzz-{name}-{}", std::process::id()))
 }

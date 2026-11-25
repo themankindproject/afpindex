@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use afpindex::{
+use hashtally::{
     Candidate, Catalog, Posting, Query, RefCoding, Scratch, SearchOptions, Segment, vote_floor,
 };
 

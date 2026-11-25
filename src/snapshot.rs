@@ -1645,7 +1645,7 @@ mod tests {
         let mut bytes = Vec::new();
         seg.write_to(&mut bytes).unwrap();
         let path =
-            std::env::temp_dir().join(format!("afpindex-parallel-{}.afx", std::process::id()));
+            std::env::temp_dir().join(format!("hashtally-parallel-{}.afx", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Segment::map_from(&path).unwrap(), seg);
         // A byte after the end: a file that is more than the snapshot.
@@ -1878,7 +1878,7 @@ mod tests {
         #[cfg(feature = "mmap")]
         {
             let path =
-                std::env::temp_dir().join(format!("afpindex-trusted-{}.afx", std::process::id()));
+                std::env::temp_dir().join(format!("hashtally-trusted-{}.afx", std::process::id()));
             std::fs::write(&path, &flipped).unwrap();
             let full = Segment::map_from(&path);
             let mapped = Segment::map_from_trusted(&path);

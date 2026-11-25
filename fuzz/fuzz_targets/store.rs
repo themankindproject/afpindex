@@ -3,9 +3,9 @@
 
 #![no_main]
 
-use afpindex::{Catalog, CatalogStore};
-use afpindex_fuzz::{Edits, Shape, exercise, temp};
 use arbitrary::Arbitrary;
+use hashtally::{Catalog, CatalogStore};
+use hashtally_fuzz::{Edits, Shape, exercise, temp};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]

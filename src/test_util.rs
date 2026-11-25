@@ -37,7 +37,7 @@ impl TempDir {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(std::format!("afpindex-{name}-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(std::format!("hashtally-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a fresh directory");
         Self(dir)

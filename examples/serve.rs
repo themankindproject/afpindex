@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use afpindex::{
+use hashtally::{
     Catalog, Compaction, CompactionPolicy, Query, RefCoding, Scratch, SearchOptions, vote_floor,
 };
 

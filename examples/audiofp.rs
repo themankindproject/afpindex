@@ -16,9 +16,9 @@
 //! mixed down to mono and resampled to 8 kHz, and references and queries
 //! must be fingerprinted with the same `WangConfig`.
 
-use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
 use audiofp::classical::Wang;
 use audiofp::{Fingerprinter, SampleRate};
+use hashtally::{Catalog, Query, Scratch, SearchOptions, vote_floor};
 
 /// Samples per second that `Wang` takes.
 const RATE: usize = 8_000;

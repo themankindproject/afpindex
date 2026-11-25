@@ -80,7 +80,7 @@ impl fmt::Display for SnapshotError {
         match self {
             Self::Io(_) => f.write_str("snapshot I/O error"),
             Self::Truncated => f.write_str("snapshot ends early"),
-            Self::BadMagic => f.write_str("not an afpindex snapshot of this kind"),
+            Self::BadMagic => f.write_str("not an hashtally snapshot of this kind"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported snapshot version {v}"),
             Self::Checksum => f.write_str("snapshot checksum mismatch"),
             Self::Corrupt(what) => write!(f, "corrupt snapshot: {what}"),

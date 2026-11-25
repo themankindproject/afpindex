@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 640" width="960" height="640" role="img" aria-labelledby="t d">
-<title id="t">afpindex at a glance</title>
+<title id="t">hashtally at a glance</title>
 <desc id="d">Rows of (hash, time) from a fingerprinter are added to a catalog of immutable segments with a liveness table; a search turns hashes shared with a query into votes and votes into candidates. Catalogs are written to checksummed snapshots and read or memory-mapped back; any number of threads search one catalog, each with its own scratch.</desc>
 <defs><marker id="a0969da" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0969da"/></marker><marker id="a6e7781" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6e7781"/></marker><marker id="a8250df" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8250df"/></marker><marker id="abc4c00" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#bc4c00"/></marker></defs>
 <rect x="0.5" y="0.5" width="959" height="639" rx="12" fill="#ffffff" stroke="#d0d7de"/>
-<text x="28" y="44" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="22" fill="#1f2328" font-weight="700">afpindex at a glance</text>
+<text x="28" y="44" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="22" fill="#1f2328" font-weight="700">hashtally at a glance</text>
 <text x="28" y="68" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif" font-size="13" fill="#59636e">Rows from a fingerprinter go into a catalog of immutable segments; a search turns shared hashes into votes, and votes into candidates.</text>
 <rect x="28" y="92" width="210" height="280" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
 <circle cx="50" cy="116" r="10.2" fill="#0969da"/>

@@ -9,7 +9,7 @@
 //! `(reference, Δ = time − query_time)`. A true copy piles many votes into one
 //! bin; chance collisions scatter single votes across many offsets.
 //!
-//! `afpindex` answers that search exactly over hundreds of millions of
+//! `hashtally` answers that search exactly over hundreds of millions of
 //! postings; the README lists the features in full:
 //!
 //! - **Postings sorted by hash,** packed to the width of the largest value:
@@ -28,8 +28,8 @@
 //! # Example
 //!
 //! ```
-//! # fn main() -> Result<(), afpindex::SearchError> {
-//! use afpindex::{Catalog, Query, Scratch, SearchOptions};
+//! # fn main() -> Result<(), hashtally::SearchError> {
+//! use hashtally::{Catalog, Query, Scratch, SearchOptions};
 //!
 //! // Two references with eight postings each. Reference 1 is reference 0
 //! // shifted 500 frames later.

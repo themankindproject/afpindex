@@ -1,7 +1,7 @@
 //! Snapshot round trips and corruption checks (`std` feature).
 #![cfg(feature = "std")]
 
-use afpindex::{
+use hashtally::{
     Catalog, Compaction, CompactionPolicy, Posting, Query, RefCoding, Scratch, SearchOptions,
     Segment, SnapshotError,
 };
@@ -538,7 +538,7 @@ mod mapped {
     /// A fresh file name under the temp dir for this test.
     fn temp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("afpindex-{}-{name}", std::process::id()));
+        p.push(format!("hashtally-{}-{name}", std::process::id()));
         p
     }
 

@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
+use hashtally::{Catalog, Query, Scratch, SearchOptions, vote_floor};
 
 mod support;
 use support::{MAX_TIME, Rng, rows_of};

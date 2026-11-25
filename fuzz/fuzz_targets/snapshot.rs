@@ -2,9 +2,9 @@
 
 #![no_main]
 
-use afpindex::{Catalog, Segment};
-use afpindex_fuzz::{Edits, Shape, exercise, temp};
 use arbitrary::Arbitrary;
+use hashtally::{Catalog, Segment};
+use hashtally_fuzz::{Edits, Shape, exercise, temp};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]

@@ -1,15 +1,15 @@
-# afpindex
+# hashtally
 
-[![Crates.io](https://img.shields.io/crates/v/afpindex)](https://crates.io/crates/afpindex)
-[![Documentation](https://docs.rs/afpindex/badge.svg)](https://docs.rs/afpindex)
-[![License](https://img.shields.io/crates/l/afpindex)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/themankindproject/afpindex/ci.yml?branch=main&label=CI)](https://github.com/themankindproject/afpindex/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/hashtally)](https://crates.io/crates/hashtally)
+[![Documentation](https://docs.rs/hashtally/badge.svg)](https://docs.rs/hashtally)
+[![License](https://img.shields.io/crates/l/hashtally)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/themankindproject/hashtally/ci.yml?branch=main&label=CI)](https://github.com/themankindproject/hashtally/actions/workflows/ci.yml)
 ![Rust Version](https://img.shields.io/badge/rust-1.89%2B-blue)
 
 Exact in-memory inverted index for landmark audio fingerprints: **hundreds of millions of postings**, **exact vote counts**, **sub-millisecond median searches**, **catalogs that change while they serve**, and **snapshots you can map instead of read**.
 
 > **Built for [`audiofp`](https://github.com/themankindproject/audiofp), usable by
-> any fingerprinter of the same shape.** afpindex was written as the search
+> any fingerprinter of the same shape.** hashtally was written as the search
 > index for audiofp's landmark fingerprints, but it does not depend on
 > audiofp and never touches audio: it indexes rows of `(hash: u32, time:
 > u32)`. Any fingerprinter that emits rows like these, with times in a
@@ -26,7 +26,7 @@ hash in a reference: `(hash, reference, time)`. A copy of a reference keeps
 its hashes and shifts their times by one constant, so every query row and
 every posting with the same hash cast a **vote** for the bin
 `(reference, Δ = time − query_time)`. A true copy piles votes into one bin;
-chance collisions scatter single votes everywhere. `afpindex` answers that
+chance collisions scatter single votes everywhere. `hashtally` answers that
 search exactly, over hundreds of millions of postings, in milliseconds.
 
 | Piece | What it does |
@@ -60,7 +60,7 @@ Perfect for:
 
 ```toml
 [dependencies]
-afpindex = { version = "0.1", features = ["mmap", "simd"] }
+hashtally = { version = "0.1", features = ["mmap", "simd"] }
 ```
 
 ### Feature Flags
@@ -74,7 +74,7 @@ afpindex = { version = "0.1", features = ["mmap", "simd"] }
 Minimal build (`no_std + alloc`):
 ```toml
 [dependencies]
-afpindex = { version = "0.1", default-features = false }
+hashtally = { version = "0.1", default-features = false }
 ```
 
 `Arc`-shared segments need a target with atomic pointers; elsewhere `Rc`
@@ -85,7 +85,7 @@ is used, and the catalog is then not `Send`.
 ### Build and search
 
 ```rust
-use afpindex::{Catalog, Query, Scratch, SearchOptions, vote_floor};
+use hashtally::{Catalog, Query, Scratch, SearchOptions, vote_floor};
 
 // Build a catalog with one sort over every posting.
 let mut builder = Catalog::builder();
@@ -191,7 +191,7 @@ point leaves the catalog of the last `save` that returned.
 How rows become candidates, from the whole catalog down to the bits. Each
 figure has more detail in [docs/USAGE.md](docs/USAGE.md).
 
-![afpindex at a glance: rows from a fingerprinter go into a catalog of immutable segments with a liveness table; a search turns shared hashes into votes and votes into candidates; snapshots are written, read and mapped; any number of threads search one catalog, each with its own scratch](docs/img/overview.svg)
+![hashtally at a glance: rows from a fingerprinter go into a catalog of immutable segments with a liveness table; a search turns shared hashes into votes and votes into candidates; snapshots are written, read and mapped; any number of threads search one catalog, each with its own scratch](docs/img/overview.svg)
 
 **Inside a segment.** Sorted keys, a directory that finds a hash's run in
 one read, and every posting's reference and time packed to the width of
@@ -219,7 +219,7 @@ everything before a catalog exists
 - [docs/USAGE.md](docs/USAGE.md) - the full guide: concepts, feeding the index, reference ids, building, queries, searching and every option, reading candidates, custom scoring, changing a catalog while it serves, threads, memory, snapshots, segments, errors, features, production and troubleshooting
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) - every measurement, how the passes are arranged, and what was tried and left out
 - [docs/SCALING.md](docs/SCALING.md) - past one host: sharding by reference, replicas from segment files, a writer that fails, sizing a shard
-- [API reference](https://docs.rs/afpindex) on docs.rs
+- [API reference](https://docs.rs/hashtally) on docs.rs
 - [CHANGELOG.md](CHANGELOG.md)
 
 ## Performance
@@ -282,12 +282,12 @@ indexing or searching: they cost the most and tell the least.
   fingerprints in memory with nothing to build. By its README a query
   takes about 0.1 ms over 100 tracks and grows with the catalog, and above
   about 10,000 tracks it suggests pre-filters or sharding.
-- **A catalog:** `afpindex` is measured at 120,329 references and 499 M
+- **A catalog:** `hashtally` is measured at 120,329 references and 499 M
   postings. One search covers every reference exactly, the catalog
   survives restarts as a snapshot, and it changes while it serves.
 - **Instead of SQL:** on the 104 real clips, the production ClickHouse
   query agreed on 103. On the last one its `LIMIT 64 BY` keeps an
-  arbitrary 64 of a hash's 74 postings, where `afpindex` keeps the first
+  arbitrary 64 of a hash's 74 postings, where `hashtally` keeps the first
   64 by time.
 
 ## Security
@@ -315,7 +315,7 @@ indexing or searching: they cost the most and tell the least.
 ## Contributing
 
 ```bash
-git clone https://github.com/themankindproject/afpindex && cd afpindex
+git clone https://github.com/themankindproject/hashtally && cd hashtally
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check

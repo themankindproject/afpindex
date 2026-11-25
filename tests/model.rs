@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use afpindex::{
+use hashtally::{
     Candidate, Catalog, Posting, Query, RefCoding, Scratch, SearchError, SearchOptions, Segment,
 };
 

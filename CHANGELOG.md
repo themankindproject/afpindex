@@ -6,7 +6,7 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [0.1.0] - 2026-11-25
 
-First release: the engine of the *afpindex* design notes as a library.
+First release: the engine of the *hashtally* design notes as a library.
 
 ### Added
 

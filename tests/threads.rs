@@ -11,7 +11,7 @@
 //! must agree.
 #![cfg(feature = "std")]
 
-use afpindex::{
+use hashtally::{
     Candidate, Catalog, Posting, Query, Scratch, SearchOptions, Segment, max_threads,
     set_max_threads,
 };

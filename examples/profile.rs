@@ -44,7 +44,7 @@
 
 use std::time::Instant;
 
-use afpindex::{Catalog, CatalogStore, Query, RefCoding, Scratch, SearchOptions, vote_floor};
+use hashtally::{Catalog, CatalogStore, Query, RefCoding, Scratch, SearchOptions, vote_floor};
 
 mod support;
 use support::Rng;

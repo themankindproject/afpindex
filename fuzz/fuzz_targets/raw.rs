@@ -2,8 +2,8 @@
 
 #![no_main]
 
-use afpindex::{Catalog, Segment};
-use afpindex_fuzz::exercise;
+use hashtally::{Catalog, Segment};
+use hashtally_fuzz::exercise;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
