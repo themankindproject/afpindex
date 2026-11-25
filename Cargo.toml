@@ -50,6 +50,8 @@ codegen-units = 1
 missing_docs = "deny"
 unsafe_code  = "deny"
 missing_debug_implementations = "warn"
+# Set by `cargo fuzz`: the checksums pass, so mutations reach the parsers.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
 all      = { level = "warn", priority = -1 }

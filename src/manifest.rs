@@ -40,7 +40,7 @@ use alloc::vec::Vec;
 use std::io::Write;
 
 use crate::snapshot::{
-    Checksum, coding_flags, coding_of_flags, live_bitmap, live_of_bitmap, pad_len,
+    Checksum, coding_flags, coding_of_flags, live_bitmap, live_of_bitmap, pad_len, sums_match,
 };
 use crate::{RefCoding, SnapshotError};
 
@@ -276,7 +276,10 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
         });
     }
     let stored = bytes.get(end..end + 8).ok_or(SnapshotError::Truncated)?;
-    if u64::from_le_bytes(stored.try_into().expect("8 bytes")) != ck.finish() {
+    if !sums_match(
+        &u64::from_le_bytes(stored.try_into().expect("8 bytes")),
+        &ck.finish(),
+    ) {
         return Err(SnapshotError::Checksum);
     }
     check_files(&entries, next_file)?;

@@ -79,6 +79,26 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Each reader against damaged files for a minute a target: a load under
+  # the full checks either fails or gives a catalog that searches, changes
+  # and compacts without a panic.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - working-directory: fuzz
+        run: |
+          for target in raw snapshot store; do
+            cargo fuzz run -O "$target" -- -max_total_time=60 -timeout=10
+          done
+
   msrv:
     runs-on: ubuntu-latest
     steps:

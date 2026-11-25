@@ -332,6 +332,13 @@ pub(crate) fn index_sum(
 }
 
 /// The checksum of a packed array's bytes.
+/// Whether a stored checksum is the one computed. Always under
+/// `cfg(fuzzing)`, so that a fuzzer's changes reach the checks past it.
+#[inline]
+pub(crate) fn sums_match<T: PartialEq>(stored: &T, computed: &T) -> bool {
+    cfg!(fuzzing) || stored == computed
+}
+
 fn packed_sum(bytes: &[u8]) -> u64 {
     let mut ck = WordSum::new();
     ck.words(bytes);
@@ -650,7 +657,7 @@ fn read_footer<R: Read>(
     r.read_exact(&mut stored)?;
     let word = |i: usize| u64::from_le_bytes(stored[8 * i..8 * i + 8].try_into().expect("8 bytes"));
     let (times, refs) = (word(0), word(1));
-    if stored != head.footer([times, refs, index.sum()]) {
+    if !sums_match(&stored, &head.footer([times, refs, index.sum()])) {
         return Err(SnapshotError::Checksum);
     }
     Ok((times, refs))
@@ -772,7 +779,7 @@ fn read_segment<R: Read>(r: &mut R, check: Check) -> Result<(Segment, Ids), Snap
     read_pad(r, refs.data().len() as u64)?;
     let index = read_index(r, n_keys, head.refs)?;
     let stored = read_footer(r, &head, &index)?;
-    if full && stored != (times_sum.finish(), refs_sum.finish()) {
+    if full && !sums_match(&stored, &(times_sum.finish(), refs_sum.finish())) {
         return Err(SnapshotError::Checksum);
     }
     // The arrays were summed as they were read, if at all.
@@ -1241,7 +1248,7 @@ fn read_catalog_head<R: Read>(r: &mut R) -> Result<CatalogHead, SnapshotError> {
         ck.word(u64::from(b));
     }
     let end = read_pad(r, (CATALOG_HEADER + bitmap.len()) as u64)?;
-    if read_u64(r)? != ck.finish() {
+    if !sums_match(&read_u64(r)?, &ck.finish()) {
         return Err(SnapshotError::Checksum);
     }
     let live = live_of_bitmap(&bitmap, n_refs);
@@ -1327,7 +1334,11 @@ mod mapped {
         // The two arrays are nearly all of the bytes: they are summed on a
         // core of their own while the runs are checked.
         let sum = move |refs: &Refs, times: &Packed| {
-            check == Check::Trusted || stored == (packed_sum(times.data()), packed_sum(refs.data()))
+            check == Check::Trusted
+                || super::sums_match(
+                    &stored,
+                    &(packed_sum(times.data()), packed_sum(refs.data())),
+                )
         };
         let (seg, ids) = finish_segment(
             &head,

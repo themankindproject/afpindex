@@ -1,0 +1,37 @@
+[package]
+name = "afpindex-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+afpindex = { path = "..", features = ["mmap", "simd"] }
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+
+# Its own workspace, so the crate's builds never see it.
+[workspace]
+
+[[bin]]
+name = "raw"
+path = "fuzz_targets/raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store"
+path = "fuzz_targets/store.rs"
+test = false
+doc = false
+bench = false
