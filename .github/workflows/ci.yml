@@ -96,7 +96,9 @@ jobs:
       - working-directory: fuzz
         run: |
           for target in raw snapshot store; do
-            cargo fuzz run -O "$target" -- -max_total_time=60 -timeout=10
+            # The installed cargo-fuzz is a musl build, and builds for its own
+            # target unless told otherwise; the sanitizer needs glibc.
+            cargo fuzz run -O --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -timeout=10
           done
 
   msrv:
