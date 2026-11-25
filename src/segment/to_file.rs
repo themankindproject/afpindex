@@ -321,12 +321,9 @@ struct Gate {
     wake: Condvar,
 }
 
-/// Merge the pieces a thread at a time and write them in order.
-///
-/// A thread does not start a piece more than [`WINDOW`] times the thread
-/// count ahead of the one the file waits for: a piece merged before the
-/// pieces ahead of it would otherwise wait in memory while the threads run
-/// on, and that wait is what the window bounds.
+/// Merge the pieces a thread at a time and write them in order, never
+/// starting one more than [`WINDOW`] times the thread count ahead of the
+/// one the file waits for (see the module docs).
 fn write_in_pieces<F: Fn(u32) -> bool + Sync>(
     plan: &Plan<'_, F>,
     gate: &Gate,
@@ -651,21 +648,17 @@ mod tests {
             let written = merge_to_file(sides, &path, coding, settings).expect("the merge writes");
             let got = std::fs::read(&path).expect("the file it wrote");
             assert_eq!(got, want, "{what}, {coding:?}: bytes");
-            assert_eq!(written.ids, merged_refs(&merged), "{what}: the range");
+            let refs = || merged.postings().map(|p| p.reference);
+            assert_eq!(
+                written.ids,
+                refs().min().zip(refs().max()),
+                "{what}: the range"
+            );
             let back = Segment::read_from(got.as_slice()).expect("a valid snapshot");
             assert_eq!(back, merged, "{what}: the file reads back");
             packed = Some(merged);
         }
         packed.expect("a merge of each coding")
-    }
-
-    /// The smallest and the largest reference of a segment, if any.
-    fn merged_refs(seg: &Segment) -> Option<(u32, u32)> {
-        let mut ids: Option<(u32, u32)> = None;
-        for posting in seg.postings() {
-            ids = union_ids(ids, Some((posting.reference, posting.reference)));
-        }
-        ids
     }
 
     /// The settings a test merges with: `threads` threads and pieces of

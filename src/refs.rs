@@ -19,13 +19,12 @@
 //! that of its widest gap, so a run has one coding, and a merge can copy a
 //! run's bits or code its references again and get the same bytes.
 //!
-//! A gap is mostly much smaller than a reference: on the real catalog the
-//! references take 12.5 bits each instead of 17. A block decodes with the
-//! same kernels as a packed array (eight gaps a lane each, `crate::simd`),
-//! and a running sum from its base turns the gaps back into references.
-//! Because every block starts from a whole reference, a reader looking for
-//! a few references steps from base to base and decodes only the blocks
-//! that can hold them.
+//! A gap is mostly much smaller than a reference (see [`RefCoding::Gaps`]
+//! for the sizes). A block decodes with the same kernels as a packed
+//! array (eight gaps a lane each, `crate::simd`), and a running sum from
+//! its base turns the gaps back into references. Because every block
+//! starts from a whole reference, a reader looking for a few references
+//! steps from base to base and decodes only the blocks that can hold them.
 
 use crate::packed::{Packed, PackedBuilder, View};
 use crate::simd::{Decoder, LANES, Scalar, WINDOW};
@@ -253,9 +252,18 @@ impl Refs {
     }
 
     /// Load a byte of every cache line from bit `at` to `bits` bits past
-    /// it, and those up to `reach` bytes further for a short stretch, and
-    /// fold them together for a caller to discard (see
-    /// [`Packed::touch`]).
+    /// it, and for a short stretch those up to `reach` bytes further, and
+    /// fold them together for a caller to discard: the lines a decode of
+    /// the stretch will read are then on their way before it starts. A
+    /// decoder reads a window past the last value ([`WINDOW`] in blocks).
+    /// Consecutive loads are at most a line apart, so no line is skipped
+    /// whatever the alignment of the array.
+    ///
+    /// The line past a stretch is worth loading for a short one only: a
+    /// miss there would stall a decode that is otherwise done, where a long
+    /// one keeps decoding its own lines in the meantime and the line after
+    /// it is mostly the next one's. Measured on runs of 17 postings, the
+    /// reach took 8 % off a search; on runs of 136 it cost 2.5 %.
     #[inline]
     pub(crate) fn touch(&self, at: u64, bits: u64, reach: usize) -> u32 {
         /// Bytes per cache line on the targets this is tuned for.
@@ -810,7 +818,7 @@ mod tests {
                     v += if spread == 0 {
                         0
                     } else {
-                        rng.next() % (spread + 1)
+                        rng.below(spread + 1)
                     };
                     run.push(v.min(u64::from(u32::MAX)) as u32);
                 }
@@ -818,6 +826,13 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The gap-coded stream that `fill` writes.
+    fn stream(fill: impl FnOnce(&mut PackedBuilder)) -> Refs {
+        let mut out = PackedBuilder::with_capacity(0, 1);
+        fill(&mut out);
+        Refs::new(out.finish(), Layout::Gaps)
     }
 
     fn coded(runs: &[Vec<u32>]) -> (Refs, Vec<u64>) {
@@ -918,42 +933,39 @@ mod tests {
     #[test]
     fn a_check_refuses_what_is_not_the_canonical_coding() {
         // A first reference wider than it needs.
-        let mut out = PackedBuilder::with_capacity(0, 1);
-        out.push_bits(code_of(8), WIDTH_BITS);
-        out.push_bits(3, 8);
-        let refs = Refs::new(out.finish(), Layout::Gaps);
+        let refs = stream(|out| {
+            out.push_bits(code_of(8), WIDTH_BITS);
+            out.push_bits(3, 8);
+        });
         assert!(gap_run(&refs, 0, 1).check(Scalar, 13, |_| {}).is_err());
         // A block wider than its widest gap.
-        let mut out = PackedBuilder::with_capacity(0, 1);
-        out.push_bits(code_of(2), WIDTH_BITS);
-        out.push_bits(3, 2);
-        out.push_bits(code_of(4), WIDTH_BITS);
-        out.push_bits(1, 4);
-        let refs = Refs::new(out.finish(), Layout::Gaps);
+        let refs = stream(|out| {
+            out.push_bits(code_of(2), WIDTH_BITS);
+            out.push_bits(3, 2);
+            out.push_bits(code_of(4), WIDTH_BITS);
+            out.push_bits(1, 4);
+        });
         assert!(gap_run(&refs, 0, 2).check(Scalar, 16, |_| {}).is_err());
         // The canonical coding of the same run passes, at its own end only.
-        let mut out = PackedBuilder::with_capacity(0, 1);
-        push_run(&mut out, &[3, 4]);
-        let refs = Refs::new(out.finish(), Layout::Gaps);
+        let refs = stream(|out| push_run(out, &[3, 4]));
         assert!(gap_run(&refs, 0, 2).check(Scalar, 13, |_| {}).is_ok());
         assert!(gap_run(&refs, 0, 2).check(Scalar, 14, |_| {}).is_err());
         // A gap width that would read past the run's end and the stream's.
-        let mut out = PackedBuilder::with_capacity(0, 1);
-        out.push_bits(code_of(4), WIDTH_BITS);
-        out.push_bits(3, 4);
-        out.push_bits(code_of(32), WIDTH_BITS);
-        let end = out.len() as u64;
-        let refs = Refs::new(out.finish(), Layout::Gaps);
+        let refs = stream(|out| {
+            out.push_bits(code_of(4), WIDTH_BITS);
+            out.push_bits(3, 4);
+            out.push_bits(code_of(32), WIDTH_BITS);
+        });
         assert_eq!(
-            gap_run(&refs, 0, BLOCK).check(Scalar, end, |_| {}),
+            gap_run(&refs, 0, BLOCK).check(Scalar, refs.bit_len(), |_| {}),
             Err("a run runs past its end")
         );
         // A gap past the largest id.
-        let mut out = PackedBuilder::with_capacity(0, 1);
-        push_run(&mut out, &[u32::MAX - 1]);
-        out.push_bits(code_of(2), WIDTH_BITS);
-        out.push_bits(2, 2);
-        let refs = Refs::new(out.finish(), Layout::Gaps);
+        let refs = stream(|out| {
+            push_run(out, &[u32::MAX - 1]);
+            out.push_bits(code_of(2), WIDTH_BITS);
+            out.push_bits(2, 2);
+        });
         let end = refs.bit_len();
         assert!(gap_run(&refs, 0, 2).check(Scalar, end, |_| {}).is_err());
     }
@@ -961,15 +973,14 @@ mod tests {
     #[test]
     fn a_check_refuses_references_that_descend_across_blocks() {
         // Width 4; a first block of fives, then a block whose base is 3.
-        let mut out = PackedBuilder::with_capacity(0, 1);
-        out.push_bits(code_of(4), WIDTH_BITS);
-        out.push_bits(5, 4);
-        out.push_bits(code_of(0), WIDTH_BITS);
-        out.push_bits(3, 4);
-        let end = out.len() as u64;
-        let refs = Refs::new(out.finish(), Layout::Gaps);
+        let refs = stream(|out| {
+            out.push_bits(code_of(4), WIDTH_BITS);
+            out.push_bits(5, 4);
+            out.push_bits(code_of(0), WIDTH_BITS);
+            out.push_bits(3, 4);
+        });
         assert_eq!(
-            gap_run(&refs, 0, BLOCK + 1).check(Scalar, end, |_| {}),
+            gap_run(&refs, 0, BLOCK + 1).check(Scalar, refs.bit_len(), |_| {}),
             Err("a run's references descend")
         );
     }

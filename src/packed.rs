@@ -64,6 +64,16 @@ impl Packed {
     /// bounds.
     pub(crate) const SLACK: usize = 8;
 
+    /// `len` values of `bits` in `bytes`, slack included.
+    fn new(bytes: Bytes, len: usize, bits: u32) -> Self {
+        Self {
+            bytes,
+            bits,
+            mask: mask_of(bits),
+            len,
+        }
+    }
+
     /// Width that holds every value up to `max`.
     pub(crate) const fn bits_for(max: u32) -> u32 {
         u32::BITS - max.leading_zeros()
@@ -84,12 +94,7 @@ impl Packed {
             return None;
         }
         bytes.resize(bytes.len() + Self::SLACK, 0);
-        Some(Self {
-            bytes: Bytes::Owned(bytes),
-            bits,
-            mask: mask_of(bits),
-            len,
-        })
+        Some(Self::new(Bytes::Owned(bytes), len, bits))
     }
 
     /// Wrap the data bytes of `len` values of `bits` followed by the
@@ -102,12 +107,7 @@ impl Packed {
             Self::data_len(len, bits) + Self::SLACK,
             "data and slack"
         );
-        Self {
-            bytes: Bytes::Owned(bytes),
-            bits,
-            mask: mask_of(bits),
-            len,
-        }
+        Self::new(Bytes::Owned(bytes), len, bits)
     }
 
     /// The `n` bits (at most 57) from bit `bit` of the data on, in the low
@@ -173,16 +173,15 @@ impl Packed {
         if start.checked_add(window)? > map.len() {
             return None;
         }
-        Some(Self {
-            bytes: Bytes::Mapped {
+        Some(Self::new(
+            Bytes::Mapped {
                 map,
                 start,
                 len: window,
             },
-            bits,
-            mask: mask_of(bits),
             len,
-        })
+            bits,
+        ))
     }
 
     /// Pack `values` at the width of the largest.
@@ -307,41 +306,6 @@ impl Packed {
         i
     }
 
-    #[cfg(test)]
-    /// Load a byte of every cache line that entries `lo..hi` lie in, and
-    /// for a short range of those up to `reach` bytes past its last byte,
-    /// and fold them together for a caller to discard: the lines a decode
-    /// of the range will read are then on their way before it starts. A
-    /// decoder reads a window past the last entry (8 bytes one value at a
-    /// time, [`WINDOW`] in blocks). Consecutive loads are at most a line
-    /// apart, so no line is skipped whatever the alignment of the array.
-    #[inline]
-    pub(crate) fn touch(&self, lo: usize, hi: usize, reach: usize) -> u32 {
-        /// Bytes per cache line on the targets this is tuned for.
-        const LINE: usize = 64;
-        debug_assert!(lo < hi && hi <= self.len, "{lo}..{hi} past {}", self.len);
-        let bits = u64::from(self.bits);
-        let bytes = self.bytes.as_slice();
-        let first = ((lo as u64 * bits) >> 3) as usize;
-        // The byte of the range's last bit (its first byte at width 0).
-        let last = ((hi as u64 * bits).saturating_sub(1) >> 3).max(first as u64) as usize;
-        // The line past a range is worth loading for a short range only: a
-        // miss there would stall a decode that is otherwise done, where a
-        // long range keeps decoding its own lines in the meantime and the
-        // line after it is mostly the next range's. Measured on runs of 17
-        // postings, the reach took 8 % off a search; on runs of 136 it
-        // cost 2.5 %.
-        let reach = if last - first < 2 * LINE { reach } else { 0 };
-        let last = last.saturating_add(reach).min(bytes.len() - 1);
-        let mut acc = bytes[last];
-        let mut at = first;
-        while at < last {
-            acc ^= bytes[at];
-            at += LINE;
-        }
-        u32::from(acc)
-    }
-
     /// Entries a range must have before it is decoded in blocks: below
     /// this, setting a kernel up costs more than the values it decodes.
     pub(crate) const BLOCK_MIN: usize = 4;
@@ -421,13 +385,6 @@ impl Packed {
     #[inline]
     pub(crate) fn iter(&self, range: Range<usize>) -> impl ExactSizeIterator<Item = u32> + '_ {
         range.map(move |i| self.get(i))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn max(&self) -> Option<u32> {
-        let mut max = None;
-        self.for_each(0, self.len, |v| max = max.max(Some(v)));
-        max
     }
 
     /// First index in `lo..hi` whose value fails `pred`, or `hi`; the
@@ -538,14 +495,6 @@ impl PackedBuilder {
         self.len
     }
 
-    #[cfg(test)]
-    /// Append `v`, which must fit the width. For one value at a time;
-    /// [`PackedBuilder::extend`] keeps a loop's state in registers.
-    #[inline]
-    pub(crate) fn push(&mut self, v: u32) {
-        self.extend(core::iter::once(v));
-    }
-
     /// Append `values`, each of which must fit the width.
     ///
     /// The accumulator is a local for the length of the loop, so it stays
@@ -582,6 +531,14 @@ impl PackedBuilder {
     pub(crate) fn push_bits(&mut self, v: u64, n: u32) {
         debug_assert_eq!(self.bits, 1, "fields go into an array of single bits");
         debug_assert!(n <= u32::BITS, "a field of {n} bits");
+        self.put(v, n);
+        self.len += n as usize;
+    }
+
+    /// Add the low `n` bits of `v` (at most 32) to the pending ones, and
+    /// write out 32 of them once there are that many.
+    #[inline]
+    fn put(&mut self, v: u64, n: u32) {
         // At most 31 pending bits and 32 new ones, so nothing is lost.
         self.acc |= (v & mask_of(n)) << self.fill;
         self.fill += n;
@@ -591,7 +548,6 @@ impl PackedBuilder {
             self.acc >>= u32::BITS;
             self.fill -= u32::BITS;
         }
-        self.len += n as usize;
     }
 
     /// Append values `lo..hi` of `src`.
@@ -639,14 +595,7 @@ impl PackedBuilder {
         (self.acc, self.len) = (acc, self.len + (hi - lo));
         let rest = (total % u64::from(u32::BITS)) as u32;
         if rest > 0 {
-            self.acc |= (src.window(bit) & mask_of(rest)) << fill;
-            self.fill += rest;
-            if self.fill >= u32::BITS {
-                self.bytes
-                    .extend_from_slice(&(self.acc as u32).to_le_bytes());
-                self.acc >>= u32::BITS;
-                self.fill -= u32::BITS;
-            }
+            self.put(src.window(bit), rest);
         }
     }
 
@@ -659,12 +608,7 @@ impl PackedBuilder {
         debug_assert_eq!(self.bytes.len(), Packed::data_len(self.len, self.bits));
         self.bytes.resize(self.bytes.len() + Packed::SLACK, 0);
         self.bytes.shrink_to_fit();
-        Packed {
-            bytes: Bytes::Owned(self.bytes),
-            bits: self.bits,
-            mask: self.mask,
-            len: self.len,
-        }
+        Packed::new(Bytes::Owned(self.bytes), self.len, self.bits)
     }
 }
 
@@ -696,12 +640,18 @@ impl fmt::Debug for Packed {
 mod tests {
     use super::*;
     use crate::test_util::Rng;
+    use core::iter::once;
+
+    /// `n` random values of at most `bits` bits.
+    fn random(rng: &mut Rng, n: usize, bits: u32) -> Vec<u32> {
+        (0..n).map(|_| rng.bits(bits)).collect()
+    }
 
     #[test]
     fn round_trips_every_width() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         for bits in 0..=32u32 {
-            let values: Vec<u32> = (0..1_000).map(|_| rng.bits(bits)).collect();
+            let values = random(&mut rng, 1_000, bits);
             // Through a small capacity, so pushes grow the buffer.
             let p = Packed::pack(&values, bits, 3);
             assert_eq!(p.len(), values.len());
@@ -711,7 +661,7 @@ mod tests {
             assert_eq!(p.heap_bytes(), p.data().len() + Packed::SLACK);
             let back = Packed::from_bytes(p.data().to_vec(), values.len(), bits).unwrap();
             assert_eq!(back, p);
-            assert_eq!(back.max(), values.iter().copied().max());
+            assert_eq!(back.iter(0..back.len()).max(), values.iter().copied().max());
             // A count the bytes cannot hold is refused (width 0 holds any).
             if bits > 0 {
                 assert!(Packed::from_bytes(p.data().to_vec(), values.len() + 64, bits).is_none());
@@ -730,7 +680,7 @@ mod tests {
     fn appends_resume_where_the_last_one_stopped() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF1);
         for bits in 0..=32u32 {
-            let values: Vec<u32> = (0..300).map(|_| rng.bits(bits)).collect();
+            let values = random(&mut rng, 300, bits);
             let whole = Packed::pack(&values, bits, values.len());
             // The same width copies bits; a wider destination decodes.
             for out_bits in [bits, 32] {
@@ -765,7 +715,7 @@ mod tests {
     fn long_stretches_copy_as_they_decode() {
         let mut rng = Rng(0x0DDB_A110_5EED_1234);
         for bits in [1u32, 3, 7, 8, 13, 15, 17, 24, 31, 32] {
-            let values: Vec<u32> = (0..5_000).map(|_| rng.bits(bits)).collect();
+            let values = random(&mut rng, 5_000, bits);
             let whole = Packed::pack(&values, bits, values.len());
             for lead in 0..9 {
                 for (lo, hi) in [
@@ -780,7 +730,7 @@ mod tests {
                     b.extend_from(whole.view(), lo, hi);
                     // A value after the stretch shows where it left the
                     // pending bits.
-                    b.push(values[0]);
+                    b.extend(once(values[0]));
                     let want: Vec<u32> = values[..lead]
                         .iter()
                         .chain(&values[lo..hi])
@@ -803,7 +753,7 @@ mod tests {
     fn for_each_matches_get_at_every_width() {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         for bits in [0u32, 1, 7, 13, 17, 24, 31, 32] {
-            let values: Vec<u32> = (0..500).map(|_| rng.bits(bits)).collect();
+            let values = random(&mut rng, 500, bits);
             let p = Packed::pack(&values, bits, values.len());
             for (lo, hi) in [
                 (0, 0),
@@ -817,21 +767,6 @@ mod tests {
                 let mut got = Vec::new();
                 p.for_each(lo, hi, |v| got.push(v));
                 assert_eq!(got, values[lo..hi], "bits {bits}, {lo}..{hi}");
-            }
-        }
-    }
-
-    /// A touch stays inside the bytes for every width and range, up to
-    /// the last entry, and spans the lines a decode of the range reads.
-    #[test]
-    fn touch_stays_in_bounds_at_every_width() {
-        for bits in 0..=32u32 {
-            let values: Vec<u32> = (0..300).map(|i| i & mask_of(bits) as u32).collect();
-            let p = Packed::pack(&values, bits, values.len());
-            for (lo, hi) in [(0, 1), (0, 300), (299, 300), (17, 140), (64, 65), (1, 299)] {
-                for reach in [0, 7, WINDOW - 1, usize::MAX] {
-                    p.touch(lo, hi, reach);
-                }
             }
         }
     }

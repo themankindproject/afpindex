@@ -113,8 +113,12 @@ mod avx2 {
 
     const fn phase(bits: usize, start: usize) -> Phase {
         let high = (start + 4 * bits) >> 3;
-        let mut shuffle = [0u8; 32];
-        let mut shift = [0u64; LANES];
+        assert!(high + 16 <= WINDOW);
+        let mut words = Phase {
+            shuffle: [0; 4],
+            shift: [0; 4],
+            high,
+        };
         let mut lane = 0;
         while lane < LANES {
             let bit = start + lane * bits;
@@ -124,29 +128,14 @@ mod avx2 {
             assert!(from + 3 < 16);
             let mut byte = 0;
             while byte < 4 {
-                shuffle[lane * 4 + byte] = (from + byte) as u8;
+                // Control byte `at` is byte `at % 8` of its little-endian word.
+                let at = lane * 4 + byte;
+                words.shuffle[at / 8] |= ((from + byte) as i64) << (8 * (at % 8));
                 byte += 1;
             }
-            shift[lane] = (bit & 7) as u64;
+            // Two lanes to a word, the odd one in its high half.
+            words.shift[lane / 2] |= ((bit & 7) as i64) << (32 * (lane % 2));
             lane += 1;
-        }
-        assert!(high + 16 <= WINDOW);
-        let mut words = Phase {
-            shuffle: [0; 4],
-            shift: [0; 4],
-            high,
-        };
-        let mut word = 0;
-        while word < 4 {
-            let mut bytes = [0u8; 8];
-            let mut byte = 0;
-            while byte < 8 {
-                bytes[byte] = shuffle[word * 8 + byte];
-                byte += 1;
-            }
-            words.shuffle[word] = i64::from_le_bytes(bytes);
-            words.shift[word] = (shift[word * 2] | shift[word * 2 + 1] << 32) as i64;
-            word += 1;
         }
         words
     }
@@ -247,6 +236,7 @@ mod tests {
     use crate::packed::Packed;
 
     /// Reads every value of a range through whatever decoder it is given.
+    #[derive(Clone, Copy)]
     struct Collect<'a> {
         packed: &'a Packed,
         lo: usize,
@@ -300,11 +290,6 @@ mod tests {
                 let (got, blocks) = run(pass);
                 assert_eq!(got, values[lo..hi], "{bits} bits, {lo}..{hi}");
                 vector_blocks += blocks;
-                let pass = Collect {
-                    packed: &packed,
-                    lo,
-                    hi,
-                };
                 let (got, blocks) = pass.run(Scalar);
                 assert_eq!(got, values[lo..hi], "{bits} bits, {lo}..{hi}, scalar");
                 assert_eq!(blocks, 0);

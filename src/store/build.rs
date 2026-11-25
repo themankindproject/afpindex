@@ -142,7 +142,7 @@ impl CatalogStoreBuilder {
 
     /// Sort the rows held into a segment and write it to a chunk file.
     fn write_chunk(&mut self) -> io::Result<()> {
-        let segment = Segment::from_postings_in(core::mem::take(&mut self.rows), self.coding);
+        let segment = Segment::from_postings_coded(core::mem::take(&mut self.rows), self.coding);
         if segment.is_empty() {
             return Ok(());
         }

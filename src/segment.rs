@@ -22,7 +22,7 @@ pub(crate) mod to_file;
 /// `len == LONG` sends the lookup to the sorted keys for the run's end, so
 /// runs that long still resolve. `mult` lets the search skip the fanout
 /// test on a run where no reference can reach the fanout.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Slot {
     key: u32,
     start_lo: u32,
@@ -44,13 +44,6 @@ const PAGE_BITS: u32 = 20;
 const LONG: u32 = (1 << 16) - 1;
 
 impl Slot {
-    const EMPTY: Slot = Slot {
-        key: 0,
-        start_lo: 0,
-        len_mult_hi: 0,
-        refs: 0,
-    };
-
     #[inline]
     fn new(key: u32, start: u64, len: u64, mult: u8, refs: u32) -> Self {
         let len = u32::try_from(len).map_or(LONG, |l| l.min(LONG));
@@ -89,8 +82,7 @@ impl Slot {
 /// A directory slot as a segment stores it: whole, 16 bytes, for
 /// references coded as gaps, or [`Short`], 12, for packed references,
 /// where a run's references start at its first posting times the width.
-trait Stored: Copy + Send + Sync {
-    const EMPTY: Self;
+trait Stored: Copy + Default + Send + Sync {
     /// Whether the slot keeps [`Slot::refs`].
     const REFS: bool;
     fn of(slot: Slot) -> Self;
@@ -101,7 +93,6 @@ trait Stored: Copy + Send + Sync {
 }
 
 impl Stored for Slot {
-    const EMPTY: Self = Slot::EMPTY;
     const REFS: bool = true;
 
     #[inline]
@@ -126,7 +117,7 @@ impl Stored for Slot {
 }
 
 /// A [`Slot`] without its reference offset: 12 bytes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Short {
     key: u32,
     start_lo: u32,
@@ -134,11 +125,6 @@ struct Short {
 }
 
 impl Stored for Short {
-    const EMPTY: Self = Short {
-        key: 0,
-        start_lo: 0,
-        len_mult_hi: 0,
-    };
     const REFS: bool = false;
 
     #[inline]
@@ -416,12 +402,9 @@ fn sparse_slots(keys: usize) -> usize {
 }
 
 /// Slots in a directory over `keys` keys: the sparse load below
-/// [`SPARSE_KEYS`], the dense one from there.
-///
-/// A lookup that misses probes on to an empty slot, and that walk is most
-/// of what a lookup in a delta segment costs: at the denser load it is
-/// five slots, and at the sparser one under two. A hit costs one or two
-/// probes either way, and both stay inside one cache line.
+/// [`SPARSE_KEYS`], the dense one from there. A miss walks five slots at
+/// the dense load and under two at the sparse; a hit costs one or two
+/// probes either way, inside one cache line.
 fn slots_for(keys: usize) -> usize {
     if keys < SPARSE_KEYS {
         sparse_slots(keys)
@@ -475,7 +458,7 @@ fn build_table_with<T: Stored>(index: Index<'_>, pages: &[u64], slots: usize) ->
     }
     debug_assert!(slots > keys.len(), "a key needs a free slot");
     let n = keys.len();
-    let mut table = alloc::vec![T::EMPTY; slots];
+    let mut table = alloc::vec![T::default(); slots];
     // A key without postings (only arrays a reader has yet to reject) gets
     // no slot, which reads as "absent".
     let slot_of_key = |k: usize| {
@@ -509,7 +492,7 @@ fn build_table_with<T: Stored>(index: Index<'_>, pages: &[u64], slots: usize) ->
     for region in 0..regions {
         next[region + 1] += next[region];
     }
-    let mut by_region = alloc::vec![T::EMPTY; next[regions]];
+    let mut by_region = alloc::vec![T::default(); next[regions]];
     #[cfg(feature = "std")]
     let region_starts = next.clone();
     for slot in (0..n).filter_map(slot_of_key) {
@@ -968,13 +951,6 @@ impl<F> Source<'_, '_, F> {
 }
 
 impl Segment {
-    /// Load the directory slots of `hashes` and discard them, so their
-    /// cache misses overlap instead of waiting one lookup at a time.
-    #[inline]
-    fn touch_directory(&self, hashes: &[u32]) {
-        self.table.touch(hashes);
-    }
-
     /// Locate each of `hashes` in turn, calling `f` with its index and
     /// its run for those the segment holds. The slots of each batch of
     /// `batch` hashes are loaded while the batch before it resolves, so the
@@ -1046,7 +1022,7 @@ impl Segment {
     /// from there.
     #[inline]
     fn touch_first(&self) {
-        self.touch_directory(&self.keys[..AHEAD.min(self.keys.len())]);
+        self.table.touch(&self.keys[..AHEAD.min(self.keys.len())]);
     }
 
     /// Call before key `k` is looked up in a walk in key order: at the
@@ -1056,20 +1032,19 @@ impl Segment {
         if k.is_multiple_of(AHEAD) {
             let n = self.keys.len();
             let from = (k + AHEAD).min(n);
-            self.touch_directory(&self.keys[from..(from + AHEAD).min(n)]);
+            self.table.touch(&self.keys[from..(from + AHEAD).min(n)]);
         }
     }
 
     /// This segment as a source for a merge, filtered by `keep` if given:
     /// a walk over every hash and its run, hashes ascending.
     ///
-    /// The walk never looks a key up. A lookup per key is a cache miss per
-    /// key once the directory outgrows the cache, which is most of the
-    /// cost of merging segments with few postings per hash. Instead the
-    /// directory is read once in memory order and its runs are sorted by
-    /// where they start, which is key order because runs are laid out in
-    /// key order: sequential passes only, over 24 bytes per key that are
-    /// released when the merge ends.
+    /// The walk never looks a key up (a cache miss per key once the
+    /// directory outgrows the cache; see [`AHEAD`]). Instead the directory
+    /// is read once in memory order and its runs are sorted by where they
+    /// start, which is key order because runs are laid out in key order:
+    /// sequential passes only, over 24 bytes per key that are released
+    /// when the merge ends.
     fn source<'k, F>(&self, keep: Option<&'k F>) -> Source<'_, 'k, F> {
         let mut order: Vec<(u64, u64)> = Vec::with_capacity(self.keys.len());
         self.table.for_each_in(0, self.table.len(), |slot| {
@@ -1126,25 +1101,12 @@ impl Segment {
     /// Load every cache line of the coded references of a run of `n`
     /// postings from bit `at`, as far as the segment's density says it
     /// reaches, and those up to `reach` bytes past it (the caller discards
-    /// the value the same way; see [`Packed::touch`]).
+    /// the value the same way; see [`Refs::touch`]).
     #[inline]
     pub(crate) fn touch_refs(&self, at: u64, n: usize, reach: usize) -> u32 {
         debug_assert!(n > 0, "a run is never empty");
         self.refs
             .touch(at, n as u64 * u64::from(self.density), reach)
-    }
-
-    /// The references of the run of postings `lo..lo + n`, whose stream
-    /// starts at bit `at`.
-    #[inline]
-    pub(crate) fn run_refs(&self, at: u64, lo: usize, n: usize) -> refs::Run<'_> {
-        self.refs.run(at, lo, n)
-    }
-
-    /// Load the time at entry `i` (the caller discards it the same way).
-    #[inline]
-    pub(crate) fn touch_time(&self, i: usize) -> u32 {
-        self.times.get(i)
     }
 }
 
@@ -1159,26 +1121,18 @@ impl Segment {
     /// ([`RefCoding::Packed`]).
     ///
     /// Sorts the rows in place (a radix sort on the hash, so close to linear
-    /// time), drops exact duplicates, and copies them into the segment's
-    /// packed arrays (the bits of a reference and a time per posting, about
-    /// `4n` bytes at the usual widths) and its keys, while the `12n`-byte
-    /// `rows` are still alive. The rows are freed before the directory is
-    /// built. With `std`, a million rows or more are sorted and packed on
-    /// every core.
+    /// time), drops exact duplicates and builds the segment; the `12n`-byte
+    /// `rows` are freed before the directory is. With `std`, a million rows
+    /// or more are sorted and packed on every core.
     #[must_use]
     pub fn from_postings(rows: Vec<Posting>) -> Self {
-        Self::from_postings_in(rows, RefCoding::Packed)
+        Self::from_postings_coded(rows, RefCoding::Packed)
     }
 
     /// [`Segment::from_postings`], with the references stored as `coding`
     /// says.
     #[must_use]
-    pub fn from_postings_coded(rows: Vec<Posting>, coding: RefCoding) -> Self {
-        Self::from_postings_in(rows, coding)
-    }
-
-    /// [`Segment::from_postings_coded`].
-    pub(crate) fn from_postings_in(mut rows: Vec<Posting>, coding: RefCoding) -> Self {
+    pub fn from_postings_coded(mut rows: Vec<Posting>, coding: RefCoding) -> Self {
         crate::sort::sort_postings(&mut rows);
         // A large input is packed on every core, in pieces cut at hash
         // boundaries; the result is the same segment.
@@ -1188,18 +1142,7 @@ impl Segment {
             Err(rows) => rows,
         };
         rows.dedup();
-        // The widths and the number of distinct hashes in one pass, so the
-        // key arrays are allocated once at their final size.
-        let (mut max_ref, mut max_time, mut keys) = (0, 0, 0usize);
-        let mut prev = None;
-        for p in &rows {
-            max_ref = max_ref.max(p.reference);
-            max_time = max_time.max(p.time);
-            if prev != Some(p.hash) {
-                keys += 1;
-                prev = Some(p.hash);
-            }
-        }
+        let (max_ref, max_time, keys) = measure(&rows);
         let mut out = Writer::with_capacity(
             rows.len(),
             keys,
@@ -1313,7 +1256,8 @@ impl Segment {
         self.touch_first();
         self.keys.iter().enumerate().map(|(k, &key)| {
             self.touch_ahead(k);
-            self.slot(key)
+            self.table
+                .find(key)
                 .map_or((0, 0, 0), |s| (s.start(), self.ref_at(&s), s.mult()))
         })
     }
@@ -1346,17 +1290,11 @@ impl Segment {
         let mults: Vec<u8> = offsets
             .windows(2)
             .map(|w| {
-                let run = &refs[w[0] as usize..w[1] as usize];
-                let (mut best, mut streak) = (0u32, 0u32);
-                for (i, &r) in run.iter().enumerate() {
-                    streak = if i > 0 && run[i - 1] == r {
-                        streak + 1
-                    } else {
-                        1
-                    };
-                    best = best.max(streak);
-                }
-                u8::try_from(best).unwrap_or(u8::MAX)
+                let mut streaks = Streaks::default();
+                refs[w[0] as usize..w[1] as usize]
+                    .iter()
+                    .for_each(|&r| streaks.see(r));
+                u8::try_from(streaks.longest).unwrap_or(u8::MAX)
             })
             .collect();
         let layout = Layout::new(coding, refs.iter().copied().max().unwrap_or(0));
@@ -1432,7 +1370,6 @@ impl Segment {
         self.table = Table::build(index, &self.pages, slots, self.refs.layout());
     }
 
-    #[cfg(feature = "std")]
     #[inline]
     pub(crate) fn refs(&self) -> &Refs {
         &self.refs
@@ -1443,14 +1380,8 @@ impl Segment {
         &self.times
     }
 
-    /// The directory slot of `hash`, if the segment holds the hash.
-    #[inline]
-    fn slot(&self, hash: u32) -> Option<Slot> {
-        self.table.find(hash)
-    }
-
     /// Entry range of `hash`'s run, if the segment holds the hash.
-    #[cfg(any(feature = "std", test))]
+    #[cfg(test)]
     #[inline]
     pub(crate) fn range(&self, hash: u32) -> Option<(usize, usize)> {
         self.locate(hash).map(|run| (run.lo, run.hi))
@@ -1466,7 +1397,7 @@ impl Segment {
     /// Where `hash`'s run is, if the segment holds the hash.
     #[inline]
     pub(crate) fn locate(&self, hash: u32) -> Option<Located> {
-        let slot = self.slot(hash)?;
+        let slot = self.table.find(hash)?;
         Some(self.located(&slot, hash, self.ref_at(&slot)))
     }
 
@@ -1497,7 +1428,7 @@ impl Segment {
             .binary_search(&hash)
             .expect("a key in the directory is in the sorted keys");
         match self.keys.get(k + 1) {
-            Some(&next) => self.slot(next).expect("every key has a slot").start() as usize,
+            Some(&next) => self.table.find(next).expect("every key has a slot").start() as usize,
             None => self.len(),
         }
     }
@@ -1653,6 +1584,14 @@ impl Segment {
         if let Some(merged) = parallel::merge_all(sides, layout) {
             return merged;
         }
+        Self::merge_serial(sides, layout)
+    }
+
+    /// [`Segment::merge_all`] on the calling thread.
+    pub(crate) fn merge_serial<F: Fn(u32) -> bool>(
+        sides: &[(&Segment, Option<&F>)],
+        layout: Layout,
+    ) -> Segment {
         // Every source's keys, an upper bound on the merge's distinct
         // hashes: one allocation each for the keys, their starts and their
         // multiplicities instead of a doubling per batch of runs.
@@ -1699,6 +1638,24 @@ impl Segment {
         }
         out.finish()
     }
+}
+
+/// The largest reference, the largest time and the number of distinct
+/// hashes of sorted `rows`, in one pass, so the key arrays are allocated
+/// once at their final size.
+#[inline]
+pub(crate) fn measure(rows: &[Posting]) -> (u32, u32, usize) {
+    let (mut max_ref, mut max_time, mut keys) = (0, 0, 0usize);
+    let mut prev = None;
+    for p in rows {
+        max_ref = max_ref.max(p.reference);
+        max_time = max_time.max(p.time);
+        if prev != Some(p.hash) {
+            keys += 1;
+            prev = Some(p.hash);
+        }
+    }
+    (max_ref, max_time, keys)
 }
 
 /// Postings across `sides`, saturating.
@@ -1958,10 +1915,6 @@ mod tests {
             run.iter().collect::<Vec<_>>(),
             vec![(0, 10), (1, 20), (1, 30)]
         );
-        assert_eq!(
-            run.iter().collect::<Vec<_>>(),
-            vec![(0, 10), (1, 20), (1, 30)]
-        );
         assert_eq!(s.run(0).unwrap().iter().collect::<Vec<_>>(), vec![(3, 9)]);
         assert_eq!(
             s.run(u32::MAX).unwrap().iter().collect::<Vec<_>>(),
@@ -2090,7 +2043,7 @@ mod tests {
         let short = Short::of(s);
         assert_eq!((short.key(), short.len()), (7, LONG - 1));
         assert_eq!(short.slot().order(), s.order());
-        assert_eq!(Slot::EMPTY.len(), 0);
+        assert_eq!(Slot::default().len(), 0);
     }
 
     #[test]
@@ -2327,15 +2280,8 @@ mod tests {
         }
         // Hashes the keys miss. They cover the image of a bijection, so a
         // sorted copy answers the lookups as the directory must.
-        for j in 0..4_096u32 {
-            let probe = j.wrapping_mul(0x85EB_CA6B) | 1;
-            assert_eq!(
-                s.run(probe).is_some(),
-                keys.binary_search_by_key(&probe, |&(hash, _)| hash).is_ok(),
-                "hash {probe}"
-            );
-        }
-        for probe in [u32::MAX, 0x8000_0001] {
+        let probes = (0..4_096u32).map(|j| j.wrapping_mul(0x85EB_CA6B) | 1);
+        for probe in probes.chain([u32::MAX, 0x8000_0001]) {
             assert_eq!(
                 s.run(probe).is_some(),
                 keys.binary_search_by_key(&probe, |&(hash, _)| hash).is_ok(),

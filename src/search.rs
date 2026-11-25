@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 use core::fmt;
 
 use crate::packed::Packed;
@@ -50,16 +51,13 @@ pub struct SearchOptions {
     /// votes, up to 3 GiB with the groups). The scratch keeps what a search
     /// grew; [`Scratch::shrink_to_fit`] gives it back.
     pub max_votes: usize,
-    /// Threads one search may run on (`std`). A search that reads many
-    /// postings cuts the reference ids into one range per thread and counts
-    /// each range on a thread of its own, at most as many as the hardware
-    /// has and only when each gets enough postings to be worth a thread;
-    /// the calling thread is one of them. Results do not depend on it.
-    /// Each thread beyond the first keeps buffers of its own in the
+    /// Threads one search may run on (`std`): a search that reads many
+    /// postings counts them on up to this many threads, at most the
+    /// hardware's, the calling thread among them. Results do not depend on
+    /// it. Each thread beyond the first keeps buffers of its own in the
     /// [`Scratch`], as large as a scratch's on one thread. Default 1, which
-    /// suits a server that runs as many searches at once as it has cores;
-    /// more lowers the latency of a large search where cores are idle.
-    /// Without `std` every search runs on the calling thread.
+    /// suits a server that already runs a search per core. Without `std`
+    /// every search runs on the calling thread.
     pub threads: usize,
 }
 
@@ -151,12 +149,8 @@ impl Candidate {
         bins: &[Bin],
         options: &SearchOptions,
     ) -> Option<Self> {
-        let mut best = *bins.first()?;
-        for b in &bins[1..] {
-            if b.votes > best.votes || (b.votes == best.votes && b.delta < best.delta) {
-                best = *b;
-            }
-        }
+        // The first of the bins with the most votes and then the smallest Δ.
+        let best = *bins.iter().min_by_key(|b| (Reverse(b.votes), b.delta))?;
         let tol = u64::from(options.offset_tolerance);
         let noise = || bins.iter().filter(|x| x.delta.abs_diff(best.delta) > tol);
         let (mut n, mut sum, mut max) = (0usize, 0.0f64, 0u32);
@@ -273,7 +267,9 @@ impl RunLoc {
     /// The run's coded references.
     #[inline]
     fn refs<'a>(&self, segments: &[&'a Segment]) -> crate::refs::Run<'a> {
-        segments[self.segment as usize].run_refs(self.at, self.lo, self.hi - self.lo)
+        segments[self.segment as usize]
+            .refs()
+            .run(self.at, self.lo, self.hi - self.lo)
     }
 }
 
@@ -323,6 +319,12 @@ pub struct Scratch {
     /// The scratches of the threads of a search that runs on several.
     #[cfg(feature = "std")]
     workers: Vec<std::sync::Mutex<Scratch>>,
+    /// Tests force how the survivor scan finds the counters the totals
+    /// pass wrote: `Some(true)` for the record of written blocks,
+    /// `Some(false)` for a scan of every counter, `None` for the search's
+    /// own choice.
+    #[cfg(test)]
+    track: Option<bool>,
 }
 
 impl Scratch {
@@ -340,6 +342,15 @@ impl Scratch {
     /// Heap bytes currently held.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
+        #[cfg(feature = "std")]
+        let workers = self.workers.capacity() * size_of::<std::sync::Mutex<Scratch>>()
+            + self
+                .workers
+                .iter()
+                .map(|w| crate::par::lock(w).heap_bytes())
+                .sum::<usize>();
+        #[cfg(not(feature = "std"))]
+        let workers = 0;
         self.totals.capacity() * size_of::<u32>()
             + self.touched.capacity()
             + self.survivor_bits.capacity() * size_of::<u64>()
@@ -351,23 +362,7 @@ impl Scratch {
             + self.cursor.capacity() * size_of::<usize>()
             + self.votes.capacity() * size_of::<(i64, u32)>()
             + self.bins.capacity() * size_of::<Bin>()
-            + self.workers_heap_bytes()
-    }
-
-    #[cfg(feature = "std")]
-    fn workers_heap_bytes(&self) -> usize {
-        self.workers.capacity() * size_of::<std::sync::Mutex<Scratch>>()
-            + self
-                .workers
-                .iter()
-                .map(|w| crate::par::lock(w).heap_bytes())
-                .sum::<usize>()
-    }
-
-    #[cfg(not(feature = "std"))]
-    #[expect(clippy::unused_self, reason = "the std build reads the workers")]
-    fn workers_heap_bytes(&self) -> usize {
-        0
+            + workers
     }
 
     fn fit(&mut self, n_refs: usize) {
@@ -428,6 +423,9 @@ fn vote_count(survivor_totals: &[u32], options: &SearchOptions) -> Result<usize,
 /// sort keyed by survivor), its groups are found in the runs, and its
 /// votes are scattered there. The counters and the survivor bits are
 /// zero again at the end.
+// Out of line: inlined into the search it moved the hot passes' code
+// layout and cost about 0.5% of a search's instructions.
+#[inline(never)]
 fn scatter_phase(
     segments: &[&Segment],
     query: &Query,
@@ -486,26 +484,6 @@ fn scatter_phase(
         cursor.iter().zip(&slots[1..]).all(|(c, s)| c == s),
         "scatter count mismatch"
     );
-}
-
-/// Bin each survivor's votes and hand it to `visit`, in the order of
-/// `survivors`.
-fn emit<F: FnMut(Survivor<'_>)>(
-    votes: &mut [(i64, u32)],
-    slots: &[usize],
-    survivors: &[u32],
-    survivor_totals: &[u32],
-    bins: &mut Vec<Bin>,
-    visit: &mut F,
-) {
-    for (sv, &r) in survivors.iter().enumerate() {
-        bins_of(&mut votes[slots[sv]..slots[sv + 1]], bins);
-        visit(Survivor {
-            reference: r,
-            total_votes: survivor_totals[sv],
-            bins,
-        });
-    }
 }
 
 /// Postings a search reads before it is cut across threads. Starting the
@@ -623,32 +601,15 @@ impl Marks for MarkBlocks {
 }
 
 /// The counters of the totals pass, and the record of which blocks of
-/// them were written. A pass borrows the two halves once with
-/// [`Counters::parts`] and then writes both together, so the record stays
-/// in step with the counters whichever way the pass counts.
+/// them were written. A pass takes the two halves apart once and then
+/// writes both together, so the record stays in step with the counters
+/// whichever way the pass counts.
 struct Counters<'a, M: Marks> {
     /// One vote total per reference.
     totals: &'a mut [u32],
     /// What marks the blocks written: one byte per [`SCAN_BLOCK`]
     /// counters, or nothing.
     marks: M::Store<'a>,
-}
-
-/// The two halves of a [`Counters`], borrowed separately so a hot loop
-/// loads each pointer once.
-struct CounterParts<'b, 'a, M: Marks> {
-    totals: &'b mut [u32],
-    marks: &'b mut M::Store<'a>,
-}
-
-impl<'a, M: Marks> Counters<'a, M> {
-    /// Borrow the counters and the record of written blocks apart.
-    fn parts<'b>(&'b mut self) -> CounterParts<'b, 'a, M> {
-        CounterParts {
-            totals: self.totals,
-            marks: &mut self.marks,
-        }
-    }
 }
 
 /// Totals pass: each run adds `query_times × min(count, fanout)` to each
@@ -721,17 +682,20 @@ fn for_each_run(segments: &[&Segment], runs: &[RunLoc], visit: impl FnMut(CodedR
     for_each_run!(segments, runs, Packed::SLACK, visit);
 }
 
-/// The plain totals pass over one run: `$whole` reads a run in which
-/// every posting counts, which is how the stream and the block passes
-/// differ.
+/// The plain totals pass over one run: `$each` reads a run in which every
+/// posting counts, which is how the stream and the block passes differ.
 ///
 /// Inside a run a reference's postings are neighbours, so an entry is its
 /// reference's `fanout + 1`th or later posting exactly when the
 /// `fanout` entries before it have its reference: a count of the streak
 /// so far answers that without a second read of the run.
 macro_rules! count_run {
-    ($fanout:expr, $whole:expr, $totals:expr, $marks:expr, $each:expr) => {{
-        let (fanout, whole): (Option<usize>, usize) = ($fanout, $whole);
+    ($fanout:expr, $totals:expr, $marks:expr, $each:expr) => {{
+        let fanout: Option<usize> = $fanout;
+        // The largest multiplicity that proves no reference of a run
+        // reaches the fanout. A saturated multiplicity is only a lower
+        // bound, so it proves nothing whatever the fanout.
+        let whole = fanout.map_or(0, |f| f.min(usize::from(u8::MAX) - 1));
         let each = $each;
         move |run: CodedRun<'_>, qc: u32, mult: u8| match fanout {
             // Every posting counts, which on real catalogs is nearly every
@@ -751,13 +715,6 @@ macro_rules! count_run {
             None => each(run, qc, &mut *$totals, &mut *$marks),
         }
     }};
-}
-
-/// The largest multiplicity that proves no reference of a run reaches the
-/// fanout. A saturated multiplicity is only a lower bound, so it proves
-/// nothing whatever the fanout.
-fn whole_below(fanout: Option<usize>) -> usize {
-    fanout.map_or(0, |f| f.min(usize::from(u8::MAX) - 1))
 }
 
 /// The totals pass with plain adds.
@@ -781,12 +738,13 @@ impl<M: Marks> Pass for CountPlain<'_, M> {
             segments,
             fanout,
             runs,
-            mut counters,
+            counters,
         } = self;
         if !D::BLOCKS {
             return count_plain(segments, fanout, runs, counters);
         }
-        let CounterParts { totals, marks } = counters.parts();
+        let Counters { totals, mut marks } = counters;
+        let marks = &mut marks;
         let each = |run: CodedRun<'_>, qc: u32, totals: &mut [u32], marks: &mut M::Store<'_>| {
             run.for_each_in(
                 decoder,
@@ -805,7 +763,7 @@ impl<M: Marks> Pass for CountPlain<'_, M> {
             segments,
             runs,
             simd::WINDOW - 1,
-            count_run!(fanout, whole_below(fanout), totals, marks, each)
+            count_run!(fanout, totals, marks, each)
         );
     }
 }
@@ -815,20 +773,17 @@ fn count_plain<M: Marks>(
     segments: &[&Segment],
     fanout: Option<usize>,
     runs: &[RunLoc],
-    mut counters: Counters<'_, M>,
+    counters: Counters<'_, M>,
 ) {
-    let CounterParts { totals, marks } = counters.parts();
+    let Counters { totals, mut marks } = counters;
+    let marks = &mut marks;
     let each = |run: CodedRun<'_>, qc: u32, totals: &mut [u32], marks: &mut M::Store<'_>| {
         run.for_each(|r| {
             totals[r as usize] += qc;
             M::mark(marks, r);
         });
     };
-    for_each_run(
-        segments,
-        runs,
-        count_run!(fanout, whole_below(fanout), totals, marks, each),
-    );
+    for_each_run(segments, runs, count_run!(fanout, totals, marks, each));
 }
 
 /// Count every run straight into the counters, saturating at `u32::MAX`
@@ -838,9 +793,10 @@ fn count_direct<M: Marks>(
     segments: &[&Segment],
     fanout: Option<usize>,
     runs: &[RunLoc],
-    mut counters: Counters<'_, M>,
+    counters: Counters<'_, M>,
 ) {
-    let CounterParts { totals, marks } = counters.parts();
+    let Counters { totals, mut marks } = counters;
+    let marks = &mut marks;
     let f = fanout.unwrap_or(usize::MAX);
     for_each_run(segments, runs, |run, qc, _| {
         let (mut last, mut streak) = (!run.first(), 0usize);
@@ -867,7 +823,22 @@ struct Group {
     hi: usize,
 }
 
-/// The first half of the histogram pass, as [`find_groups`] does it.
+/// First half of the histogram pass: find every survivor's group in every
+/// run, in run order then reference order (`index` then holds each
+/// survivor's index plus one, and `survivors` ascend).
+///
+/// A run is grouped by reference, ascending. Packed references are read
+/// where they are: a run with few survivors relative to its length is
+/// searched for each survivor, and a run with many is walked once with a
+/// bitmap membership test per group. References coded as gaps are read in
+/// order, but every block of them starts from a whole reference, so only
+/// the blocks whose span of references holds a survivor are decoded; the
+/// rest cost a read of their first fields. A group of a survivor never
+/// reaches into a block passed over, which would have held the survivor,
+/// so a group ends where the reference changes or the decoded stretch
+/// does. A group is no longer than the run's multiplicity, so its end is
+/// not looked for when that is one. The references are decoded through
+/// the pass's decoder and are still cached from the totals pass.
 struct FindGroups<'a> {
     segments: &'a [&'a Segment],
     fanout: Option<usize>,
@@ -883,16 +854,107 @@ impl Pass for FindGroups<'_> {
 
     #[inline(always)]
     fn run<D: Decoder>(self, decoder: D) {
-        find_groups(
-            self.segments,
-            self.fanout,
-            self.runs,
-            self.survivors,
-            self.survivor_bits,
-            self.index,
-            self.groups,
-            decoder,
-        );
+        let Self {
+            segments,
+            fanout,
+            runs,
+            survivors,
+            survivor_bits,
+            index,
+            groups,
+        } = self;
+        groups.clear();
+        debug_assert!(survivors.is_sorted(), "survivors ascend");
+        let n_surv = survivors.len();
+        let is_survivor = |r: u32| survivor_bits[(r >> 6) as usize] & (1u64 << (r & 63)) != 0;
+        for run in runs {
+            let (run_lo, run_hi) = (run.lo, run.hi);
+            let len = run_hi - run_lo;
+            // Groups as entries of the segment.
+            let mut push = |i: usize, j: usize, survivor: u32| {
+                let end = fanout.map_or(j, |f| j.min(i.saturating_add(f)));
+                groups.push(Group {
+                    segment: run.segment,
+                    hash: run.hash,
+                    survivor,
+                    lo: i,
+                    hi: end,
+                });
+            };
+            let refs = match run.refs(segments) {
+                CodedRun::Packed { refs, .. } => refs,
+                CodedRun::Gaps(coded) => {
+                    gap_groups(
+                        &coded,
+                        run_lo,
+                        run.mult,
+                        survivors,
+                        is_survivor,
+                        index,
+                        decoder,
+                        &mut push,
+                    );
+                    continue;
+                }
+            };
+            // Probing costs about `survivors × log2(len)`; walking costs `len`.
+            let probe_cost =
+                n_surv.saturating_mul((usize::BITS - len.leading_zeros()) as usize + 1);
+            if probe_cost < len {
+                // The most postings a group can have; a saturated multiplicity
+                // is only a lower bound.
+                let longest = if run.mult == u8::MAX {
+                    len
+                } else {
+                    usize::from(run.mult)
+                };
+                let mut lo = run_lo;
+                for (sv, &r) in survivors.iter().enumerate() {
+                    let i = first_not_below(refs, lo, run_hi, r, decoder);
+                    if i == run_hi {
+                        break;
+                    }
+                    lo = i;
+                    if refs.get(i) != r {
+                        continue;
+                    }
+                    let j = if longest == 1 {
+                        i + 1
+                    } else {
+                        let end = run_hi.min(i.saturating_add(longest));
+                        refs.partition_point(i + 1, end, |x| x == r)
+                    };
+                    push(i, j, sv as u32);
+                    lo = j;
+                }
+            } else if run.mult == 1 {
+                // Every posting is its own group: a membership test per
+                // posting, no search for the group's end.
+                let mut i = run_lo;
+                refs.for_each_in(run_lo, run_hi, decoder, |r| {
+                    if is_survivor(r) {
+                        push(i, i + 1, index[r as usize] - 1);
+                    }
+                    i += 1;
+                });
+            } else {
+                // One read of the run: a group ends where the reference
+                // changes.
+                let (mut i, mut start, mut current) = (run_lo, run_lo, refs.get(run_lo));
+                refs.for_each_in(run_lo, run_hi, decoder, |r| {
+                    if r != current {
+                        if is_survivor(current) {
+                            push(start, i, index[current as usize] - 1);
+                        }
+                        (start, current) = (i, r);
+                    }
+                    i += 1;
+                });
+                if is_survivor(current) {
+                    push(start, run_hi, index[current as usize] - 1);
+                }
+            }
+        }
     }
 }
 
@@ -940,11 +1002,11 @@ fn first_not_below<D: Decoder>(
     refs.partition_point(lo, hi, |x| x < r)
 }
 
-/// The groups of [`find_groups`] in a run of references coded as gaps,
+/// The groups of [`FindGroups`] in a run of references coded as gaps,
 /// at positions from `run_lo`: only the blocks whose span of references
 /// holds a survivor are decoded, and a group ends where the reference
 /// changes or the decoded stretch does.
-#[expect(clippy::too_many_arguments, reason = "the state of `find_groups`")]
+#[expect(clippy::too_many_arguments, reason = "the state of `FindGroups`")]
 #[inline(always)]
 fn gap_groups<D: Decoder>(
     coded: &Coded<'_>,
@@ -995,127 +1057,6 @@ fn gap_groups<D: Decoder>(
     }
 }
 
-/// First half of the histogram pass: find every survivor's group in every
-/// run, in run order then reference order (`index` then holds each
-/// survivor's index plus one, and `survivors` ascend).
-///
-/// A run is grouped by reference, ascending. Packed references are read
-/// where they are: a run with few survivors relative to its length is
-/// searched for each survivor, and a run with many is walked once with a
-/// bitmap membership test per group. References coded as gaps are read in
-/// order, but every block of them starts from a whole reference, so only
-/// the blocks whose span of references holds a survivor are decoded; the
-/// rest cost a read of their first fields. A group of a survivor never
-/// reaches into a block passed over, which would have held the survivor,
-/// so a group ends where the reference changes or the decoded stretch
-/// does. A group is no longer than the run's multiplicity, so its end is
-/// not looked for when that is one. The references are decoded through
-/// `decoder` and are still cached from the totals pass.
-#[expect(clippy::too_many_arguments, reason = "the fields of `FindGroups`")]
-#[inline(always)]
-fn find_groups<D: Decoder>(
-    segments: &[&Segment],
-    fanout: Option<usize>,
-    runs: &[RunLoc],
-    survivors: &[u32],
-    survivor_bits: &[u64],
-    index: &[u32],
-    groups: &mut Vec<Group>,
-    decoder: D,
-) {
-    groups.clear();
-    debug_assert!(survivors.is_sorted(), "survivors ascend");
-    let n_surv = survivors.len();
-    let is_survivor = |r: u32| survivor_bits[(r >> 6) as usize] & (1u64 << (r & 63)) != 0;
-    for run in runs {
-        let (run_lo, run_hi) = (run.lo, run.hi);
-        let len = run_hi - run_lo;
-        // Groups as entries of the segment.
-        let mut push = |i: usize, j: usize, survivor: u32| {
-            let end = fanout.map_or(j, |f| j.min(i.saturating_add(f)));
-            groups.push(Group {
-                segment: run.segment,
-                hash: run.hash,
-                survivor,
-                lo: i,
-                hi: end,
-            });
-        };
-        let refs = match run.refs(segments) {
-            CodedRun::Packed { refs, .. } => refs,
-            CodedRun::Gaps(coded) => {
-                gap_groups(
-                    &coded,
-                    run_lo,
-                    run.mult,
-                    survivors,
-                    is_survivor,
-                    index,
-                    decoder,
-                    &mut push,
-                );
-                continue;
-            }
-        };
-        // Probing costs about `survivors × log2(len)`; walking costs `len`.
-        let probe_cost = n_surv.saturating_mul((usize::BITS - len.leading_zeros()) as usize + 1);
-        if probe_cost < len {
-            // The most postings a group can have; a saturated multiplicity
-            // is only a lower bound.
-            let longest = if run.mult == u8::MAX {
-                len
-            } else {
-                usize::from(run.mult)
-            };
-            let mut lo = run_lo;
-            for (sv, &r) in survivors.iter().enumerate() {
-                let i = first_not_below(refs, lo, run_hi, r, decoder);
-                if i == run_hi {
-                    break;
-                }
-                lo = i;
-                if refs.get(i) != r {
-                    continue;
-                }
-                let j = if longest == 1 {
-                    i + 1
-                } else {
-                    let end = run_hi.min(i.saturating_add(longest));
-                    refs.partition_point(i + 1, end, |x| x == r)
-                };
-                push(i, j, sv as u32);
-                lo = j;
-            }
-        } else if run.mult == 1 {
-            // Every posting is its own group: a membership test per
-            // posting, no search for the group's end.
-            let mut i = run_lo;
-            refs.for_each_in(run_lo, run_hi, decoder, |r| {
-                if is_survivor(r) {
-                    push(i, i + 1, index[r as usize] - 1);
-                }
-                i += 1;
-            });
-        } else {
-            // One read of the run: a group ends where the reference
-            // changes.
-            let (mut i, mut start, mut current) = (run_lo, run_lo, refs.get(run_lo));
-            refs.for_each_in(run_lo, run_hi, decoder, |r| {
-                if r != current {
-                    if is_survivor(current) {
-                        push(start, i, index[current as usize] - 1);
-                    }
-                    (start, current) = (i, r);
-                }
-                i += 1;
-            });
-            if is_survivor(current) {
-                push(start, run_hi, index[current as usize] - 1);
-            }
-        }
-    }
-}
-
 /// Second half of the histogram pass: write each group's `(Δ, query_time)`
 /// votes at its survivor's cursor. The times of a group are the first
 /// cold lines of the search, so each batch of groups is loaded while the
@@ -1130,7 +1071,7 @@ fn write_votes(
     let n = groups.len();
     let touch = |from: usize, to: usize| {
         let acc = groups[from.min(n)..to.min(n)].iter().fold(0u32, |acc, g| {
-            acc ^ segments[g.segment as usize].touch_time(g.lo)
+            acc ^ segments[g.segment as usize].times().get(g.lo)
         });
         core::hint::black_box(acc);
     };
@@ -1206,26 +1147,6 @@ impl Catalog {
         query: &Query,
         options: &SearchOptions,
         scratch: &mut Scratch,
-        visit: F,
-    ) -> Result<(), SearchError>
-    where
-        F: FnMut(Survivor<'_>),
-    {
-        self.search_tracked(query, options, scratch, None, visit)
-    }
-
-    /// [`Catalog::search_with`], with `track` choosing how the survivor
-    /// scan finds the counters the totals pass wrote: `Some(true)` for the
-    /// record of written blocks, `Some(false)` for a scan of every
-    /// counter, `None` for the choice the search makes for itself once
-    /// its runs are located. Tests pass the first two to compare the paths
-    /// on one catalog.
-    fn search_tracked<F>(
-        &self,
-        query: &Query,
-        options: &SearchOptions,
-        scratch: &mut Scratch,
-        track: Option<bool>,
         mut visit: F,
     ) -> Result<(), SearchError>
     where
@@ -1237,56 +1158,48 @@ impl Catalog {
         if fanout == Some(0) {
             return Ok(());
         }
-        let n_refs = self.reference_count();
-        let floor = options.min_total_votes.max(1);
         // Segments are shared handles; the passes take a view of them. The
         // small vector is the only per-search allocation beyond the scratch.
         let segments: Vec<&Segment> = self.segments().collect();
         let segments: &[&Segment] = &segments;
-        scratch.fit(n_refs);
+        scratch.fit(self.reference_count());
         locate(segments, query, &mut scratch.runs);
-        #[cfg(feature = "std")]
-        if let Some(threads) = parallel_threads(options, &scratch.runs) {
-            return self.search_parallel(segments, query, options, scratch, threads, floor, visit);
-        }
-        self.count_phase(segments, fanout, scratch, n_refs, track, floor)?;
+        self.count_phase(segments, options, scratch)?;
         if scratch.survivors.is_empty() {
             return Ok(());
         }
         let n_votes = vote_count(&scratch.survivor_totals, options)?;
         scatter_phase(segments, query, fanout, scratch, n_votes);
-        let Scratch {
-            survivors,
-            survivor_totals,
-            slots,
-            votes,
-            bins,
-            ..
-        } = scratch;
-        emit(
-            &mut votes[..n_votes],
-            slots,
-            survivors,
-            survivor_totals,
-            bins,
-            &mut visit,
-        );
+        for (sv, &r) in scratch.survivors.iter().enumerate() {
+            let slot = scratch.slots[sv]..scratch.slots[sv + 1];
+            bins_of(&mut scratch.votes[slot], &mut scratch.bins);
+            visit(Survivor {
+                reference: r,
+                total_votes: scratch.survivor_totals[sv],
+                bins: &scratch.bins,
+            });
+        }
         Ok(())
     }
 
     /// The totals pass and the survivor scan over the runs `scratch` has
-    /// located, by the path `track` chooses (`None` for the search's own
-    /// choice): the survivors and their totals are left in the scratch,
-    /// and the counters are zero again, error or not.
+    /// located: the survivors and their totals are left in the scratch, and
+    /// the counters are zero again, error or not. The counters are zero at
+    /// entry too.
     fn count_phase(
         &self,
         segments: &[&Segment],
-        fanout: Option<usize>,
+        options: &SearchOptions,
         scratch: &mut Scratch,
-        n_refs: usize,
-        track: Option<bool>,
-        floor: u32,
     ) -> Result<(), SearchError> {
+        let floor = options.min_total_votes.max(1);
+        #[cfg(feature = "std")]
+        if let Some(threads) = parallel_threads(options, &scratch.runs) {
+            return self.count_parallel(segments, options.fanout, scratch, threads, floor);
+        }
+        let n_refs = self.reference_count();
+        #[cfg(test)]
+        let scratch_track = scratch.track;
         let Scratch {
             totals,
             touched,
@@ -1305,56 +1218,67 @@ impl Catalog {
         // blocks left out are worth more than the stores. A short query
         // over a catalog of many references records; a long one over the
         // same catalog does not.
-        let track = track.unwrap_or_else(|| postings_of(runs) < n_blocks);
+        let track = postings_of(runs) < n_blocks;
+        #[cfg(test)]
+        let track = scratch_track.unwrap_or(track);
+        let fanout = options.fanout;
         *dirty = true;
-        let taken = self.count_and_take(
-            segments,
-            fanout,
-            runs,
-            totals,
-            touched,
-            n_blocks,
-            track,
-            floor,
-            survivors,
-            survivor_totals,
-        );
+        // The path is chosen once, and the pass is compiled for it, so
+        // marking a block costs no branch per posting.
+        let taken = if track {
+            totals_pass(
+                Counters::<MarkBlocks> {
+                    totals,
+                    marks: &mut touched[..n_blocks],
+                },
+                segments,
+                fanout,
+                runs,
+            );
+            self.take_touched(
+                totals,
+                &mut touched[..n_blocks],
+                floor,
+                survivors,
+                survivor_totals,
+            )
+        } else {
+            totals_pass(
+                Counters::<ScanAll> { totals, marks: () },
+                segments,
+                fanout,
+                runs,
+            );
+            self.take_survivors(totals, floor, survivors, survivor_totals)
+        };
         // The counters are clean again, whether or not the pass found an
         // overflow.
         *dirty = false;
         taken
     }
 
-    /// [`Catalog::search_tracked`] with its totals pass on `threads`
-    /// threads, for runs already located in `scratch`.
+    /// [`Catalog::count_phase`] with its totals pass on `threads`
+    /// threads.
     ///
     /// The runs are cut into one share per thread of about equal postings,
     /// and each thread counts its share with the totals pass of a search on
     /// one thread into counters of its own, marking the blocks it writes.
     /// The calling thread then adds the marked blocks into the scratch's
     /// counters, saturating so that an overflow is caught as it is on one
-    /// thread, and the survivor scan, the histogram pass and the visits run
-    /// as they do there. A run is never cut, so no thread looks anything up
-    /// to split the work.
+    /// thread, and the survivor scan reads the marked blocks. A run is never
+    /// cut, so no thread looks anything up to split the work.
     #[cfg(feature = "std")]
-    #[expect(clippy::too_many_arguments, reason = "the parts of a search")]
-    fn search_parallel<F>(
+    fn count_parallel(
         &self,
         segments: &[&Segment],
-        query: &Query,
-        options: &SearchOptions,
+        fanout: Option<usize>,
         scratch: &mut Scratch,
         threads: usize,
         floor: u32,
-        mut visit: F,
-    ) -> Result<(), SearchError>
-    where
-        F: FnMut(Survivor<'_>),
-    {
+    ) -> Result<(), SearchError> {
         use crate::par::{lock, run_tasks};
         let n_refs = self.reference_count();
         let n_blocks = n_refs.div_ceil(SCAN_BLOCK);
-        let fanout = options.fanout;
         while scratch.workers.len() < threads {
             scratch
                 .workers
@@ -1427,77 +1351,7 @@ impl Catalog {
         }
         let taken = self.take_touched(totals, touched, floor, survivors, survivor_totals);
         *dirty = false;
-        taken?;
-        if scratch.survivors.is_empty() {
-            return Ok(());
-        }
-        let n_votes = vote_count(&scratch.survivor_totals, options)?;
-        scatter_phase(segments, query, fanout, scratch, n_votes);
-        let Scratch {
-            survivors,
-            survivor_totals,
-            slots,
-            votes,
-            bins,
-            ..
-        } = scratch;
-        emit(
-            &mut votes[..n_votes],
-            slots,
-            survivors,
-            survivor_totals,
-            bins,
-            &mut visit,
-        );
-        Ok(())
-    }
-
-    /// Fill the counters from the runs and take the survivors out of them,
-    /// by the path `track` chooses. The counters are zero at entry and at
-    /// exit, whether the search goes on to the histogram pass or stops
-    /// here with an error.
-    #[expect(clippy::too_many_arguments, reason = "the fields of the scratch")]
-    fn count_and_take(
-        &self,
-        segments: &[&Segment],
-        fanout: Option<usize>,
-        runs: &[RunLoc],
-        totals: &mut [u32],
-        touched: &mut [u8],
-        n_blocks: usize,
-        track: bool,
-        floor: u32,
-        survivors: &mut Vec<u32>,
-        survivor_totals: &mut Vec<u32>,
-    ) -> Result<(), SearchError> {
-        // The path is chosen once, and the pass is compiled for it, so
-        // marking a block costs no branch per posting.
-        if track {
-            totals_pass(
-                Counters::<MarkBlocks> {
-                    totals,
-                    marks: &mut touched[..n_blocks],
-                },
-                segments,
-                fanout,
-                runs,
-            );
-            self.take_touched(
-                totals,
-                &mut touched[..n_blocks],
-                floor,
-                survivors,
-                survivor_totals,
-            )
-        } else {
-            totals_pass(
-                Counters::<ScanAll> { totals, marks: () },
-                segments,
-                fanout,
-                runs,
-            );
-            self.take_survivors(totals, floor, survivors, survivor_totals)
-        }
+        taken
     }
 
     /// Move the survivors out of the counters, reading every block: the
@@ -1514,8 +1368,6 @@ impl Catalog {
         survivors: &mut Vec<u32>,
         survivor_totals: &mut Vec<u32>,
     ) -> Result<(), SearchError> {
-        survivors.clear();
-        survivor_totals.clear();
         let mut scratch = SurvivorScan::new(survivors, survivor_totals);
         for (b, block) in totals.chunks_mut(SCAN_BLOCK).enumerate() {
             self.drain_block(b, block, floor, &mut scratch);
@@ -1535,8 +1387,6 @@ impl Catalog {
         survivors: &mut Vec<u32>,
         survivor_totals: &mut Vec<u32>,
     ) -> Result<(), SearchError> {
-        survivors.clear();
-        survivor_totals.clear();
         let mut scratch = SurvivorScan::new(survivors, survivor_totals);
         // Eight mark bytes per word, read as one little-endian `u64`: a
         // zero word skips eight blocks, and `set` names the marked bytes
@@ -1633,8 +1483,8 @@ impl Catalog {
     }
 }
 
-/// The survivors of one scan, and the first reference whose counter
-/// overflowed.
+/// The survivors of one scan, which starts from empty buffers, and the
+/// first reference whose counter overflowed.
 struct SurvivorScan<'a> {
     survivors: &'a mut Vec<u32>,
     totals: &'a mut Vec<u32>,
@@ -1643,6 +1493,8 @@ struct SurvivorScan<'a> {
 
 impl<'a> SurvivorScan<'a> {
     fn new(survivors: &'a mut Vec<u32>, totals: &'a mut Vec<u32>) -> Self {
+        survivors.clear();
+        totals.clear();
         Self {
             survivors,
             totals,
@@ -1651,10 +1503,9 @@ impl<'a> SurvivorScan<'a> {
     }
 
     fn finish(self) -> Result<(), SearchError> {
-        match self.overflow {
-            Some(reference) => Err(SearchError::TotalsOverflow { reference }),
-            None => Ok(()),
-        }
+        self.overflow.map_or(Ok(()), |reference| {
+            Err(SearchError::TotalsOverflow { reference })
+        })
     }
 }
 
@@ -1662,6 +1513,7 @@ impl<'a> SurvivorScan<'a> {
 mod tests {
     use super::*;
     use crate::Posting;
+    use crate::test_util::Rng;
     use alloc::vec;
 
     fn bin(delta: i64, votes: u32) -> Bin {
@@ -1977,6 +1829,20 @@ mod tests {
         assert_eq!(totals, [0, 0]);
     }
 
+    /// [`Catalog::search`] with the block record forced on or off.
+    fn candidates(
+        cat: &Catalog,
+        query: &Query,
+        options: &SearchOptions,
+        scratch: &mut Scratch,
+        track: bool,
+    ) -> Result<Vec<Candidate>, SearchError> {
+        scratch.track = Some(track);
+        let found = cat.search(query, options, scratch);
+        scratch.track = None;
+        found
+    }
+
     /// Every search of a pair below runs with the block record on and off,
     /// so both survivor scans see the same catalog, and the pair agrees on
     /// the candidates. Each search runs on the other one's scratch too, so
@@ -1989,24 +1855,90 @@ mod tests {
         let mut first = Scratch::new();
         let mut second = Scratch::new();
         let with = |track, scratch: &mut Scratch| {
-            let mut out = Vec::new();
-            cat.search_tracked(query, options, scratch, Some(track), |s| {
-                out.push(s.candidate(options));
-            })
-            .map(|()| out)
+            candidates(cat, query, options, scratch, track).expect("the search succeeds")
         };
         // A search on each scratch first, then the opposite path on the
         // same scratch: neither leaves a counter, a mark or a survivor bit
         // behind.
-        let _ = with(true, &mut first).expect("the recorded path succeeds");
+        with(true, &mut first);
         assert_scratch_clean(cat, &first);
-        let scanned = with(false, &mut first).expect("the scanned path succeeds");
+        let scanned = with(false, &mut first);
         assert_scratch_clean(cat, &first);
-        let _ = with(false, &mut second).expect("the scanned path succeeds");
+        with(false, &mut second);
         assert_scratch_clean(cat, &second);
-        let tracked = with(true, &mut second).expect("the recorded path succeeds");
+        let tracked = with(true, &mut second);
         assert_scratch_clean(cat, &second);
         (tracked, scanned)
+    }
+
+    /// The block record and the full scan agree on `query` through every
+    /// arm of `count_run!`: the whole run (multiplicity below the fanout),
+    /// the fixed ring, a fanout past the ring, and no fanout.
+    fn agree_across_fanouts(cat: &Catalog, query: &Query) {
+        for fanout in [Some(64), Some(32), Some(1), None] {
+            let o = SearchOptions {
+                fanout,
+                ..SearchOptions::default()
+            };
+            let (tracked, scanned) = both_paths(cat, query, &o);
+            assert_eq!(tracked, scanned, "fanout {fanout:?}");
+        }
+    }
+
+    /// Both errors a search can report, on a catalog whose reference 0 has
+    /// 70,000 postings of hash 5, each by both survivor scans and each
+    /// leaving the scratch clean for the search that follows.
+    fn check_error_paths(cat: &Catalog) {
+        // The saturating path, and the totals error it reports: 70,000
+        // postings of one hash against 65,000 query times need 4.55
+        // billion votes, past what a 32-bit counter holds.
+        let wide = Query::from_pairs((0..65_000u32).map(|t| (5, t)), None);
+        let o = SearchOptions {
+            fanout: None,
+            max_votes: usize::MAX,
+            ..SearchOptions::default()
+        };
+        let mut s = Scratch::new();
+        for track in [true, false] {
+            assert_eq!(
+                candidates(cat, &wide, &o, &mut s, track).unwrap_err(),
+                SearchError::TotalsOverflow { reference: 0 },
+                "overflow, tracking {track}"
+            );
+            assert_scratch_clean(cat, &s);
+        }
+        assert_eq!(
+            cat.search(&wide, &o, &mut s).unwrap_err(),
+            SearchError::TotalsOverflow { reference: 0 },
+            "the same scratch still sees clean counters"
+        );
+
+        // The other error: hash 5 gives reference 0 64 × 65,000 votes.
+        let mut pairs: Vec<(u32, u32)> = (0..65_000u32).map(|t| (5, t)).collect();
+        pairs.extend((0..65u32).map(|t| (6, t)));
+        let q = Query::from_pairs(pairs, None);
+        let tight = SearchOptions {
+            fanout: Some(64),
+            max_votes: 1_000,
+            ..SearchOptions::default()
+        };
+        for track in [true, false] {
+            assert!(
+                matches!(
+                    candidates(cat, &q, &tight, &mut s, track),
+                    Err(SearchError::TooManyVotes { max: 1_000, .. })
+                ),
+                "too many votes, tracking {track}"
+            );
+            assert_scratch_clean(cat, &s);
+        }
+        let small = Query::from_pairs([(5, 0), (6, 0)], Some(64));
+        let got = cat
+            .search(&small, &SearchOptions::default(), &mut s)
+            .unwrap();
+        let (tracked, scanned) = both_paths(cat, &small, &SearchOptions::default());
+        assert_eq!(got, tracked);
+        assert_eq!(got, scanned);
     }
 
     /// The counters and the block marks a search's totals pass writes, as
@@ -2115,77 +2047,18 @@ mod tests {
             }
         }
 
-        // Every arm of `count_run!`: the whole run (multiplicity below the
-        // fanout), the fixed ring, a fanout past the ring, and no fanout.
-        let query = Query::from_pairs([(1, 0), (2, 0), (7, 0), (7, 5)], None);
-        for fanout in [Some(64), Some(32), Some(1), None] {
-            let o = SearchOptions {
-                fanout,
-                ..SearchOptions::default()
-            };
-            let (tracked, scanned) = both_paths(&catalog, &query, &o);
-            assert_eq!(tracked, scanned, "fanout {fanout:?}");
-        }
+        agree_across_fanouts(
+            &catalog,
+            &Query::from_pairs([(1, 0), (2, 0), (7, 0), (7, 5)], None),
+        );
 
-        // The saturating path, and the totals error it reports, on a
-        // catalog of many blocks: 70 000 postings of one hash against
-        // 65 000 query times need 4.55 billion votes for reference 0.
+        // Both errors, on a catalog of many blocks: reference 0 has 70,000
+        // postings of hash 5 and every reference one of hash 6.
         let mut rows: Vec<Posting> = (0..70_000u32).map(|t| Posting::new(5, 0, t)).collect();
         rows.extend((0..70_000u32).map(|r| Posting::new(6, r, 0)));
         let sat = Catalog::from_segment(Segment::from_postings(rows));
         assert!(sat.reference_count().div_ceil(SCAN_BLOCK) > 1_000);
-        let wide = Query::from_pairs((0..65_000u32).map(|t| (5, t)), None);
-        let o = SearchOptions {
-            fanout: None,
-            max_votes: usize::MAX,
-            ..SearchOptions::default()
-        };
-        let mut s = Scratch::new();
-        for track in [true, false] {
-            assert_eq!(
-                sat.search_tracked(&wide, &o, &mut s, Some(track), |_| {})
-                    .unwrap_err(),
-                SearchError::TotalsOverflow { reference: 0 },
-                "overflow, tracking {track}"
-            );
-            assert_scratch_clean(&sat, &s);
-        }
-        assert_eq!(
-            sat.search(&wide, &o, &mut s).unwrap_err(),
-            SearchError::TotalsOverflow { reference: 0 },
-            "the same scratch still sees clean counters"
-        );
-
-        // The other error, which the same catalog reports once many
-        // references survive: hash 5 gives reference 0 64 × 65,000 votes
-        // and hash 6 gives each of the 70,000 references 65.
-        let mut pairs: Vec<(u32, u32)> = (0..65_000u32).map(|t| (5, t)).collect();
-        pairs.extend((0..65u32).map(|t| (6, t)));
-        let q = Query::from_pairs(pairs, None);
-        let tight = SearchOptions {
-            fanout: Some(64),
-            max_votes: 1_000,
-            ..SearchOptions::default()
-        };
-        for track in [true, false] {
-            assert_eq!(
-                sat.search_tracked(&q, &tight, &mut s, Some(track), |_| {})
-                    .unwrap_err(),
-                SearchError::TooManyVotes {
-                    votes: 64 * 65_000 + 70_000 * 65,
-                    max: 1_000
-                },
-                "too many votes, tracking {track}"
-            );
-            assert_scratch_clean(&sat, &s);
-        }
-        let small = Query::from_pairs([(6, 0)], Some(64));
-        let got = sat
-            .search(&small, &SearchOptions::default(), &mut s)
-            .unwrap();
-        let (tracked, scanned) = both_paths(&sat, &small, &SearchOptions::default());
-        assert_eq!(got, tracked);
-        assert_eq!(got, scanned);
+        check_error_paths(&sat);
     }
 
     /// A catalog searched with the block record forced on and forced off
@@ -2226,74 +2099,17 @@ mod tests {
             assert_eq!(tracked, scanned, "{qrows} rows");
         }
 
-        // Every arm of `count_run!`: the whole run (multiplicity below the
-        // fanout), the fixed ring, a fanout past the ring, and no fanout.
-        let query = Query::from_pairs((0..48u32).flat_map(|h| [(h, 0), (h, 5)]), None);
-        for fanout in [Some(64), Some(32), Some(1), None] {
-            let o = SearchOptions {
-                fanout,
-                ..SearchOptions::default()
-            };
-            let (tracked, scanned) = both_paths(&catalog, &query, &o);
-            assert_eq!(tracked, scanned, "fanout {fanout:?}");
-        }
-
-        // The saturating path, and the totals error it reports: 70 000
-        // postings of one hash against 65 000 query times need 4.55
-        // billion votes, past what a 32-bit counter holds.
-        let many: Vec<Posting> = (0..70_000u32).map(|t| Posting::new(5, 0, t)).collect();
-        let sat = Catalog::from_segment(Segment::from_postings(many));
-        let wide = Query::from_pairs((0..65_000u32).map(|t| (5, t)), None);
-        let o = SearchOptions {
-            fanout: None,
-            max_votes: usize::MAX,
-            ..SearchOptions::default()
-        };
-        let mut s = Scratch::new();
-        for track in [true, false] {
-            assert_eq!(
-                sat.search_tracked(&wide, &o, &mut s, Some(track), |_| {})
-                    .unwrap_err(),
-                SearchError::TotalsOverflow { reference: 0 },
-                "overflow, tracking {track}"
-            );
-            assert_scratch_clean(&sat, &s);
-        }
-        assert_eq!(
-            sat.search(&wide, &o, &mut s).unwrap_err(),
-            SearchError::TotalsOverflow { reference: 0 },
-            "the same scratch still sees clean counters"
+        agree_across_fanouts(
+            &catalog,
+            &Query::from_pairs((0..48u32).flat_map(|h| [(h, 0), (h, 5)]), None),
         );
 
-        // The other error, on its own scratch, which it also leaves clean
-        // before a search of the same catalog answers.
+        // Both errors: 70,000 postings of hash 5 for reference 0 and ten
+        // for reference 1.
         let mut rows: Vec<Posting> = (0..70_000u32).map(|i| Posting::new(5, 0, i)).collect();
         rows.extend((0..10u32).map(|i| Posting::new(5, 1, i)));
-        let big = Catalog::from_segment(Segment::from_postings(rows));
-        let q = Query::from_pairs((0..65_000u32).map(|t| (5, t)), None);
-        let tight = SearchOptions {
-            fanout: Some(64),
-            max_votes: 1_000,
-            ..SearchOptions::default()
-        };
-        for track in [true, false] {
-            assert!(matches!(
-                big.search_tracked(&q, &tight, &mut s, Some(track), |_| {}),
-                Err(SearchError::TooManyVotes { .. })
-            ));
-            assert_scratch_clean(&big, &s);
-        }
-        let small = Query::from_pairs([(5, 0)], Some(64));
-        let got = big
-            .search(&small, &SearchOptions::default(), &mut s)
-            .unwrap();
-        let (tracked, scanned) = both_paths(&big, &small, &SearchOptions::default());
-        assert_eq!(got, tracked);
-        assert_eq!(got, scanned);
+        check_error_paths(&Catalog::from_segment(Segment::from_postings(rows)));
     }
-
-    /// A small deterministic generator for the randomised comparison.
-    use crate::test_util::Rng;
 
     /// A random catalog of `refs` references over `hashes` hashes in
     /// several `add_many` batches, with some references removed. Every
@@ -2340,14 +2156,6 @@ mod tests {
             let catalog = random_catalog(&mut rng, refs, hashes);
             assert!(refs.div_ceil(SCAN_BLOCK) > 8, "many blocks of counters");
             let mut scratch = Scratch::new();
-            let with = |track, scratch: &mut Scratch, q: &Query, o: &SearchOptions| {
-                let mut out = Vec::new();
-                catalog
-                    .search_tracked(q, o, scratch, Some(track), |s| {
-                        out.push(s.candidate(o));
-                    })
-                    .map(|()| out)
-            };
             for _ in 0..12 {
                 let qrows = 1 + rng.below(60) as usize;
                 let mut pairs: Vec<(u32, u32)> = (0..qrows)
@@ -2360,9 +2168,11 @@ mod tests {
                     fanout: [Some(64), Some(3), Some(1), None][rng.below(4) as usize],
                     ..SearchOptions::default()
                 };
-                let tracked = with(true, &mut scratch, &query, &o).expect("recorded path");
+                let tracked =
+                    candidates(&catalog, &query, &o, &mut scratch, true).expect("recorded path");
                 assert_scratch_clean(&catalog, &scratch);
-                let scanned = with(false, &mut scratch, &query, &o).expect("scanned path");
+                let scanned =
+                    candidates(&catalog, &query, &o, &mut scratch, false).expect("scanned path");
                 assert_scratch_clean(&catalog, &scratch);
                 assert_eq!(tracked, scanned, "seed {seed:#x}");
             }
@@ -2430,36 +2240,35 @@ mod tests {
         let mut totals = alloc::vec![0u32; n];
         let mut touched = alloc::vec![0u8; n_blocks];
         let want = mark_blocks(&mut totals, &mut touched, &marked, floor);
-        let (mut survivors, mut survivor_totals) = (Vec::new(), Vec::new());
-        cat.take_touched(
-            &mut totals,
-            &mut touched,
-            floor,
-            &mut survivors,
-            &mut survivor_totals,
-        )
-        .expect("no counter overflows");
-        let got: Vec<(u32, u32)> = survivors
-            .iter()
-            .copied()
-            .zip(&survivor_totals)
-            .map(|(r, &t)| (r, t))
-            .collect();
-        assert_eq!(got, want, "the survivors of the marked blocks, ascending");
-        assert_eq!(touched, alloc::vec![0u8; n_blocks], "every mark cleared");
-        for (b, &mark) in touched.iter().enumerate() {
-            let lo = b * SCAN_BLOCK;
-            let hi = (lo + SCAN_BLOCK).min(n);
-            if marked.contains(&b) {
+        // The survivors with their totals, or the error, of one scan.
+        let take = |cat: &Catalog, totals: &mut [u32], touched: &mut [u8]| {
+            let (mut survivors, mut survivor_totals) = (Vec::new(), Vec::new());
+            cat.take_touched(totals, touched, floor, &mut survivors, &mut survivor_totals)
+                .map(|()| {
+                    survivors
+                        .into_iter()
+                        .zip(survivor_totals)
+                        .collect::<Vec<(u32, u32)>>()
+                })
+        };
+        // Every counter of a marked block is zero again.
+        let assert_reset = |totals: &[u32]| {
+            for &b in &marked {
+                let lo = b * SCAN_BLOCK;
+                let hi = (lo + SCAN_BLOCK).min(n);
                 assert_eq!(
                     totals[lo..hi],
                     alloc::vec![0u32; hi - lo],
                     "block {b} reset"
                 );
-            } else {
-                assert_eq!(mark, 0, "block {b}'s mark");
-                assert_eq!(totals[lo], floor + 100, "block {b} left alone");
             }
+        };
+        let got = take(&cat, &mut totals, &mut touched).expect("no counter overflows");
+        assert_eq!(got, want, "the survivors of the marked blocks, ascending");
+        assert_eq!(touched, alloc::vec![0u8; n_blocks], "every mark cleared");
+        assert_reset(&totals);
+        for b in (0..n_blocks).filter(|b| !marked.contains(b)) {
+            assert_eq!(totals[b * SCAN_BLOCK], floor + 100, "block {b} left alone");
         }
 
         // A removed reference at the floor in a marked block is not a
@@ -2468,16 +2277,9 @@ mod tests {
         assert!(cat.remove(gone as u32));
         mark_blocks(&mut totals, &mut touched, &marked, floor);
         totals[gone] = floor + 1;
-        cat.take_touched(
-            &mut totals,
-            &mut touched,
-            floor,
-            &mut survivors,
-            &mut survivor_totals,
-        )
-        .expect("no counter overflows");
-        assert_eq!(survivors.len(), marked.len());
-        assert!(survivors.iter().all(|&r| r as usize != gone));
+        let got = take(&cat, &mut totals, &mut touched).expect("no counter overflows");
+        assert_eq!(got.len(), marked.len());
+        assert!(got.iter().all(|&(r, _)| r as usize != gone));
         assert_eq!(totals[gone], 0, "a removed reference's counter is reset");
         assert_eq!(touched, alloc::vec![0u8; n_blocks]);
 
@@ -2486,28 +2288,13 @@ mod tests {
         mark_blocks(&mut totals, &mut touched, &marked, floor);
         totals[16 * SCAN_BLOCK + 5] = u32::MAX;
         assert_eq!(
-            cat.take_touched(
-                &mut totals,
-                &mut touched,
-                floor,
-                &mut survivors,
-                &mut survivor_totals,
-            )
-            .unwrap_err(),
+            take(&cat, &mut totals, &mut touched).unwrap_err(),
             SearchError::TotalsOverflow {
                 reference: (16 * SCAN_BLOCK + 5) as u32
             }
         );
         assert_eq!(touched, alloc::vec![0u8; n_blocks]);
-        for &b in &marked {
-            let lo = b * SCAN_BLOCK;
-            let hi = (lo + SCAN_BLOCK).min(n);
-            assert_eq!(
-                totals[lo..hi],
-                alloc::vec![0u32; hi - lo],
-                "block {b} reset"
-            );
-        }
+        assert_reset(&totals);
     }
 
     /// The counters, the block marks and the survivor bits of `scratch`

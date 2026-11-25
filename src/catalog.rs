@@ -454,7 +454,10 @@ impl Catalog {
         self.live.resize(start + count, true);
         self.live_count += count;
         if !rows.is_empty() {
-            let part = Part::new(Segment::from_postings_in(rows, self.coding), (first, last));
+            let part = Part::new(
+                Segment::from_postings_coded(rows, self.coding),
+                (first, last),
+            );
             self.merge_in(part, merges)
                 .inspect_err(|_| self.take_back(count))?;
         }
@@ -797,7 +800,7 @@ impl CatalogBuilder {
             coding: self.coding,
             base_removed: 0,
         };
-        let segment = Segment::from_postings_in(self.rows, self.coding);
+        let segment = Segment::from_postings_coded(self.rows, self.coding);
         // A posting implies a reference, so `next` is at least one here.
         if !segment.is_empty() {
             cat.parts.push(Part::new(segment, (0, self.next - 1)));

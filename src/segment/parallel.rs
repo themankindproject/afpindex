@@ -27,7 +27,8 @@ use std::sync::{Mutex, PoisonError};
 
 use super::{
     Index, MAX_POSTINGS, Parts, REGION_SLOTS, Refs, Segment, Stored, Writer, build_table,
-    copied_ids, merge_sources, place, postings, ref_room, slot_of, time_bits, union_ids,
+    copied_ids, keys, measure, merge_sources, place, postings, ref_room, slot_of, time_bits,
+    union_ids,
 };
 use crate::Posting;
 use crate::packed::Packed;
@@ -55,9 +56,16 @@ pub(super) fn merge_all<F: Fn(u32) -> bool + Sync>(
     sides: &[(&Segment, Option<&F>)],
     layout: Layout,
 ) -> Option<Segment> {
+    let (threads, pieces) = fan_out(postings(sides))?;
+    Some(merge_in_pieces(sides, threads, pieces, layout))
+}
+
+/// The threads and the pieces to cut `n` postings into, or `None` for a
+/// job too small to be worth it or a single core.
+fn fan_out(n: usize) -> Option<(usize, usize)> {
     // The size first: asking for the threads costs more than a small
-    // merge's test.
-    if postings(sides) < MERGE_MIN {
+    // job's test.
+    if n < MERGE_MIN {
         return None;
     }
     let threads = threads();
@@ -68,24 +76,17 @@ pub(super) fn merge_all<F: Fn(u32) -> bool + Sync>(
     // the pieces merged but not yet copied, the memory beyond the output,
     // are smaller. Each holds at least 2^16 postings, so that cutting
     // costs little against merging.
-    let pieces = (threads * 8).min(postings(sides) >> 16).max(1);
-    Some(merge_in_pieces(sides, threads, pieces, layout))
+    Some((threads, (threads * 8).min(n >> 16).max(1)))
 }
 
 /// The rest of [`Segment::from_postings`] once `rows` are sorted, on every
 /// core, or the rows back for an input too small to be worth it or a
 /// single core.
 pub(super) fn pack_sorted(rows: Vec<Posting>, coding: RefCoding) -> Result<Segment, Vec<Posting>> {
-    if rows.len() < MERGE_MIN {
-        return Err(rows);
+    match fan_out(rows.len()) {
+        Some((threads, pieces)) => Ok(pack_in_pieces(rows, threads, pieces, coding)),
+        None => Err(rows),
     }
-    let threads = threads();
-    if threads <= 1 {
-        return Err(rows);
-    }
-    // As many pieces as a merge of this size takes.
-    let pieces = (threads * 8).min(rows.len() >> 16).max(1);
-    Ok(pack_in_pieces(rows, threads, pieces, coding))
 }
 
 /// [`pack_sorted`] in up to `pieces` pieces on up to `threads` threads,
@@ -93,10 +94,9 @@ pub(super) fn pack_sorted(rows: Vec<Posting>, coding: RefCoding) -> Result<Segme
 ///
 /// The sorted rows are cut at hash boundaries, so a run and the duplicates
 /// in it, which the sort put side by side, are in one piece. A first pass
-/// finds the widths and every piece's distinct hashes; a second packs
-/// each piece as a merge's piece is packed and copies it into the joined
-/// arrays as soon as the pieces before it are, with the merge's join. The
-/// rows go before the directory is built, as they do on one thread.
+/// finds the widths and every piece's distinct hashes; a second packs and
+/// joins each piece as passes 2 and 3 above do. The rows go before the
+/// directory is built, as they do on one thread.
 fn pack_in_pieces(rows: Vec<Posting>, threads: usize, pieces: usize, coding: RefCoding) -> Segment {
     let bounds = hash_cuts(&rows, pieces);
     let n = bounds.len() - 1;
@@ -104,17 +104,7 @@ fn pack_in_pieces(rows: Vec<Posting>, threads: usize, pieces: usize, coding: Ref
     // The largest reference and time and the distinct hashes of a piece.
     let counted = slots::<(u32, u32, usize)>(n);
     run_tasks(threads, n, |i| {
-        let (mut max_ref, mut max_time, mut keys) = (0, 0, 0usize);
-        let mut prev = None;
-        for p in piece(i) {
-            max_ref = max_ref.max(p.reference);
-            max_time = max_time.max(p.time);
-            if prev != Some(p.hash) {
-                keys += 1;
-                prev = Some(p.hash);
-            }
-        }
-        *lock(&counted[i]) = Some((max_ref, max_time, keys));
+        *lock(&counted[i]) = Some(measure(piece(i)));
     });
     let counted: Vec<(u32, u32, usize)> = counted
         .into_iter()
@@ -147,19 +137,32 @@ fn pack_in_pieces(rows: Vec<Posting>, threads: usize, pieces: usize, coding: Ref
             writer.push_run(run[0].hash, pairs);
         }
         *lock(&packed[i]) = Some(writer.into_parts());
-        loop {
-            let next = lock(&joined).place_next(&packed);
-            match next {
-                Some((place, parts)) => place.fill(parts),
-                None => break,
-            }
-        }
+        drain(&joined, &packed);
     });
-    let joined = joined.into_inner().unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(joined.next, n, "every piece is joined");
-    let done = joined.finish();
+    let done = finish_join(joined, n);
     drop(rows);
     out.into_segment(done, None)
+}
+
+/// Copy every piece that is next in line into the joined arrays: the one
+/// just merged, or later ones that finished first.
+fn drain(joined: &Mutex<Joined<'_>>, merged: &[Mutex<Option<Parts>>]) {
+    loop {
+        // Not a `while let`: that would hold the lock across `fill` and
+        // serialise the copies.
+        let next = lock(joined).place_next(merged);
+        match next {
+            Some((place, parts)) => place.fill(parts),
+            None => break,
+        }
+    }
+}
+
+/// The join once every one of the `n` pieces is placed.
+fn finish_join(joined: Mutex<Joined<'_>>, n: usize) -> Done {
+    let joined = joined.into_inner().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(joined.next, n, "every piece is joined");
+    joined.finish()
 }
 
 /// Where sorted `rows` are cut into about `pieces` pieces of about equal
@@ -195,22 +198,13 @@ struct Cuts {
 }
 
 impl Segment {
-    /// The entry key `k`'s run starts at, or the length for `k` past the
-    /// last key.
-    fn start_of_key(&self, k: usize) -> usize {
-        self.keys
-            .get(k)
-            .and_then(|&key| self.range(key))
-            .map_or(self.len(), |(lo, _)| lo)
-    }
-
-    /// The bit key `k`'s coded references start at, or the bit count for
-    /// `k` past the last key.
-    fn ref_start_of_key(&self, k: usize) -> u64 {
+    /// The entry key `k`'s run starts at and the bit its coded references
+    /// start at, or the length and the bit count for `k` past the last key.
+    fn cut_of_key(&self, k: usize) -> (usize, u64) {
         self.keys
             .get(k)
             .and_then(|&key| self.locate(key))
-            .map_or(self.refs.bit_len(), |run| run.at)
+            .map_or((self.len(), self.refs.bit_len()), |run| (run.lo, run.at))
     }
 
     /// Keys below hash `bound`.
@@ -227,7 +221,7 @@ fn split<F>(sides: &[(&Segment, Option<&F>)], pieces: usize) -> Vec<u64> {
     let below = |bound: u64| -> usize {
         sides
             .iter()
-            .map(|&(s, _)| s.start_of_key(s.keys_below(bound)))
+            .map(|&(s, _)| s.cut_of_key(s.keys_below(bound)).0)
             .sum()
     };
     let total = postings(sides);
@@ -262,30 +256,18 @@ pub(super) fn merge_in_pieces<F: Fn(u32) -> bool + Sync>(
 ) -> Segment {
     let plan = Plan::new(sides, pieces, layout);
     plan.deal(threads);
-    // The second and third passes: merge every piece on its own, and copy
-    // each into the joined arrays as soon as every piece before it is
-    // merged, which is when its place is known. A thread that copies a
-    // piece frees it before it takes the next, so the pieces in flight at
-    // once are about all the memory beyond the joined arrays.
-    let mut out = Output::with_room(sides, plan.time_bits, layout);
+    // The second and third passes. A thread that copies a piece frees it
+    // before it takes the next, so the pieces in flight at once are about
+    // all the memory beyond the joined arrays.
+    let mut out = Output::with_capacity(keys(sides), postings(sides), plan.time_bits, layout);
     let merged = slots::<Parts>(plan.pieces);
     let joined = Mutex::new(out.joined());
     run_tasks(threads, plan.pieces, |piece| {
         *lock(&merged[piece]) = Some(plan.merge(piece));
-        // Copy every piece that is next in line, this one or later ones
-        // that finished first.
-        loop {
-            let next = lock(&joined).place_next(&merged);
-            match next {
-                Some((place, parts)) => place.fill(parts),
-                None => break,
-            }
-        }
+        drain(&joined, &merged);
     });
     drop(plan);
-    let joined = joined.into_inner().unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(joined.next, merged.len(), "every piece is joined");
-    let done = joined.finish();
+    let done = finish_join(joined, merged.len());
     out.into_segment(done, copied_ids(sides))
 }
 
@@ -321,8 +303,7 @@ impl<'a, F: Fn(u32) -> bool + Sync> Plan<'a, F> {
             .iter()
             .map(|&(s, _)| {
                 let keys: Vec<usize> = bounds.iter().map(|&b| s.keys_below(b)).collect();
-                let starts = keys.iter().map(|&k| s.start_of_key(k)).collect();
-                let bits = keys.iter().map(|&k| s.ref_start_of_key(k)).collect();
+                let (starts, bits) = keys.iter().map(|&k| s.cut_of_key(k)).unzip();
                 Cuts { keys, starts, bits }
             })
             .collect();
@@ -439,11 +420,6 @@ impl Output {
             time_bits,
             layout,
         }
-    }
-
-    fn with_room<F>(sides: &[(&Segment, Option<&F>)], time_bits: u32, layout: Layout) -> Self {
-        let keys: usize = sides.iter().map(|&(s, _)| s.keys.len()).sum();
-        Self::with_capacity(keys, postings(sides), time_bits, layout)
     }
 
     /// The arrays to place the pieces in.
@@ -794,9 +770,7 @@ fn slots_of_vecs<T>(n: usize) -> Vec<Mutex<Vec<T>>> {
 mod tests {
     use super::*;
     use crate::Posting;
-    use crate::segment::{
-        Index, Slot, build_table_with, dense_slots, keys, layout_of, ref_bits, sparse_slots,
-    };
+    use crate::segment::{Index, Slot, build_table_with, dense_slots, layout_of, sparse_slots};
 
     type Keep<'a> = &'a (dyn Fn(u32) -> bool + Sync);
 
@@ -868,7 +842,7 @@ mod tests {
                     let below = |b: u64| -> usize {
                         sides
                             .iter()
-                            .map(|&(s, _)| s.start_of_key(s.keys_below(b)))
+                            .map(|&(s, _)| s.cut_of_key(s.keys_below(b)).0)
                             .sum()
                     };
                     for w in bounds.windows(2) {
@@ -878,21 +852,7 @@ mod tests {
                 }
                 for coding in [RefCoding::Packed, RefCoding::Gaps] {
                     let layout = layout_of(&sides, coding);
-                    let want = {
-                        let mut out = Writer::with_capacity(
-                            postings(&sides),
-                            keys(&sides),
-                            ref_bits(&sides),
-                            time_bits(&sides),
-                            layout,
-                        );
-                        let mut sources: Vec<_> =
-                            sides.iter().map(|&(s, keep)| s.source(keep)).collect();
-                        merge_sources(&mut out, &mut sources);
-                        drop(sources);
-                        out.include(copied_ids(&sides));
-                        out.finish()
-                    };
+                    let want = Segment::merge_serial(&sides, layout);
                     for (threads, pieces) in [(1, 1), (2, 2), (3, 7), (4, 16), (2, 200), (8, 800)] {
                         let got = merge_in_pieces(&sides, threads, pieces, layout);
                         assert_same(
@@ -970,7 +930,7 @@ mod tests {
                     for r in 0..regions {
                         region_starts[r + 1] += region_starts[r];
                     }
-                    let mut table = vec![Slot::EMPTY; slots];
+                    let mut table = vec![Slot::default(); slots];
                     late += place_in_stretches(
                         &mut table,
                         &by_region,

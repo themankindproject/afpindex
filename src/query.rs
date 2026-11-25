@@ -83,19 +83,10 @@ impl Query {
     ///
     /// # Panics
     ///
-    /// Panics if `i >= self.hash_count()`; [`Query::iter`] walks every hash
-    /// without indexing.
+    /// Panics if `i >= self.hash_count()`.
     #[must_use]
     pub fn times(&self, i: usize) -> &[u32] {
         &self.times[self.offsets[i]..self.offsets[i + 1]]
-    }
-
-    /// Every hash with its kept times, hashes ascending.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (u32, &[u32])> + '_ {
-        self.hashes
-            .iter()
-            .enumerate()
-            .map(|(i, &h)| (h, self.times(i)))
     }
 
     /// Number of distinct hashes.
@@ -138,9 +129,6 @@ mod tests {
         assert_eq!(q.len(), 4);
         assert_eq!(q.input_rows(), 6);
         assert!(!q.is_empty());
-        let walked: Vec<(u32, &[u32])> = q.iter().collect();
-        assert_eq!(walked, alloc::vec![(3, &[1, 0][..]), (9, &[5, 2][..])]);
-        assert_eq!(q.iter().len(), 2);
     }
 
     #[test]
@@ -158,7 +146,6 @@ mod tests {
         let q = Query::from_pairs(Vec::<(u32, u32)>::new(), Some(64));
         assert!(q.is_empty());
         assert_eq!(q.hash_count(), 0);
-        assert_eq!(q.iter().count(), 0);
         assert_eq!(q, Query::default());
     }
 }

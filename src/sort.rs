@@ -247,6 +247,17 @@ mod tests {
 
     use crate::test_util::Rng;
 
+    /// `n` postings whose hashes `hash` makes of random words; their
+    /// references and times come from the same words.
+    fn rows_with(rng: &mut Rng, n: usize, hash: &mut dyn FnMut(u64) -> u32) -> Vec<Posting> {
+        (0..n)
+            .map(|_| {
+                let r = rng.next();
+                Posting::new(hash(r), (r >> 32) as u32 % 50, (r >> 40) as u32 % 1000)
+            })
+            .collect()
+    }
+
     fn check(mut rows: Vec<Posting>) {
         let mut expected = rows.clone();
         expected.sort_unstable();
@@ -290,14 +301,7 @@ mod tests {
     #[test]
     fn agrees_with_the_comparison_sort() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF1);
-        let mut rows_with = |n: usize, hash: &mut dyn FnMut(u64) -> u32| -> Vec<Posting> {
-            (0..n)
-                .map(|_| {
-                    let r = rng.next();
-                    Posting::new(hash(r), (r >> 32) as u32 % 50, (r >> 40) as u32 % 1000)
-                })
-                .collect()
-        };
+        let mut rows_with = |n, hash: &mut dyn FnMut(u64) -> u32| rows_with(&mut rng, n, hash);
         check(Vec::new());
         check(rows_with(1, &mut |r| r as u32));
         // Wide hashes, many more than one bucket's worth of rows.
@@ -317,14 +321,7 @@ mod tests {
     #[test]
     fn agrees_with_the_comparison_sort_on_awkward_shapes() {
         let mut rng = Rng(0x0BAD_5EED_0BAD_5EED);
-        let mut rows_with = |n: usize, hash: &mut dyn FnMut(u64) -> u32| -> Vec<Posting> {
-            (0..n)
-                .map(|_| {
-                    let r = rng.next();
-                    Posting::new(hash(r), (r >> 32) as u32 % 50, (r >> 40) as u32 % 1000)
-                })
-                .collect()
-        };
+        let mut rows_with = |n, hash: &mut dyn FnMut(u64) -> u32| rows_with(&mut rng, n, hash);
         // Every size around the hand-over to the comparison sort and the
         // narrow digits above it, with hashes over the whole range.
         for n in (SMALL - 2..SMALL + 40).chain([500, 1_500, 5_000, 17_000]) {

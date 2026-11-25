@@ -9,35 +9,21 @@
 //! `(reference, Δ = time − query_time)`. A true copy piles many votes into one
 //! bin; chance collisions scatter single votes across many offsets.
 //!
-//! `afpindex` answers that search exactly and fast over hundreds of millions
-//! of postings:
+//! `afpindex` answers that search exactly over hundreds of millions of
+//! postings; the README lists the features in full:
 //!
-//! - **Postings sorted by hash** in flat arrays, references and times packed
-//!   to the width of the largest value, so each hash is one contiguous run
-//!   located by a single directory read. A query's lookups
-//!   are independent, and every pass loads the next batch of lines before
-//!   it works on the current one, so a search is bounded by memory
-//!   parallelism rather than by one cache miss after another.
-//! - **Count before histogram.** A branch-free first pass totals each
-//!   reference's votes in a dense counter array; only references that reach
-//!   a vote floor get a histogram. Chance matches never pay for a sort.
-//! - **Immutable, shared segments.** Additions go into small delta segments
-//!   that are merged geometrically; removals tombstone a reference and
-//!   compaction drops its postings. Reference ids never change, and a
-//!   catalog clone shares its segments.
+//! - **Postings sorted by hash,** packed to the width of the largest value:
+//!   each hash is one contiguous run found by a single directory read.
+//! - **Count before histogram.** A branch-free pass totals each reference's
+//!   votes; only references that reach a vote floor get a histogram.
+//! - **Immutable, shared segments.** Additions go into delta segments merged
+//!   geometrically; removals tombstone a reference; ids never change.
 //! - **No unsafe code by default, no dependencies beyond `libm`,** and a
-//!   `no_std + alloc` core. The `std` feature adds checksummed snapshot
-//!   files for segments and whole catalogs. Two more features bring one
-//!   `unsafe` block each: `mmap` maps those files instead of reading them
-//!   (the mapping call), and `simd` decodes packed postings eight at a
-//!   time on x86-64 CPUs that report AVX2 when asked at run time (the
-//!   entry into the code compiled for AVX2).
-//! - **A catalog in a directory.** With `mmap`, [`CatalogStore`] owns a
-//!   directory of immutable segment files and a manifest, and writes a
-//!   large merge straight into a new segment file instead of the heap;
-//!   [`Catalog::map_dir`] reads such a directory with the postings left in
-//!   the files' pages. A catalog several times larger than memory can then
-//!   be changed and searched.
+//!   `no_std + alloc` core. `std` adds snapshot files; `mmap` and `simd`
+//!   bring one `unsafe` block each.
+//! - **A catalog in a directory.** With `mmap`, [`CatalogStore`] keeps
+//!   segment files and a manifest, and [`Catalog::map_dir`] searches them
+//!   with the postings left in the files' pages.
 //!
 //! # Example
 //!
@@ -77,25 +63,12 @@
 //!
 //! # What a search computes
 //!
-//! For each query hash and each segment holding it, the search walks the
-//! hash's run. Within a run each reference's postings are contiguous with
-//! times ascending, and at most [`SearchOptions::fanout`] of them count. The
-//! query side keeps at most `max_times_per_hash` times per hash
-//! ([`Query::from_pairs`]). A reference whose total votes reach
-//! [`SearchOptions::min_total_votes`] is a **survivor**; every survivor's
-//! votes are sorted by Δ, merged into [`Bin`]s, and reduced to one
-//! [`Candidate`]: its best bin (most votes, ties to the smaller Δ) plus noise
-//! statistics over the bins outside `±offset_tolerance` of it. Candidates
-//! come back in ascending reference order, and the whole computation is
-//! deterministic.
-//!
+//! A reference whose votes reach [`SearchOptions::min_total_votes`] (at
+//! most [`SearchOptions::fanout`] postings of a hash vote per reference) is
+//! a **survivor**. Its votes are merged into [`Bin`]s by Δ and reduced to a
+//! [`Candidate`], in ascending reference order and deterministically.
 //! [`Catalog::search_with`] hands each [`Survivor`] with its bins to a
 //! closure instead, for callers with their own scoring.
-//!
-//! # Scale
-//!
-//! `examples/bench.rs` (shipped with the crate) builds a synthetic catalog
-//! and reports latency and throughput; see the README for measured numbers.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
