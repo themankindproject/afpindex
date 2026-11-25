@@ -734,6 +734,18 @@ fn segment_counts(head: &Head) -> Result<(usize, usize, (usize, u32)), SnapshotE
     if n_keys > 1 << 32 {
         return Err(SnapshotError::Corrupt("too many keys for a segment"));
     }
+    // A run's postings are distinct (reference, time) pairs, so arrays this
+    // narrow hold only so many a key. Arrays of no bits at all would
+    // otherwise let a few bytes of header name billions of postings, which
+    // a full load then walks one by one.
+    if let Layout::Packed(width) = head.refs {
+        let bits = head.time_bits.saturating_add(width);
+        if bits < 64 && u128::from(n_post) > u128::from(n_keys) << bits {
+            return Err(SnapshotError::Corrupt(
+                "more postings than the widths leave distinct pairs",
+            ));
+        }
+    }
     let n_keys = to_usize(n_keys)?;
     let n_post = to_usize(n_post)?;
     if n_keys > n_post {
@@ -1766,6 +1778,27 @@ mod tests {
             Segment::read_from_trusted(bytes.as_slice()),
             Err(SnapshotError::Corrupt(m)) if m.contains("inverted")
         ));
+    }
+
+    /// A header whose arrays have no bits cannot name more postings than
+    /// one a key: found by fuzzing, where a few hundred bytes naming 2^29
+    /// postings of one key kept a full load walking them for seconds.
+    #[test]
+    fn zero_width_arrays_cannot_name_more_postings_than_pairs() {
+        let seg = Segment::from_postings(vec![Posting::new(7, 0, 0), Posting::new(9, 0, 0)]);
+        assert_eq!((seg.time_bits(), seg.bits().0), (0, 0), "zero-width arrays");
+        let mut bytes = Vec::new();
+        seg.write_to(&mut bytes).unwrap();
+        assert_eq!(Segment::read_from(bytes.as_slice()).unwrap(), seg);
+        bytes[24..32].copy_from_slice(&(1u64 << 29).to_le_bytes());
+        for check in [Check::Full, Check::Trusted] {
+            let got = read_segment(&mut bytes.as_slice(), check);
+            assert!(
+                matches!(got, Err(SnapshotError::Corrupt(m)) if m.contains("distinct pairs")),
+                "trusted {}: {got:?}",
+                check == Check::Trusted
+            );
+        }
     }
 
     /// A trusted load skips the checksum and the order of the runs, and
