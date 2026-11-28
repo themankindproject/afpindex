@@ -4,6 +4,30 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-11-28
+
+Additions for running replicas and exporting metrics. The file formats
+are unchanged: 0.1.0 and 0.1.1 read and write the same directories.
+
+### Added
+
+- `Catalog::stats`, with `CatalogStats` and `SegmentStats`: the
+  catalog's counters and each segment's postings, keys, heap bytes,
+  reference coding and reference range, in one call.
+- `Manifest` and `ManifestEntry` (`mmap`): `Manifest::read(dir)` and
+  `Manifest::from_bytes` read a catalog directory's manifest, with every
+  check of a load, and give its generation, id space, liveness, reference
+  coding and segment files without mapping a segment.
+- `replica::sync(src, dst)` (`mmap`): brings a directory up to another
+  catalog directory, copying the segment files it lacks, checking each
+  fully before it takes its name, and writing the manifest last. A file
+  already present is kept only when its length and footer checksums match,
+  so a source created again from nothing is copied again rather than mixed
+  in. `replica::prune(dir)` removes the files a directory's manifest no
+  longer names. Both hold the directory's lock.
+- Fuzzing of the manifest reader and of `replica::sync` on damaged
+  directories.
+
 ## [0.1.0] - 2026-11-25
 
 First release: the engine of the *hashtally* design notes as a library.

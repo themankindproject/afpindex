@@ -1277,6 +1277,41 @@ straight after a trusted open; after 1.7 s of `warm_references` they took
 `open` reads every posting to check it, which leaves the pages in the
 cache anyway.
 
+**Copies of a directory.** `hashtally::replica::sync(src, dst)` brings
+the directory `dst` up to the catalog of `src`: it copies the segment
+files `dst` lacks, checks each one fully as it lands (so `dst` can be
+mapped with `map_dir_trusted`), and writes the manifest last, so a reader
+of `dst` sees the catalog before or after the sync and never a mix. The
+source may be a directory its writer is saving to. A file already in
+`dst` is kept when its length and its footer checksums match the
+source's, so a source created again from nothing, whose files take the
+old names, is copied again rather than mixed in. `replica::prune(dst)`
+removes the files the manifest no longer names, once the catalog mapped
+from the previous manifest is gone. A replica's directory is an ordinary
+one: `CatalogStore::open` on it promotes it to writer. `Manifest::read`
+reads a directory's manifest (its generation, id space and segment
+files) without mapping anything.
+
+```rust
+use hashtally::{Catalog, replica};
+use std::path::Path;
+
+/// Refresh a replica from the writer's directory; the new catalog, if the
+/// writer saved since the last refresh.
+pub fn refresh(primary: &Path, local: &Path) -> Result<Option<Catalog>, hashtally::SnapshotError> {
+    let synced = replica::sync(primary, local)?;
+    if !synced.manifest_replaced {
+        return Ok(None);
+    }
+    // Every file was checked as it was copied.
+    let catalog = Catalog::map_dir_trusted(local)?;
+    catalog.warm_references();
+    // Swap it in for searches; once the old catalog is dropped, call
+    // `replica::prune(local)`.
+    Ok(Some(catalog))
+}
+```
+
 ---
 
 ## 14. Working with segments directly
@@ -1529,8 +1564,9 @@ copies an array that grows where glibc remaps its pages.
 - **Bound the work**: a proportional floor (`vote_floor`), `Some(64)` times
   per hash and fanout, `max_votes` sized to the memory you can spend per
   search.
-- **Watch** `segment_count()`, `posting_count()`, `live_count()`,
-  `heap_bytes()` and search latency percentiles.
+- **Watch** `stats()` (the counters and each segment's size in one
+  call: `posting_count`, `live_count`, `heap_bytes`, the segments) and
+  search latency percentiles.
 - **Measure on your hardware** with `examples/bench.rs`,
   `examples/lifecycle.rs` and `examples/replay.rs`
   ([PERFORMANCE.md](PERFORMANCE.md#reproducing)).

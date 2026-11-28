@@ -37,7 +37,9 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 use std::io::Write;
+use std::path::Path;
 
 use crate::snapshot::{
     Checksum, coding_flags, coding_of_flags, live_bitmap, live_of_bitmap, pad_len, sums_match,
@@ -66,9 +68,12 @@ pub(super) const GENERATION_END: usize = 16;
 /// rather than a reason to allocate.
 const MAX_SEGMENTS: u64 = 1 << 24;
 
-/// One segment of the catalog: its file, its shape and its references.
+/// One segment a [`Manifest`] names: its file, its shape and its
+/// references, which a load checks the file against before it trusts a
+/// mapping of it.
+#[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Entry {
+pub struct ManifestEntry {
     pub(super) file: u32,
     pub(super) bytes: u64,
     pub(super) keys: u64,
@@ -78,10 +83,18 @@ pub(super) struct Entry {
     pub(super) ids: Option<(u32, u32)>,
 }
 
-/// What a manifest holds: a catalog's id space, its segments and the
-/// generation a writer compares before it replaces the file.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Manifest {
+/// The manifest of a catalog directory: which segment files make the
+/// catalog, its id space and its removals, and the generation of the save
+/// that wrote it.
+///
+/// A [`CatalogStore`](crate::CatalogStore) writes it; [`Manifest::read`]
+/// reads it without mapping a segment, for a process that copies a
+/// directory (see [`crate::replica`]) or watches one change. Every check of
+/// a load runs on it: the checksum, the id space, and file ids that a store
+/// gave out and that name one segment each.
+#[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct Manifest {
     pub(super) generation: u64,
     pub(super) reference_count: u64,
     /// The id the next segment file gets; ids are never reused.
@@ -90,10 +103,88 @@ pub(super) struct Manifest {
     /// and merges.
     pub(super) ref_coding: RefCoding,
     pub(super) live: Vec<bool>,
-    pub(super) entries: Vec<Entry>,
+    pub(super) entries: Vec<ManifestEntry>,
 }
 
 impl Manifest {
+    /// The name of the manifest file in a catalog directory. A copy of a
+    /// directory writes it last, once every segment file it names is in
+    /// place.
+    pub const FILE_NAME: &'static str = MANIFEST;
+
+    /// Read the manifest of the catalog directory `dir`.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Io`] when the file cannot be read (`NotFound` when
+    /// the directory holds no catalog), and the errors of
+    /// [`Manifest::from_bytes`].
+    pub fn read(dir: impl AsRef<Path>) -> Result<Manifest, SnapshotError> {
+        read(&std::fs::read(dir.as_ref().join(MANIFEST))?)
+    }
+
+    /// Read a manifest from `bytes`, the whole file's contents.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError`] when the bytes are not a manifest this version
+    /// reads, are cut short, do not match their checksum, or describe
+    /// segments outside the id space or a file id the store did not give.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
+        read(bytes)
+    }
+
+    /// The generation of the save that wrote this manifest: 1 for a
+    /// directory's first save, one more for each save after it.
+    ///
+    /// Generations order the saves of one store only. A directory created
+    /// again from nothing starts over at 1.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Ids assigned so far, live or not, as
+    /// [`Catalog::reference_count`](crate::Catalog::reference_count) of
+    /// the catalog saved.
+    #[must_use]
+    pub fn reference_count(&self) -> usize {
+        self.reference_count as usize
+    }
+
+    /// References not removed.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.live.iter().filter(|&&live| live).count()
+    }
+
+    /// `true` if `id` was assigned and had not been removed when the
+    /// catalog was saved.
+    #[must_use]
+    pub fn is_live(&self, id: u32) -> bool {
+        self.live.get(id as usize).copied().unwrap_or(false)
+    }
+
+    /// How the catalog stores the references of the segments it builds.
+    #[must_use]
+    pub fn ref_coding(&self) -> RefCoding {
+        self.ref_coding
+    }
+
+    /// The segments, largest first, as the catalog lists them.
+    #[must_use]
+    pub fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
+    }
+
+    /// Postings across all segments, as
+    /// [`Catalog::posting_count`](crate::Catalog::posting_count) of the
+    /// catalog saved.
+    #[must_use]
+    pub fn posting_count(&self) -> u64 {
+        self.entries.iter().map(|e| e.postings).sum()
+    }
+
     /// Write the manifest.
     pub(super) fn write(&self, w: &mut impl Write) -> std::io::Result<()> {
         let mut ck = Checksum::new();
@@ -132,6 +223,54 @@ impl Manifest {
         }
         w.write_all(&ck.finish().to_le_bytes())?;
         w.flush()
+    }
+}
+
+impl fmt::Debug for Manifest {
+    /// The liveness table is summed rather than listed: it holds one entry
+    /// per id.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Manifest")
+            .field("generation", &self.generation)
+            .field("reference_count", &self.reference_count)
+            .field("live_count", &self.live_count())
+            .field("next_file", &self.next_file)
+            .field("ref_coding", &self.ref_coding)
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManifestEntry {
+    /// The segment file's name in the directory, `seg-<8 hex digits>.afs`.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        segment_name(self.file)
+    }
+
+    /// The segment file's length in bytes.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Distinct hashes in the segment.
+    #[must_use]
+    pub fn key_count(&self) -> u64 {
+        self.keys
+    }
+
+    /// Postings in the segment.
+    #[must_use]
+    pub fn posting_count(&self) -> u64 {
+        self.postings
+    }
+
+    /// Smallest and largest reference with a posting in the segment, or
+    /// `None` when it has none.
+    #[must_use]
+    pub fn references(&self) -> Option<(u32, u32)> {
+        self.ids
     }
 }
 
@@ -179,7 +318,7 @@ pub(super) fn generation(head: &[u8; GENERATION_END]) -> Option<u64> {
 /// id and never reuses one, so an id at or past the next is not one of its
 /// own, and one file named twice would be mapped twice and its postings
 /// counted twice.
-fn check_files(entries: &[Entry], next_file: u32) -> Result<(), SnapshotError> {
+fn check_files(entries: &[ManifestEntry], next_file: u32) -> Result<(), SnapshotError> {
     if entries.iter().any(|e| e.file >= next_file) {
         return Err(SnapshotError::Corrupt(
             "a segment file id at or past the next one",
@@ -267,7 +406,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Manifest, SnapshotError> {
                 "a segment references an id outside the id space",
             ));
         }
-        entries.push(Entry {
+        entries.push(ManifestEntry {
             file,
             bytes,
             keys,
@@ -308,14 +447,14 @@ mod tests {
             ref_coding: RefCoding::Gaps,
             live,
             entries: alloc::vec![
-                Entry {
+                ManifestEntry {
                     file: 3,
                     bytes: 1_000,
                     keys: 10,
                     postings: 50,
                     ids: Some((0, 4)),
                 },
-                Entry {
+                ManifestEntry {
                     file: 8,
                     bytes: 32,
                     keys: 0,
@@ -324,6 +463,31 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// The public accessors read what the file holds.
+    #[test]
+    fn reads_through_the_public_accessors() {
+        let mut bytes = Vec::new();
+        sample().write(&mut bytes).unwrap();
+        let m = Manifest::from_bytes(&bytes).unwrap();
+        assert_eq!(m.generation(), 7);
+        assert_eq!(m.reference_count(), 5);
+        assert_eq!(m.live_count(), 4);
+        assert!(m.is_live(1) && !m.is_live(2) && !m.is_live(5));
+        assert_eq!(m.ref_coding(), RefCoding::Gaps);
+        assert_eq!(m.posting_count(), 50);
+        let e = m.entries()[0];
+        assert_eq!(e.file_name(), "seg-00000003.afs");
+        assert_eq!(
+            (e.bytes(), e.key_count(), e.posting_count()),
+            (1_000, 10, 50)
+        );
+        assert_eq!(e.references(), Some((0, 4)));
+        assert_eq!(m.entries()[1].references(), None);
+        assert_eq!(Manifest::FILE_NAME, "MANIFEST");
+        let debug = alloc::format!("{m:?}");
+        assert!(debug.contains("live_count: 4") && !debug.contains("true"));
     }
 
     #[test]

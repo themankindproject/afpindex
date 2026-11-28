@@ -22,8 +22,9 @@
 //!   `no_std + alloc` core. `std` adds snapshot files; `mmap` and `simd`
 //!   bring one `unsafe` block each.
 //! - **A catalog in a directory.** With `mmap`, [`CatalogStore`] keeps
-//!   segment files and a manifest, and [`Catalog::map_dir`] searches them
-//!   with the postings left in the files' pages.
+//!   segment files and a manifest, [`Catalog::map_dir`] searches them
+//!   with the postings left in the files' pages, and [`replica::sync`]
+//!   keeps a copy of the directory up to date.
 //!
 //! # Example
 //!
@@ -88,6 +89,9 @@ mod par;
 mod posting;
 mod query;
 mod refs;
+#[cfg(feature = "mmap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mmap")))]
+pub mod replica;
 mod search;
 mod segment;
 mod simd;
@@ -106,10 +110,14 @@ mod test_util;
 #[doc = include_str!("../docs/USAGE.md")]
 mod usage_guide {}
 
-pub use catalog::{Catalog, CatalogBuilder, Compaction, CompactionPolicy};
+pub use catalog::{
+    Catalog, CatalogBuilder, CatalogStats, Compaction, CompactionPolicy, SegmentStats,
+};
 pub use error::SearchError;
 #[cfg(feature = "std")]
 pub use error::SnapshotError;
+#[cfg(feature = "mmap")]
+pub use manifest::{Manifest, ManifestEntry};
 #[cfg(feature = "std")]
 pub use par::{set_max_threads, threads as max_threads};
 pub use posting::Posting;

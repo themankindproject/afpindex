@@ -97,8 +97,8 @@ The writer of a shard, after each `save`:
 
 A replica:
 
-1. reads the manifest from the object store and compares its generation
-   with the one it serves;
+1. reads the manifest from the object store (`Manifest::from_bytes`) and
+   compares its generation with the one it serves;
 2. downloads the segment files it does not have into its own local
    directory, and checks each new one once with `Segment::map_from`, which
    runs every check;
@@ -110,6 +110,14 @@ A replica:
    ([USAGE.md, section 11](USAGE.md#changing-a-catalog-while-it-serves));
 5. deletes the segment files the new manifest no longer names once the
    catalog that mapped them is gone.
+
+When the writer's directory is reachable as a path (a shared volume, or a
+local mirror of the object store), `replica::sync(src, dst)` does steps 2
+and 3 and `replica::prune(dst)` does step 5. `sync` also notices a
+writer's directory created again from nothing: its files take the old
+names, and a file whose length or footer checksums differ is copied again,
+with `dst`'s manifest removed first so no reader pairs it with the old
+one.
 
 A replica's directory is its own: the writer's lock and its removal of
 files it does not recognise only make sense for one writer per directory.

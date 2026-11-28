@@ -1,10 +1,10 @@
-//! A saved catalog directory with one of its files changed, mapped and
-//! opened.
+//! A saved catalog directory with one of its files changed, mapped,
+//! opened, and copied to a replica.
 
 #![no_main]
 
 use arbitrary::Arbitrary;
-use hashtally::{Catalog, CatalogStore};
+use hashtally::{Catalog, CatalogStore, Manifest, replica};
 use hashtally_fuzz::{Edits, Shape, exercise, temp};
 use libfuzzer_sys::fuzz_target;
 
@@ -41,5 +41,17 @@ fuzz_target!(|input: Input| {
         exercise(store.catalog());
     }
     let _ = Catalog::map_dir_trusted(&dir);
+    let _ = Manifest::read(&dir);
+    // A sync checks every file it copies as a full load does, so what it
+    // copied maps trusted and survives the same work.
+    let copy = temp("store-replica");
+    let _ = std::fs::remove_dir_all(&copy);
+    if replica::sync(&dir, &copy).is_ok() {
+        let catalog = Catalog::map_dir_trusted(&copy).expect("a synced replica");
+        exercise(&catalog);
+        drop(catalog);
+        let _ = replica::prune(&copy);
+    }
+    let _ = std::fs::remove_dir_all(&copy);
     let _ = std::fs::remove_dir_all(&dir);
 });

@@ -9,7 +9,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{MergeParts, NO_FILE, Part};
-use crate::manifest::{self, Entry, LOCK, MANIFEST, Manifest};
+use crate::manifest::{self, LOCK, MANIFEST, Manifest, ManifestEntry};
 use crate::segment::to_file::{Settings, merge_to_file};
 use crate::snapshot::map_segment;
 use crate::{Catalog, RefCoding, Segment, SnapshotError};
@@ -407,7 +407,7 @@ impl CatalogStore {
     }
 
     /// The manifest entries of the parts as they stand.
-    fn entries(&self) -> io::Result<Vec<Entry>> {
+    fn entries(&self) -> io::Result<Vec<ManifestEntry>> {
         let mut entries = Vec::with_capacity(self.catalog.parts().len());
         for part in self.catalog.parts() {
             let Some(file) = part.file() else {
@@ -417,7 +417,7 @@ impl CatalogStore {
             // that someone removed stops the save before the manifest
             // names it.
             let meta = fs::metadata(self.dir.join(manifest::segment_name(file)))?;
-            entries.push(Entry {
+            entries.push(ManifestEntry {
                 file,
                 bytes: meta.len(),
                 keys: part.segment.key_count() as u64,
@@ -430,7 +430,7 @@ impl CatalogStore {
 
     /// Write the manifest of `entries`, rename it into place and sync the
     /// directory.
-    fn put_manifest(&mut self, entries: Vec<Entry>) -> io::Result<()> {
+    fn put_manifest(&mut self, entries: Vec<ManifestEntry>) -> io::Result<()> {
         let generation = self.on_disk.map_or(1, |g| g + 1);
         let manifest = Manifest {
             generation,
@@ -642,11 +642,13 @@ fn files_of(catalog: &Catalog) -> Vec<u32> {
 /// left in `dir`: every temporary file, and every segment file but those
 /// of `keep`. Files of any other name are not the store's to remove.
 ///
-/// A file that cannot be removed stays for the next sweep.
-fn sweep(dir: &Path, keep: &[u32]) {
+/// A file that cannot be removed stays for the next sweep. Returns the
+/// number of files removed.
+pub(crate) fn sweep(dir: &Path, keep: &[u32]) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return 0;
     };
+    let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -654,10 +656,11 @@ fn sweep(dir: &Path, keep: &[u32]) {
             Some(file) => !keep.contains(&file),
             None => manifest::is_temp(name),
         };
-        if left {
-            let _ = fs::remove_file(entry.path());
+        if left && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
         }
     }
+    removed
 }
 
 /// Create `path`, write it with `fill` and, when it must be `durable`,
@@ -710,12 +713,12 @@ pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
 
 /// Sync a directory entry, where the platform has directory handles.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(_: &Path) -> io::Result<()> {
     Ok(())
 }
 

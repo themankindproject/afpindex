@@ -159,6 +159,48 @@ pub enum Compaction {
     Full,
 }
 
+/// A catalog's counters and the shape of each of its segments, as
+/// [`Catalog::stats`] gathers them.
+///
+/// New fields may be added in a minor release, so the struct can be read
+/// but not built outside the crate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CatalogStats {
+    /// Ids assigned so far, live or not: [`Catalog::reference_count`].
+    pub reference_count: usize,
+    /// References not removed: [`Catalog::live_count`].
+    pub live_count: usize,
+    /// Postings across all segments, including those of removed references
+    /// not yet compacted away: [`Catalog::posting_count`].
+    pub posting_count: usize,
+    /// Heap bytes held by the segments and the liveness table:
+    /// [`Catalog::heap_bytes`]. A mapped segment's postings are in its
+    /// file's pages and not counted here.
+    pub heap_bytes: usize,
+    /// One entry per segment, largest first, as [`Catalog::segments`]
+    /// lists them.
+    pub segments: Vec<SegmentStats>,
+}
+
+/// The shape of one segment of a catalog, an entry of
+/// [`CatalogStats::segments`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SegmentStats {
+    /// Postings in the segment: [`Segment::len`].
+    pub posting_count: usize,
+    /// Distinct hashes in the segment: [`Segment::key_count`].
+    pub key_count: usize,
+    /// Heap bytes the segment holds: [`Segment::heap_bytes`].
+    pub heap_bytes: usize,
+    /// How the segment stores its references.
+    pub ref_coding: RefCoding,
+    /// Smallest and largest reference that may have a posting in the
+    /// segment, or `None` when it has no postings.
+    pub references: Option<(u32, u32)>,
+}
+
 /// A segment of a catalog and what the catalog knows of its references.
 #[derive(Clone)]
 pub(crate) struct Part {
@@ -578,6 +620,34 @@ impl Catalog {
         self.segments().map(Segment::heap_bytes).sum::<usize>()
             + self.parts.capacity() * size_of::<Part>()
             + self.live.capacity()
+    }
+
+    /// The catalog's counters and each segment's shape, in one call: what a
+    /// server exports as metrics after each change.
+    ///
+    /// Every field is a counter the catalog already keeps or a segment
+    /// already knows, so a call costs one small allocation per segment and
+    /// reads no posting.
+    #[must_use]
+    pub fn stats(&self) -> CatalogStats {
+        let segments: Vec<SegmentStats> = self
+            .parts
+            .iter()
+            .map(|part| SegmentStats {
+                posting_count: part.segment.len(),
+                key_count: part.segment.key_count(),
+                heap_bytes: part.segment.heap_bytes(),
+                ref_coding: part.segment.ref_coding(),
+                references: (!part.segment.is_empty()).then_some(part.ids),
+            })
+            .collect();
+        CatalogStats {
+            reference_count: self.reference_count(),
+            live_count: self.live_count,
+            posting_count: segments.iter().map(|s| s.posting_count).sum(),
+            heap_bytes: self.heap_bytes(),
+            segments,
+        }
     }
 
     /// The compaction `policy` calls for now, if any: cheap enough to ask
@@ -1186,5 +1256,39 @@ mod tests {
         let bytes: usize = catalog.segments().map(|s| s.refs().data().len()).sum();
         assert!(bytes > 0);
         assert_eq!(catalog.warm_references(), bytes);
+    }
+    /// `stats` gathers the counters the catalog keeps and the shape of
+    /// each segment, largest first.
+    #[test]
+    fn stats_gather_the_counters_and_each_segment() {
+        let empty = Catalog::new().stats();
+        assert_eq!(empty.reference_count, 0);
+        assert_eq!(empty.posting_count, 0);
+        assert!(empty.segments.is_empty());
+
+        let mut builder = Catalog::builder();
+        for r in 0..30u32 {
+            builder.add((0..20u32).map(|i| (i * 5 + r, i)));
+        }
+        let mut catalog = builder.build();
+        catalog.set_ref_coding(RefCoding::Gaps);
+        catalog.add([(3, 1), (4, 2)]);
+        catalog.remove(2);
+        let stats = catalog.stats();
+        assert_eq!(stats.reference_count, catalog.reference_count());
+        assert_eq!(stats.live_count, catalog.live_count());
+        assert_eq!(stats.live_count, 30);
+        assert_eq!(stats.posting_count, catalog.posting_count());
+        assert_eq!(stats.heap_bytes, catalog.heap_bytes());
+        assert_eq!(stats.segments.len(), catalog.segment_count());
+        for (s, segment) in stats.segments.iter().zip(catalog.segments()) {
+            assert_eq!(s.posting_count, segment.len());
+            assert_eq!(s.key_count, segment.key_count());
+            assert_eq!(s.heap_bytes, segment.heap_bytes());
+            assert_eq!(s.ref_coding, segment.ref_coding());
+        }
+        assert_eq!(stats.segments[0].references, Some((0, 29)));
+        assert_eq!(stats.segments[1].references, Some((30, 30)));
+        assert_eq!(stats.segments[1].ref_coding, RefCoding::Gaps);
     }
 }
